@@ -303,8 +303,18 @@ pub enum PersistenceMsg {
             Result<xai_chat_state::StrictAppendAck, xai_chat_state::StrictAppendError>,
         >,
     },
-    /// Replace the entire chat history (used for compaction)
+    AppendChatTailV2AndAck {
+        append: xai_chat_state::TailAppend,
+        respond_to: tokio::sync::oneshot::Sender<Result<(), xai_chat_state::HistoryReplaceError>>,
+    },
+    /// Replace the entire chat history (legacy fire-and-forget paths).
     ReplaceChatHistory(Vec<ConversationItem>),
+    /// Durable history replacement used by the chat-state dual-generation CAS.
+    ReplaceChatHistoryAndAck {
+        operation_id: String,
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<Result<(), xai_chat_state::HistoryReplaceError>>,
+    },
     CurrentModel {
         model_id: acp::ModelId,
         /// The active agent definition name (e.g. `"grok-build"`).
@@ -363,6 +373,24 @@ pub enum PersistenceMsg {
     },
     /// Persist a compaction checkpoint file to `compaction_checkpoints/{id}.json`.
     CompactionCheckpoint(crate::extensions::notification::CompactionCheckpointFile),
+    /// Durably persist a Responses schema-v2 checkpoint before history commit.
+    ResponsesCompactionCheckpointV2 {
+        relative_path: String,
+        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV2,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Stage a server Responses segment without allocating a formal index.
+    ResponsesCompactionSegmentStage {
+        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV1,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Publish a committed staged server Responses segment idempotently.
+    ResponsesCompactionSegmentPublish {
+        checkpoint_id: String,
+        respond_to: tokio::sync::oneshot::Sender<
+            io::Result<crate::session::storage::responses_compaction::PublishedCompactionSegment>,
+        >,
+    },
     /// Persist a compaction request+response artifact to
     /// `compaction_requests/{request_id}.json`. Used for offline prompt
     /// iteration — captures the exact ConversationItem list sent to the
@@ -1844,6 +1872,103 @@ impl SessionPersistence {
         result
     }
 
+    fn typed_tail_update(
+        &self,
+        update: crate::extensions::notification::SessionUpdate,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(
+            crate::extensions::notification::SessionNotification {
+                session_id: self.info.id.clone(),
+                update,
+                meta: None,
+            },
+        ))
+    }
+
+    async fn append_typed_tail(
+        &mut self,
+        append: xai_chat_state::TailAppend,
+    ) -> Result<(), xai_chat_state::HistoryReplaceError> {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::session::storage::responses_compaction::{
+            ConversationAppendCommittedV2, ConversationAppendPreparedV2, TailV2,
+        };
+        use crate::session::storage::{AppendTailError, AppendUpdateError};
+
+        self.drain_pending().await.map_err(|error| match error {
+            AppendUpdateError::NotCommitted(error) => {
+                xai_chat_state::HistoryReplaceError::NotCommitted(error)
+            }
+            AppendUpdateError::Committed(error) => {
+                xai_chat_state::HistoryReplaceError::NotCommitted(error)
+            }
+        })?;
+        let prepared = ConversationAppendPreparedV2 {
+            operation_id: append.operation_id.clone(),
+            checkpoint_id: append.checkpoint_id.clone(),
+            branch_id: append.branch_id.clone(),
+            sequence: append.sequence,
+            prompt_index: append.prompt_index,
+            item: append.item.clone(),
+        };
+        let prepared_update = self.typed_tail_update(
+            XaiSessionUpdate::ConversationAppendPreparedV2(Box::new(prepared.clone())),
+        );
+        match self
+            .storage
+            .append_update_durable_commit_aware(&self.info, &prepared_update)
+            .await
+        {
+            Ok(()) => {}
+            Err(AppendUpdateError::Committed(error)) => {
+                tracing::warn!(%error, "typed-tail Prepared committed with bookkeeping error");
+            }
+            Err(AppendUpdateError::NotCommitted(error)) => {
+                return Err(xai_chat_state::HistoryReplaceError::NotCommitted(error));
+            }
+        }
+
+        let tail = TailV2 {
+            operation_id: append.operation_id,
+            checkpoint_id: append.checkpoint_id,
+            branch_id: append.branch_id,
+            sequence: append.sequence,
+            prompt_index: append.prompt_index,
+            item: append.item,
+        };
+        match self
+            .storage
+            .append_chat_tail_v2_durable(&self.info, &tail)
+            .await
+        {
+            Ok(_) => {}
+            Err(AppendTailError::Committed(error)) => {
+                tracing::warn!(%error, "typed tail committed with bookkeeping error");
+            }
+            Err(AppendTailError::NotCommitted(error)) => {
+                return Err(xai_chat_state::HistoryReplaceError::NotCommitted(error));
+            }
+        }
+
+        let committed = ConversationAppendCommittedV2::from(&prepared);
+        let committed_update =
+            self.typed_tail_update(XaiSessionUpdate::ConversationAppendCommittedV2(committed));
+        match self
+            .storage
+            .append_update_durable_commit_aware(&self.info, &committed_update)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(AppendUpdateError::Committed(error)) => {
+                tracing::warn!(%error, "typed-tail Committed record persisted with bookkeeping error");
+                Ok(())
+            }
+            Err(AppendUpdateError::NotCommitted(error)) => {
+                Err(xai_chat_state::HistoryReplaceError::Committed(error))
+            }
+        }
+    }
+
     /// Flush any pending merged ACP notification to disk and remote sync.
     async fn flush_pending(&mut self) {
         if let Err(error) = self.drain_pending().await {
@@ -1949,6 +2074,10 @@ impl SessionPersistence {
                         });
                     let _ = respond_to.send(result);
                 }
+                PersistenceMsg::AppendChatTailV2AndAck { append, respond_to } => {
+                    let result = self.append_typed_tail(append).await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::ReplaceChatHistory(messages) => {
                     tracing::info!(
                         num_messages = messages.len(),
@@ -1961,6 +2090,20 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to replace chat history");
                     }
+                }
+                PersistenceMsg::ReplaceChatHistoryAndAck {
+                    operation_id,
+                    messages,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .replace_chat_history_durable(&self.info, &operation_id, &messages)
+                        .await;
+                    if let Err(error) = &result {
+                        tracing::warn!(?error, "failed durable chat history replacement");
+                    }
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
@@ -2198,6 +2341,41 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to write compaction checkpoint file");
                     }
+                }
+                PersistenceMsg::ResponsesCompactionCheckpointV2 {
+                    relative_path,
+                    checkpoint,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .write_responses_compaction_checkpoint_v2(
+                            &self.info,
+                            &relative_path,
+                            &checkpoint,
+                        )
+                        .await;
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::ResponsesCompactionSegmentStage {
+                    staging,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .stage_responses_compaction_segment(&self.info, &staging)
+                        .await;
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::ResponsesCompactionSegmentPublish {
+                    checkpoint_id,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .publish_responses_compaction_segment(&self.info, &checkpoint_id)
+                        .await;
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CompactionRequest(request) => {
                     if let Err(e) = self

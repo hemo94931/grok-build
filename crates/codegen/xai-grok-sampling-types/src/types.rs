@@ -1090,6 +1090,11 @@ pub struct CreateResponseWrapper {
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
+
+    /// Pre-serialized normal Responses body. Used when input starts with a
+    /// local server-compaction checkpoint whose canonical prefix must bypass
+    /// the typed `rs::InputItem` round-trip.
+    pub raw_body: Option<serde_json::Value>,
 }
 
 impl CreateResponseWrapper {
@@ -1106,6 +1111,7 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
+            raw_body: None,
         }
     }
 

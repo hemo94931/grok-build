@@ -399,6 +399,7 @@ pub(crate) fn flatten_transcript_for_classifier(
                     }
                 }
             }
+            ConversationItem::ResponsesCompactionCheckpoint(_) => {}
         }
     }
     out

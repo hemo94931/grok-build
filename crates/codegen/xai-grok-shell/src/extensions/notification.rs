@@ -458,6 +458,16 @@ pub enum SessionUpdate {
         /// Reason for compaction
         reason: String,
     },
+    /// Standalone Responses compaction could not be used; builtin compaction is starting.
+    CompactionFallbackStarted {
+        /// Fixed, content-free failure category.
+        reason: String,
+    },
+    /// An opaque checkpoint cannot be replayed under the next request identity.
+    CompactionMigrationStarted {
+        /// `continuity_mismatch` or `non_responses`.
+        reason: String,
+    },
     /// Auto-compact completed successfully
     AutoCompactCompleted {
         /// Tokens used before compaction. `None` on payloads from older shells.
@@ -607,6 +617,14 @@ pub enum SessionUpdate {
     /// The actual compacted conversation is stored in a separate file under
     /// `compaction_checkpoints/{checkpoint_id}.json` to keep `updates.jsonl` lean.
     CompactionCheckpoint(Box<CompactionCheckpointInfo>),
+    /// Persist-only first phase for one provider-visible v2 checkpoint tail item.
+    ConversationAppendPreparedV2(
+        Box<crate::session::storage::responses_compaction::ConversationAppendPreparedV2>,
+    ),
+    /// Persist-only confirmation that the matching typed tail is authoritative.
+    ConversationAppendCommittedV2(
+        crate::session::storage::responses_compaction::ConversationAppendCommittedV2,
+    ),
     /// A rewind marker written to `updates.jsonl` when a rewind occurs.
     ///
     /// This is **persist-only** — it is never sent to the gateway/UI. Because
@@ -1263,6 +1281,21 @@ pub struct CompactionCheckpointInfo {
     pub auto_continue: Option<AutoContinueInfo>,
     /// Schema version for forward compatibility.
     pub schema_version: u32,
+    /// Server-checkpoint operation ID (schema v2 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Active typed-tail branch (schema v2 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    /// Portable-history digest used to validate the v2 sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_history_sha256: Option<String>,
+    /// Mode repair payload for a missing schema-v2 marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_mode: Option<xai_grok_sampling_types::ResponsesCompactionModeV1>,
+    /// Whether the server checkpoint was followed by auto-continue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_auto_continue: Option<bool>,
     /// ISO 8601 timestamp of when the checkpoint was created.
     pub created_at: String,
 }

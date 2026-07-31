@@ -94,6 +94,9 @@ pub fn replay_to_prompt(
     session_dir: &Path,
     target_prompt_index: usize,
 ) -> io::Result<ReplayResult> {
+    if let Some(result) = try_replay_responses_v2(updates_path, session_dir, target_prompt_index)? {
+        return Ok(result);
+    }
     let Some(iter) = UpdatesIterator::open(updates_path)? else {
         return Ok(ReplayResult {
             conversation: vec![],
@@ -165,6 +168,111 @@ pub fn replay_to_prompt(
             .checkpoint_active
             .then_some(state.checkpoint_prompt_index),
     })
+}
+
+fn try_replay_responses_v2(
+    updates_path: &Path,
+    session_dir: &Path,
+    target_prompt_index: usize,
+) -> io::Result<Option<ReplayResult>> {
+    let Some(iter) = UpdatesIterator::open(updates_path)? else {
+        return Ok(None);
+    };
+    let updates =
+        crate::session::storage::filter_rewind_updates(iter.filter_map(Result::ok).collect());
+    let Some((marker_index, marker)) =
+        updates
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, update)| {
+                let SessionUpdate::Xai(notification) = update else {
+                    return None;
+                };
+                let XaiSessionUpdate::CompactionCheckpoint(marker) = &notification.update else {
+                    return None;
+                };
+                Some((index, marker.as_ref()))
+            })
+    else {
+        return Ok(None);
+    };
+    if marker.schema_version != 2 {
+        return Ok(None);
+    }
+    let digest = marker.portable_history_sha256.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Responses checkpoint marker has no portable digest",
+        )
+    })?;
+    let checkpoint = crate::session::storage::responses_compaction::read_checkpoint_v2(
+        session_dir,
+        &marker.checkpoint_file,
+        &marker.checkpoint_id,
+        marker.prompt_index_at_compaction,
+        digest,
+    )?;
+    crate::session::storage::responses_compaction::validate_marker_for_wrapper(
+        marker,
+        &checkpoint.wrapper,
+    )?;
+
+    if target_prompt_index < marker.prompt_index_at_compaction {
+        let mut conversation = checkpoint.portable_history;
+        let keep = xai_grok_sampling_types::conversation_truncate_for_prompt(
+            &conversation,
+            target_prompt_index,
+        );
+        conversation.truncate(keep);
+        return Ok(Some(ReplayResult {
+            conversation,
+            prompt_index_reached: target_prompt_index,
+            original_user_info: checkpoint.original_user_info,
+            last_compaction_prompt_index: None,
+        }));
+    }
+
+    use crate::session::storage::responses_compaction::{PersistedChatEntry, TailJournalRecord};
+    let records = updates[marker_index + 1..]
+        .iter()
+        .filter_map(|update| {
+            let SessionUpdate::Xai(notification) = update else {
+                return None;
+            };
+            match &notification.update {
+                XaiSessionUpdate::ConversationAppendPreparedV2(prepared) => {
+                    Some(TailJournalRecord::Prepared((**prepared).clone()))
+                }
+                XaiSessionUpdate::ConversationAppendCommittedV2(committed) => {
+                    Some(TailJournalRecord::Committed(committed.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let entries = crate::session::storage::responses_compaction::rebuild_updates_only_entries_v2(
+        checkpoint.wrapper,
+        &records,
+    )?;
+    let mut kept = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match &entry {
+            PersistedChatEntry::Legacy(_) => kept.push(entry),
+            PersistedChatEntry::TailV2(tail) if tail.prompt_index <= target_prompt_index => {
+                kept.push(entry);
+            }
+            PersistedChatEntry::TailV2(_) => break,
+        }
+    }
+    let conversation =
+        crate::session::storage::responses_compaction::recover_history_entries(kept)?.conversation;
+    Ok(Some(ReplayResult {
+        conversation,
+        prompt_index_reached: target_prompt_index,
+        original_user_info: checkpoint.original_user_info,
+        last_compaction_prompt_index: Some(marker.prompt_index_at_compaction),
+    }))
 }
 
 #[derive(Debug, PartialEq)]
@@ -779,6 +887,11 @@ mod tests {
                 checkpoint_file: format!("compaction_checkpoints/{checkpoint_id}.json"),
                 auto_continue,
                 schema_version: 1,
+                operation_id: None,
+                branch_id: None,
+                portable_history_sha256: None,
+                responses_mode: None,
+                responses_auto_continue: None,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             })),
             meta: None,

@@ -18,6 +18,7 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
+pub mod responses_compaction;
 pub mod search;
 pub mod search_fts;
 mod search_recovery;
@@ -143,6 +144,9 @@ pub(crate) mod chat_rebuild {
         use std::io::{Seek, Write};
 
         let updates_path = dir.join(UPDATES_FILE);
+        if let Some(count) = try_rebuild_responses_v2(dir, &updates_path)? {
+            return Ok(count);
+        }
         let Some(iter) = UpdatesIterator::open(&updates_path)? else {
             return Ok(0);
         };
@@ -191,6 +195,81 @@ pub(crate) mod chat_rebuild {
             return Err(e);
         }
         Ok(reducer.count())
+    }
+
+    fn try_rebuild_responses_v2(dir: &Path, updates_path: &Path) -> io::Result<Option<usize>> {
+        let Some(iter) = UpdatesIterator::open(updates_path)? else {
+            return Ok(None);
+        };
+        let updates = super::filter_rewind_updates(iter.filter_map(Result::ok).collect());
+        let Some((marker_index, marker)) =
+            updates
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, update)| {
+                    let super::SessionUpdate::Xai(notification) = update else {
+                        return None;
+                    };
+                    let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(info) =
+                        &notification.update
+                    else {
+                        return None;
+                    };
+                    Some((index, info.as_ref()))
+                })
+        else {
+            return Ok(None);
+        };
+        if marker.schema_version != 2 {
+            return Ok(None);
+        }
+        let digest = marker.portable_history_sha256.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Responses checkpoint marker has no portable digest",
+            )
+        })?;
+        let checkpoint = super::responses_compaction::read_checkpoint_v2(
+            dir,
+            &marker.checkpoint_file,
+            &marker.checkpoint_id,
+            marker.prompt_index_at_compaction,
+            digest,
+        )?;
+        super::responses_compaction::validate_marker_for_wrapper(marker, &checkpoint.wrapper)?;
+
+        let records = updates[marker_index + 1..]
+            .iter()
+            .filter_map(|update| {
+                let super::SessionUpdate::Xai(notification) = update else {
+                    return None;
+                };
+                match &notification.update {
+                    crate::extensions::notification::SessionUpdate::ConversationAppendPreparedV2(
+                        prepared,
+                    ) => Some(super::responses_compaction::TailJournalRecord::Prepared(
+                        (**prepared).clone(),
+                    )),
+                    crate::extensions::notification::SessionUpdate::ConversationAppendCommittedV2(
+                        committed,
+                    ) => Some(super::responses_compaction::TailJournalRecord::Committed(
+                        committed.clone(),
+                    )),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let entries = super::responses_compaction::rebuild_updates_only_entries_v2(
+            checkpoint.wrapper,
+            &records,
+        )?;
+        let count = entries.len();
+        super::responses_compaction::write_history_v2_durable(
+            &dir.join(CHAT_HISTORY_FILE),
+            &entries,
+        )?;
+        Ok(Some(count))
     }
 
     /// Reduces ACP session updates into conversation items.
@@ -974,6 +1053,12 @@ pub enum AppendCwdSwitchError {
     },
 }
 
+#[derive(Debug)]
+pub enum AppendTailError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
 impl AppendUpdateError {
     pub fn into_io_error(self) -> io::Error {
         match self {
@@ -1043,6 +1128,19 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Append a chat message and increment counter.
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()>;
+
+    /// Durably append one typed checkpoint tail item. The boolean is false
+    /// when the exact operation was already present.
+    async fn append_chat_tail_v2_durable(
+        &self,
+        _info: &Info,
+        _tail: &responses_compaction::TailV2,
+    ) -> Result<bool, AppendTailError> {
+        Err(AppendTailError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "typed checkpoint tail append is unsupported",
+        )))
+    }
 
     /// Append one working-directory switch generation exactly once.
     async fn append_cwd_switch_commit_aware(
@@ -1180,6 +1278,18 @@ pub trait StorageAdapter: Send + Sync {
         messages: &[ConversationItem],
     ) -> io::Result<()>;
 
+    /// Durable, commit-aware replacement used by the chat-state CAS boundary.
+    async fn replace_chat_history_durable(
+        &self,
+        info: &Info,
+        _operation_id: &str,
+        messages: &[ConversationItem],
+    ) -> Result<(), xai_chat_state::HistoryReplaceError> {
+        self.replace_chat_history(info, messages)
+            .await
+            .map_err(xai_chat_state::HistoryReplaceError::NotCommitted)
+    }
+
     /// Copy session data from source to target, transforming session IDs
     /// The `options` parameter allows setting parent session tracking and model overrides.
     async fn copy_session_data(
@@ -1234,6 +1344,43 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()>;
+
+    /// Durably write a schema-v2 Responses checkpoint sidecar.
+    async fn write_responses_compaction_checkpoint_v2(
+        &self,
+        _info: &Info,
+        _relative_path: &str,
+        _checkpoint: &responses_compaction::CompactionCheckpointFileV2,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses checkpoint v2 is unsupported",
+        ))
+    }
+
+    /// Durably stage a checkpoint-keyed segment without allocating a formal index.
+    async fn stage_responses_compaction_segment(
+        &self,
+        _info: &Info,
+        _staging: &responses_compaction::ResponsesCompactionSegmentStagingV1,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment staging is unsupported",
+        ))
+    }
+
+    /// Publish a committed staged segment, assigning its formal index idempotently.
+    async fn publish_responses_compaction_segment(
+        &self,
+        _info: &Info,
+        _checkpoint_id: &str,
+    ) -> io::Result<responses_compaction::PublishedCompactionSegment> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment publication is unsupported",
+        ))
+    }
 
     /// Write a compaction request artifact to `compaction_requests/{request_id}.json`.
     /// Captures the exact request sent to the compaction model and the response

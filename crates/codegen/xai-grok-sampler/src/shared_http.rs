@@ -18,6 +18,8 @@ use std::time::Duration;
 
 static SHARED_H2: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
+static SHARED_COMPACT_H2: OnceLock<reqwest::Client> = OnceLock::new();
+static SHARED_COMPACT_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Kill switch: `GROK_SAMPLER_SHARED_CLIENT=0` (or `false`, any case)
 /// restores the old behavior of building a fresh `reqwest::Client` per
@@ -67,9 +69,25 @@ pub(crate) fn client_http1() -> Result<reqwest::Client, reqwest::Error> {
     shared(&SHARED_HTTP1, build_http_client_http1, sharing_disabled())
 }
 
-/// Build a `reqwest::Client` for sampling with HTTP/2 + connection pooling.
-/// Env knobs are read once, when the shared client is first built.
-fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+pub(crate) fn compact_client() -> Result<reqwest::Client, reqwest::Error> {
+    shared(
+        &SHARED_COMPACT_H2,
+        build_compact_http_client,
+        sharing_disabled(),
+    )
+}
+
+pub(crate) fn compact_client_http1() -> Result<reqwest::Client, reqwest::Error> {
+    shared(
+        &SHARED_COMPACT_HTTP1,
+        build_compact_http_client_http1,
+        sharing_disabled(),
+    )
+}
+
+fn build_http_client_with_timeout(
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
     let pool_max_idle: usize = std::env::var("GROK_POOL_MAX_IDLE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -78,21 +96,47 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
-    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
 
     xai_grok_extra_ca::with_extra_root_certificates(
         reqwest::Client::builder()
             .pool_max_idle_per_host(pool_max_idle)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .connect_timeout(connect_timeout)
             .tcp_nodelay(true)
             // HTTP/2 keep-alive: ping every 15s, timeout after 5s.
             .http2_keep_alive_interval(Duration::from_secs(15))
             .http2_keep_alive_timeout(Duration::from_secs(5))
             .http2_keep_alive_while_idle(true),
+    )
+    .build()
+}
+
+/// Build a `reqwest::Client` for sampling with HTTP/2 + connection pooling.
+/// Env knobs are read once, when the shared client is first built.
+fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    let connect_timeout_secs: u64 = std::env::var("GROK_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    build_http_client_with_timeout(Duration::from_secs(connect_timeout_secs))
+}
+
+fn build_compact_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    build_http_client_with_timeout(
+        crate::client::responses_compact::RESPONSES_COMPACT_CONNECT_TIMEOUT,
+    )
+}
+
+fn build_http1_client_with_timeout(
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    xai_grok_extra_ca::with_extra_root_certificates(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .pool_idle_timeout(Duration::from_secs(0))
+            .connect_timeout(connect_timeout)
+            .tcp_nodelay(true)
+            .http1_only(),
     )
     .build()
 }
@@ -104,16 +148,13 @@ fn build_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
+    build_http1_client_with_timeout(Duration::from_secs(connect_timeout_secs))
+}
 
-    xai_grok_extra_ca::with_extra_root_certificates(
-        reqwest::Client::builder()
-            .pool_max_idle_per_host(0)
-            .pool_idle_timeout(Duration::from_secs(0))
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .tcp_nodelay(true)
-            .http1_only(),
+fn build_compact_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
+    build_http1_client_with_timeout(
+        crate::client::responses_compact::RESPONSES_COMPACT_CONNECT_TIMEOUT,
     )
-    .build()
 }
 
 #[cfg(test)]

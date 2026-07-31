@@ -188,6 +188,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
+        | XaiSessionUpdate::CompactionFallbackStarted { .. }
+        | XaiSessionUpdate::CompactionMigrationStarted { .. }
         | XaiSessionUpdate::AutoCompactCompleted { .. }
         | XaiSessionUpdate::AutoCompactFailed { .. }
         | XaiSessionUpdate::AutoCompactCancelled { .. }
@@ -1087,6 +1089,8 @@ pub(super) fn handle_child_session_notification(
 ) -> bool {
     match update {
         XaiSessionUpdate::AutoCompactStarted { .. }
+        | XaiSessionUpdate::CompactionFallbackStarted { .. }
+        | XaiSessionUpdate::CompactionMigrationStarted { .. }
         | XaiSessionUpdate::AutoCompactCompleted { .. }
         | XaiSessionUpdate::AutoCompactFailed { .. }
         | XaiSessionUpdate::AutoCompactCancelled { .. }
@@ -1168,6 +1172,21 @@ pub(super) fn apply_session_event(
                 SessionEvent::CompactionStarted {
                     percentage: *percentage,
                 },
+            ));
+            true
+        }
+        XaiSessionUpdate::CompactionFallbackStarted { reason } => {
+            tracing::info!(reason, "using builtin compaction fallback");
+            scrollback.push_block(RenderBlock::system(format!(
+                "Continuing with local conversation compaction ({reason})."
+            )));
+            true
+        }
+        XaiSessionUpdate::CompactionMigrationStarted { .. } => {
+            tracing::info!("migrating compacted conversation continuity");
+            scrollback.push_block(RenderBlock::system(
+                "Updating the compacted conversation for the current model and connection."
+                    .to_string(),
             ));
             true
         }

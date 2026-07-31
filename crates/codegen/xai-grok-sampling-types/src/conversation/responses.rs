@@ -130,7 +130,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             conversation: None,
             include: None,
             input,
-            instructions: None,
+            instructions: req.instructions.clone(),
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,
             metadata: None,
@@ -193,6 +193,117 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResponsesRequestBuildError {
+    #[error(transparent)]
+    Validation(#[from] ConversationValidationError),
+    #[error("failed to serialize responses request: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("serialized responses request has no input array")]
+    MissingInput,
+}
+
+/// Immutable normal Responses request immediately before transport defaults/headers.
+///
+/// A checkpoint-bearing request is serialized by preserving the raw canonical
+/// prefix and converting only the typed live tail.
+#[derive(Debug, Clone)]
+pub struct FinalResponsesRequest {
+    body: serde_json::Value,
+}
+
+impl FinalResponsesRequest {
+    pub fn body(&self) -> &serde_json::Value {
+        &self.body
+    }
+
+    pub fn into_body(self) -> serde_json::Value {
+        self.body
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self.body)
+    }
+}
+
+impl TryFrom<&ConversationRequest> for FinalResponsesRequest {
+    type Error = ResponsesRequestBuildError;
+
+    fn try_from(request: &ConversationRequest) -> Result<Self, Self::Error> {
+        request.validate_for_backend(&crate::ApiBackend::Responses)?;
+        let checkpoint = request.items.first().and_then(|item| match item {
+            ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => Some(checkpoint),
+            _ => None,
+        });
+        let mut typed_request = request.clone();
+        if checkpoint.is_some() {
+            typed_request.items.remove(0);
+        }
+
+        let create_response = rs::CreateResponse::from(&typed_request);
+        let mut body = serde_json::to_value(create_response)?;
+        patch_reasoning_text_types(&mut body);
+
+        if let Some(value) = request.prompt_cache_options.clone() {
+            body["prompt_cache_options"] = value;
+        }
+        if let Some(value) = request.prompt_cache_retention.clone() {
+            body["prompt_cache_retention"] = serde_json::Value::String(value);
+        }
+        if let Some(value) = request.service_tier.clone() {
+            body["service_tier"] = serde_json::Value::String(value);
+        }
+
+        let extra_tools = extra_tool_entries(&request.hosted_tools);
+        if !extra_tools.is_empty() {
+            let tools = body
+                .as_object_mut()
+                .expect("CreateResponse serializes as an object")
+                .entry("tools")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            let tools = tools
+                .as_array_mut()
+                .expect("CreateResponse tools serializes as an array");
+            tools.extend(extra_tools);
+        }
+
+        if let Some(checkpoint) = checkpoint {
+            let tail = body
+                .get_mut("input")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(ResponsesRequestBuildError::MissingInput)?;
+            let mut input = checkpoint.output.clone();
+            input.append(tail);
+            body["input"] = serde_json::Value::Array(input);
+        }
+
+        Ok(Self { body })
+    }
+}
+
+/// Serialize JSON with recursively sorted object keys.
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn sort(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut entries: Vec<_> = object.iter().collect();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                let mut sorted = serde_json::Map::new();
+                for (key, value) in entries {
+                    sorted.insert(key.clone(), sort(value));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(sort).collect())
+            }
+            scalar => scalar.clone(),
+        }
+    }
+
+    serde_json::to_vec(&sort(value))
 }
 
 fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {
@@ -284,6 +395,9 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
             }]
+        }
+        ConversationItem::ResponsesCompactionCheckpoint(_) => {
+            unreachable!("checkpoint input must be flattened by FinalResponsesRequest")
         }
     }
 }

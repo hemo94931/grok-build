@@ -224,6 +224,12 @@ pub(super) fn install_system_prompt(
     preserve_inherited_system: bool,
     system_prompt: &str,
 ) {
+    if matches!(
+        conversation.first(),
+        Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+    ) {
+        return;
+    }
     if let Some(ConversationItem::System(sys)) = conversation.first_mut() {
         if is_subagent_spawn && !preserve_inherited_system {
             sys.content = std::sync::Arc::<str>::from(system_prompt);
@@ -285,6 +291,57 @@ mod install_system_prompt_tests {
             "summarized fork (preserve=false) must overwrite [0] with the child system"
         );
     }
+    #[test]
+    fn checkpoint_resume_never_inserts_before_wrapper() {
+        use chrono::Utc;
+        use xai_grok_sampling_types::{
+            CheckpointIdentityV1, ResponsesCompactionModeV1, ServerResponsesCheckpointV1,
+            TokenSeedSource,
+        };
+        let mut conv = vec![ConversationItem::ResponsesCompactionCheckpoint(Box::new(
+            ServerResponsesCheckpointV1 {
+                schema_version: 1,
+                checkpoint_id: "checkpoint".into(),
+                operation_id: "operation".into(),
+                prompt_index: 1,
+                created_at: Utc::now(),
+                auto_continue: false,
+                mode: ResponsesCompactionModeV1 {
+                    name: "summary".into(),
+                    detail: None,
+                },
+                branch_id: "branch".into(),
+                identity: CheckpointIdentityV1 {
+                    provider_id: "provider".into(),
+                    api: "responses".into(),
+                    endpoint_fingerprint: "endpoint".into(),
+                    model: "model".into(),
+                    auth_principal_fingerprint: "principal".into(),
+                    contract_version: "responses-compact-codex-v1".into(),
+                    prompt_envelope_fingerprint: "prompt".into(),
+                    canonical_prompt_projection: None,
+                },
+                output: vec![serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "opaque"
+                })],
+                portable_history_path: "compaction_checkpoints/checkpoint.json".into(),
+                portable_history_sha256: "digest".into(),
+                portable_history_bytes: 1,
+                checkpoint_token_seed: 1,
+                token_seed_source: TokenSeedSource::UsageOutputTokens,
+                server_output_item_count: 1,
+            },
+        ))];
+        let mut prefix = None;
+        install_system_prompt(&mut conv, &mut prefix, false, false, "fresh");
+        assert!(matches!(
+            conv.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        assert_eq!(conv.len(), 1);
+    }
+
     #[test]
     fn top_level_resume_keeps_stored_system() {
         let mut conv = vec![

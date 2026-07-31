@@ -431,13 +431,54 @@ impl SessionActor {
                 conversation.truncate(keep_count);
             }
 
-            // Write the truncated conversation back via the actor
-            // (handles both state update + persistence).
-            self.chat_state_handle.replace_conversation(conversation);
+            // A rewind from a server checkpoint starts a fresh tail branch;
+            // abandoned future records can no longer match active replay.
+            if let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
+                conversation.first_mut()
+            {
+                wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+            }
+
+            // Cross the acknowledged dual-generation CAS boundary rather than
+            // issuing a resident fire-and-forget history rewrite.
+            let Some(expected) = self.chat_state_handle.get_compaction_snapshot().await else {
+                anyhow::bail!("chat-state actor unavailable during rewind");
+            };
+            let committed_total_tokens =
+                xai_chat_state::estimate_conversation_tokens(&conversation);
+            let commit = self
+                .chat_state_handle
+                .commit_compaction(xai_chat_state::CommitCompaction {
+                    operation_id: format!("rewind-{}", uuid::Uuid::now_v7()),
+                    expected_history_revision: expected.history_revision,
+                    expected_request_identity_generation: expected.request_identity_generation,
+                    replacement: conversation,
+                    committed_total_tokens,
+                })
+                .await;
+            match commit {
+                Some(xai_chat_state::CommitCompactionResult::Committed { .. }) => {}
+                Some(xai_chat_state::CommitCompactionResult::Superseded { .. }) => {
+                    anyhow::bail!("rewind was superseded by a concurrent history change");
+                }
+                Some(xai_chat_state::CommitCompactionResult::PersistenceFailed(error)) => {
+                    return Ok(RewindResponse {
+                        success: false,
+                        target_prompt_index: target_index,
+                        mode,
+                        reverted_files: vec![],
+                        clean_files: vec![],
+                        conflicts: vec![],
+                        prompt_text: None,
+                        error: Some(format!("Failed to persist rewind: {error}")),
+                    });
+                }
+                None => anyhow::bail!("chat-state actor unavailable during rewind commit"),
+            }
+
             // Use a snapshot to set the correct prompt_index and truncated prompt_texts.
             // The actor's TruncateToPromptIndex doesn't apply here because the
-            // conversation was already truncated locally. Instead, snapshot + restore
-            // with the corrected fields.
+            // conversation was already replaced by the acknowledged commit.
             if let Some(mut snap) = self.chat_state_handle.snapshot().await {
                 snap.prompt_index = target_index;
                 snap.prompt_texts.truncate(target_index);
@@ -472,6 +513,18 @@ impl SessionActor {
                 target_prompt_index: target_index,
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
+            let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+            if self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::FlushAndAck {
+                    respond_to: flush_tx,
+                })
+                .is_err()
+                || flush_rx.await.is_err()
+            {
+                anyhow::bail!("rewind committed but its branch marker could not be flushed");
+            }
         }
 
         // Update the file state tracker to reflect the rewind.

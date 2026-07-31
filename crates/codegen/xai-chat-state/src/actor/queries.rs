@@ -28,6 +28,9 @@ impl ChatStateActor {
             turn_start_ms: self.state.turn_start_ms,
             last_compaction_prompt_index: self.state.last_compaction_prompt_index,
             credentials: self.state.credentials.clone(),
+            history_revision: self.state.history_revision,
+            request_identity_generation: self.state.request_identity_generation,
+            bound_request_identity: self.state.bound_request_identity.clone(),
         }
     }
 
@@ -74,6 +77,7 @@ impl ChatStateActor {
         self.state.estimate_at_last_response = self.state.total_tokens;
 
         self.persistence.replace_history(&self.state.conversation);
+        self.state.bump_history_revision();
 
         self.send_event(ChatStateEvent::ConversationReset {
             new_len: self.state.conversation.len(),
@@ -242,6 +246,7 @@ impl ChatStateActor {
                 xai_grok_sampling_types::ConversationItem::System(_) => {}
                 xai_grok_sampling_types::ConversationItem::BackendToolCall(_) => {}
                 xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}
+                xai_grok_sampling_types::ConversationItem::ResponsesCompactionCheckpoint(_) => {}
             }
         }
         counts

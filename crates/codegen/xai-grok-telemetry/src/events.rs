@@ -126,7 +126,7 @@ impl PermissionOutcome {
     }
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     Manual,
@@ -452,6 +452,54 @@ pub struct CompactionTriggered {
     pub model_id: String,
     pub user_context_provided: bool,
     pub compaction_id: String,
+}
+
+/// Metadata-only strategy attempt for standalone Responses compaction.
+/// Deliberately excludes endpoint/auth identity digests and all wire content.
+#[derive(Serialize)]
+pub struct CompactionStrategyAttempt {
+    pub compaction_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_compaction_id: Option<String>,
+    pub strategy: &'static str,
+    pub eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<&'static str>,
+    pub attempts: u8,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub output_items: u64,
+    pub capability_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_latency_ms: Option<u64>,
+    pub prefire_consumed: bool,
+    pub prefire_wasted: bool,
+    pub prefire_stale: bool,
+    pub history_revision: u64,
+    pub request_identity_generation: u64,
+    pub cas_outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_schema: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_outcome: Option<&'static str>,
+    pub marker_repaired: bool,
+    pub tokens_before: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_seed_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_failure_step: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1669,6 +1717,7 @@ telemetry_event!(
 );
 telemetry_event!(AutoCompactFired, "auto_compact_fired");
 telemetry_event!(CompactionTriggered, "compaction_triggered");
+telemetry_event!(CompactionStrategyAttempt, "compaction_strategy_attempt");
 telemetry_event!(
     CompactionCompleted,
     "compaction_completed",

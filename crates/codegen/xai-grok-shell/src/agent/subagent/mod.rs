@@ -378,6 +378,38 @@ impl SubagentSpawnContext {
             .resolve()
             .value
     }
+    pub fn resolve_server_compaction_enabled(&self) -> bool {
+        crate::agent::config::BoolFlag::env("GROK_SERVER_COMPACTION")
+            .config(
+                self.agent_config
+                    .as_ref()
+                    .and_then(|config| config.features.server_compaction),
+            )
+            .feature_flag(
+                self.remote_settings
+                    .as_ref()
+                    .and_then(|settings| settings.server_compaction_enabled),
+            )
+            .default(true)
+            .resolve()
+            .value
+    }
+
+    pub fn resolve_compact_model(&self, current_model: &str) -> Option<String> {
+        let selected = crate::session::responses_server_compaction::resolve_compact_model_layers(
+            crate::agent::config::env_string("GROK_COMPACT_MODEL").as_deref(),
+            self.agent_config
+                .as_ref()
+                .and_then(|config| config.features.compact_model.as_deref()),
+            self.remote_settings
+                .as_ref()
+                .and_then(|settings| settings.compact_model.as_deref()),
+            current_model,
+            |model| crate::agent::config::find_model_by_id(&self.available_models, model).is_some(),
+        );
+        (selected != current_model).then_some(selected)
+    }
+
     pub fn resolve_compaction_tool_choice(&self) -> crate::util::config::CompactionToolChoice {
         crate::util::config::resolve_compaction_tool_choice_from(
             crate::agent::config::env_string(crate::util::config::ENV_COMPACTION_TOOL_CHOICE)

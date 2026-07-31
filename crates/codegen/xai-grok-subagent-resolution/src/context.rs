@@ -329,10 +329,9 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
         ConversationItem::BackendToolCall(b) => {
             let _ = writeln!(out, "[Backend Tool]: {}", b.text_summary());
         }
-        // Reasoning siblings don't enter the fork-background rendering —
-        // they're rendered (when needed) inline with the surrounding
-        // assistant turn elsewhere.
-        ConversationItem::Reasoning(_) => {}
+        // Reasoning siblings and local opaque checkpoints never enter fork
+        // background text. Checkpoint migration uses its portable sidecar.
+        ConversationItem::Reasoning(_) | ConversationItem::ResponsesCompactionCheckpoint(_) => {}
     }
 }
 

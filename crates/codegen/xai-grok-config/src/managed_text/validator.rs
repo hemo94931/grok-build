@@ -159,7 +159,7 @@ fn teardown_child(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 

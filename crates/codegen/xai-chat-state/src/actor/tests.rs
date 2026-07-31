@@ -6,10 +6,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
-use crate::StrictAppendAck;
 use crate::actor::ChatStateActor;
 use crate::events::ChatStateEvent;
 use crate::persistence::{MockChatPersistence, MockPersistenceReceiver, PersistenceRecord};
+use crate::{ReplaceSystemHeadResult, StrictAppendAck};
 
 /// Helper to build a `SamplingConfig` for tests.
 fn test_config() -> SamplingConfig {
@@ -1011,7 +1011,7 @@ async fn replace_system_head_swaps_head_and_preserves_turns() {
         ConversationItem::assistant("yo"),
     ]);
     let changed = h.handle.replace_system_head("new prompt").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(conv.len(), 3, "must not wipe user/assistant turns");
     assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "new prompt"));
@@ -1029,7 +1029,7 @@ async fn replace_system_head_noop_when_head_matches_modulo_newline() {
     let changed = h.handle.replace_system_head("same").await;
     assert_eq!(
         changed,
-        Some(false),
+        Some(ReplaceSystemHeadResult::Unchanged),
         "trailing-newline-only diff is a no-op"
     );
     let conv = h.handle.get_conversation().await;
@@ -1044,7 +1044,7 @@ async fn replace_system_head_noop_when_head_matches_modulo_newline() {
 async fn replace_system_head_inserts_when_absent() {
     let h = TestHarness::with_conversation(vec![ConversationItem::user("hi")]);
     let changed = h.handle.replace_system_head("sys").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(conv.len(), 2, "inserts System at head, keeps the user turn");
     assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "sys"));
@@ -1061,7 +1061,7 @@ async fn replace_system_head_retains_concurrently_pushed_item() {
     h.handle
         .push_assistant_response(ConversationItem::assistant("in-flight turn output"));
     let changed = h.handle.replace_system_head("new").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(
         conv.len(),
@@ -1085,7 +1085,7 @@ async fn replace_system_head_preserves_active_turn_capture() {
         .push_assistant_response(ConversationItem::assistant("in-flight"));
 
     let changed = h.handle.replace_system_head("new prompt").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
 
     let capture = h
         .handle

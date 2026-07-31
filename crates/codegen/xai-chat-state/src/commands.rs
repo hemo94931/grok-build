@@ -9,8 +9,9 @@ use xai_grok_sampling_types::{
 };
 
 use crate::types::{
-    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    TurnCapture,
+    AutoCompactTrigger, ChatCompactionSnapshot, ChatStateSnapshot, CommitCompaction,
+    CommitCompactionResult, ConversationCounts, Credentials, NotificationMeta,
+    ReplaceSystemHeadResult, RequestIdentityBindResult, RequestIdentityBinding, TurnCapture,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -121,6 +122,23 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
 
+    /// Invalidate any bound continuity identity before semantic config/auth changes.
+    InvalidateRequestIdentity,
+
+    /// Bind the identity of a fully prepared final provider request.
+    BindRequestIdentity {
+        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        reply: oneshot::Sender<RequestIdentityBinding>,
+    },
+
+    /// Bind only if the final request still matches its captured history revision,
+    /// returning the compaction snapshot from the same actor command.
+    BindRequestIdentityAtRevision {
+        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        expected_history_revision: u64,
+        reply: oneshot::Sender<RequestIdentityBindResult>,
+    },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 
@@ -134,6 +152,12 @@ pub enum ChatStateCommand {
     ReplaceConversation {
         items: Vec<ConversationItem>,
         is_compaction: bool,
+    },
+
+    /// Compare both generations, durably replace history, then reseed tokens.
+    CommitCompaction {
+        commit: CommitCompaction,
+        reply: oneshot::Sender<CommitCompactionResult>,
     },
 
     /// Out-of-band history repair (`x.ai/session/repair`): run
@@ -165,7 +189,7 @@ pub enum ChatStateCommand {
     /// anyway.
     ReplaceSystemHead {
         prompt: String,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<ReplaceSystemHeadResult>,
     },
 
     /// Cache prompt text for rewind preview.
@@ -213,6 +237,11 @@ pub enum ChatStateCommand {
         conv_id: String,
         req_id: String,
         reply: oneshot::Sender<ConversationRequest>,
+    },
+
+    /// Get the actor-owned generations and conversation in one atomic snapshot.
+    GetCompactionSnapshot {
+        reply: oneshot::Sender<ChatCompactionSnapshot>,
     },
 
     /// Get a clone of the full conversation.

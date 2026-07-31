@@ -31,7 +31,10 @@ use xai_chat_state::compaction_utils::{
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
     validate_compacted_history,
 };
-use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+use xai_grok_sampling_types::{
+    ApiBackend, ConversationItem, ConversationRequest, FinalResponsesRequest,
+    ResponsesCompactionModeV1,
+};
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
@@ -57,6 +60,11 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
             ConversationItem::ToolResult(_) => 3,
             ConversationItem::BackendToolCall(_) => 4,
             ConversationItem::Reasoning(_) => 5,
+            ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
+                checkpoint.checkpoint_id.hash(&mut h);
+                checkpoint.portable_history_sha256.hash(&mut h);
+                6
+            }
         };
         tag.hash(&mut h);
         it.text_content().hash(&mut h);
@@ -163,6 +171,45 @@ impl SessionActor {
         let agent = self.agent.borrow();
         agent.compaction_policy().two_pass_enabled
     }
+    async fn prepare_builtin_compaction_sampling(
+        &self,
+    ) -> Result<
+        (
+            xai_grok_sampler::SamplerConfig,
+            xai_grok_sampler::SamplingClient,
+        ),
+        acp::Error,
+    > {
+        self.refresh_token_if_expired().await;
+        let current = self.reconstruct_full_config().await;
+        let compact_model = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .compact_model
+            .clone();
+        let mut config = compact_model
+            .as_deref()
+            .filter(|model| *model != current.model)
+            .and_then(|model| self.models_manager.sampling_config_for_model_id(model))
+            .unwrap_or_else(|| current.clone());
+        config.origin_client = current.origin_client.clone();
+        config.client_identifier = current.client_identifier.clone();
+        config.attribution_callback = current.attribution_callback.clone();
+        config.header_injector = current.header_injector.clone();
+        if config.auth_scheme == xai_grok_sampler::AuthScheme::Bearer
+            && config.api_key == current.api_key
+        {
+            config.bearer_resolver = current.bearer_resolver.clone();
+        }
+        config.compactions_remaining = None;
+        config.compaction_at_tokens = None;
+        config.doom_loop_recovery = None;
+        let client = xai_grok_sampler::SamplingClient::new(config.clone())
+            .map_err(|error| self.to_acp_error(error))?;
+        Ok((config, client))
+    }
+
     /// Run one summarization sample over a fully-built two-pass history (the
     /// prompt is already embedded, so this bypasses the single-pass sampler and
     /// calls `generate_session_compact` directly). Returns `None` on any error
@@ -173,9 +220,8 @@ impl SessionActor {
     /// the turn loop; a long-lived borrow would race with turn/compact/cancel
     /// and panic on double-borrow.
     async fn two_pass_sample(&self, history: Vec<ConversationItem>) -> Option<CompactOutput> {
-        let sampling_config = self.reconstruct_full_config().await;
-        let client = match self.prepare_chat_completion(false).await {
-            Ok(c) => c,
+        let (sampling_config, client) = match self.prepare_builtin_compaction_sampling().await {
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(error = %e, "two_pass: failed to prepare sampling client");
                 return None;
@@ -214,6 +260,12 @@ impl SessionActor {
     /// Per-turn prefire decision: usage has reached `threshold - lead` (so there
     /// is still runway before the hard auto-compact line at `threshold`).
     pub(crate) async fn should_prefire_two_pass(&self) -> bool {
+        if matches!(
+            self.chat_state_handle.get_conversation().await.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            return false;
+        }
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
         let Some(cw) = sampling_cfg.as_ref().map(|c| c.context_window.get()) else {
             return false;
@@ -290,10 +342,17 @@ impl SessionActor {
             .as_ref()
             .map(|c| c.api_backend == ApiBackend::Messages)
             .unwrap_or(false);
-        let model_slug = sampling_cfg
+        let current_model = sampling_cfg
             .as_ref()
-            .map(|c| c.model.to_string())
+            .map(|config| config.model.clone())
             .unwrap_or_default();
+        let model_slug = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .compact_model
+            .clone()
+            .unwrap_or(current_model);
         let prefix_prepared =
             prepare_conversation_for_verbatim_summarization(split.prefix.to_vec(), strips);
         let prefix_est_tokens = prefix_prepared
@@ -376,12 +435,19 @@ impl SessionActor {
         }
         let cache = self.compaction.prefire.take()?;
         let live = self.chat_state_handle.get_conversation().await;
-        let model_slug = self
+        let current_model = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| c.model.to_string())
+            .map(|config| config.model)
             .unwrap_or_default();
+        let model_slug = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .compact_model
+            .clone()
+            .unwrap_or(current_model);
         if cache.prefix_len == 0
             || cache.prefix_len > live.len()
             || cache.model_slug != model_slug
@@ -431,6 +497,82 @@ impl SessionActor {
         Some(out)
     }
 }
+/// Trigger info for auto-compact decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionStrategy {
+    ServerFirst,
+    BuiltinMigration(&'static str),
+}
+
+enum CompactionAttemptOutcome {
+    Committed,
+    Superseded {
+        compaction_id: String,
+        strategy_started_notified: bool,
+    },
+}
+
+struct PreparedServerRequest {
+    snapshot: crate::session::responses_server_compaction::ResponsesRequestSnapshot,
+    client: xai_grok_sampler::SamplingClient,
+    request: xai_grok_sampler::ResponsesCompactRequest,
+    capability_key: crate::session::responses_server_compaction::CapabilityKey,
+    checkpoint_status: xai_chat_state::CheckpointReplayStatus,
+}
+
+#[derive(Debug)]
+struct AuthManagerCompactResolver {
+    manager: Arc<crate::auth::AuthManager>,
+    principal_fingerprint: String,
+}
+
+impl xai_grok_sampler::CompactCredentialResolver for AuthManagerCompactResolver {
+    fn current_credential(&self) -> Option<xai_grok_sampler::CompactCredential> {
+        let auth = self.manager.current_wire_valid()?;
+        (stable_auth_principal_fingerprint(&auth).as_deref()
+            == Some(self.principal_fingerprint.as_str()))
+        .then(|| {
+            xai_grok_sampler::CompactCredential::bearer(
+                auth.key,
+                self.principal_fingerprint.clone(),
+            )
+        })
+    }
+}
+
+fn stable_auth_principal_fingerprint(auth: &crate::auth::GrokAuth) -> Option<String> {
+    let has_stable_id = [
+        auth.principal_id.as_deref(),
+        auth.team_id.as_deref(),
+        auth.organization_id.as_deref(),
+        Some(auth.user_id.as_str()).filter(|value| !value.is_empty()),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if !has_stable_id {
+        return None;
+    }
+    let value = serde_json::json!({
+        "class": format!("{:?}", auth.auth_mode).to_ascii_lowercase(),
+        "principal_id": auth.principal_id,
+        "team_id": auth.team_id,
+        "organization_id": auth.organization_id,
+        "user_id": auth.user_id,
+    });
+    let bytes = xai_grok_sampling_types::canonical_json_bytes(&value).ok()?;
+    use sha2::Digest as _;
+    Some(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn keyed_principal_fingerprint(class: &str, key: &str) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(class.as_bytes());
+    hash.update([0]);
+    hash.update(key.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
 /// Trigger info for auto-compact decisions.
 pub(crate) struct AutoCompactTriggerInfo {
     pub tokens_used: u64,
@@ -619,6 +761,11 @@ impl SessionActor {
                 user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::ServerFirst,
+                None,
+                None,
+                false,
+                0,
             )
             .await
         {
@@ -707,6 +854,11 @@ impl SessionActor {
             .await;
         }
     }
+    pub(crate) fn is_compaction_cancelled(error: &acp::Error) -> bool {
+        error.data.as_ref().and_then(serde_json::Value::as_str)
+            == Some("responses_compaction_cancelled")
+    }
+
     /// Map a deterministic failure's error text to a fixed, content-free
     /// [`SuppressReason`] (drives telemetry + sticky-vs-per-turn scope).
     fn classify_suppress_reason(error_msg: &str) -> SuppressReason {
@@ -866,6 +1018,759 @@ impl SessionActor {
             }
         }
     }
+    fn current_prompt_projection(
+        &self,
+        final_request: &FinalResponsesRequest,
+        items: &[ConversationItem],
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let (default_projection, _) =
+            crate::session::responses_server_compaction::canonical_prompt_envelope(final_request)?;
+        let mut projection = items
+            .first()
+            .and_then(|item| match item {
+                ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
+                    checkpoint.identity.canonical_prompt_projection.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or(default_projection);
+        let system_prompt = self.agent.borrow().system_prompt().to_string();
+        if !projection.is_array() {
+            projection = serde_json::json!([{
+                "type": "message",
+                "role": "system",
+                "content": system_prompt.clone(),
+            }]);
+        }
+        let values = projection
+            .as_array_mut()
+            .expect("projection was normalized to an array");
+        if let Some(system) = values
+            .iter_mut()
+            .find(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        {
+            system["content"] = serde_json::Value::String(system_prompt);
+        } else {
+            values.insert(
+                0,
+                serde_json::json!({
+                    "type": "message",
+                    "role": "system",
+                    "content": system_prompt,
+                }),
+            );
+        }
+        Ok(projection)
+    }
+
+    fn compact_credential(
+        &self,
+        config: &xai_grok_sampler::SamplerConfig,
+    ) -> Option<(xai_grok_sampler::RequestCredentialSnapshot, String)> {
+        let key = config.api_key.as_deref().filter(|key| !key.is_empty())?;
+        let auth = self
+            .auth_manager
+            .as_ref()
+            .and_then(|manager| manager.current_wire_valid());
+        let uses_session_auth = auth.as_ref().is_some_and(|auth| auth.key == key)
+            || (config.bearer_resolver.is_some() && auth.is_some());
+        let principal = if uses_session_auth {
+            stable_auth_principal_fingerprint(auth.as_ref()?)?
+        } else if let Some(deployment_id) = config.deployment_id.as_deref() {
+            keyed_principal_fingerprint("deployment", deployment_id)
+        } else {
+            keyed_principal_fingerprint(
+                match config.auth_scheme {
+                    xai_grok_sampler::AuthScheme::Bearer => "bearer_key",
+                    xai_grok_sampler::AuthScheme::XApiKey => "x_api_key",
+                },
+                key,
+            )
+        };
+        let credential = match config.auth_scheme {
+            xai_grok_sampler::AuthScheme::Bearer => {
+                let snapshot = xai_grok_sampler::RequestCredentialSnapshot::bearer(
+                    key.to_string(),
+                    principal.clone(),
+                );
+                if uses_session_auth {
+                    snapshot.with_resolver(Arc::new(AuthManagerCompactResolver {
+                        manager: self.auth_manager.as_ref()?.clone(),
+                        principal_fingerprint: principal.clone(),
+                    }))
+                } else {
+                    snapshot
+                }
+            }
+            xai_grok_sampler::AuthScheme::XApiKey => {
+                xai_grok_sampler::RequestCredentialSnapshot::x_api_key(
+                    key.to_string(),
+                    principal.clone(),
+                )
+            }
+        };
+        Some((credential, principal))
+    }
+
+    fn portable_history_for_request(
+        &self,
+        items: &[ConversationItem],
+    ) -> std::io::Result<Vec<ConversationItem>> {
+        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = items.first() else {
+            return Ok(items.to_vec());
+        };
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let mut portable =
+            crate::session::storage::responses_compaction::read_checkpoint_for_wrapper(
+                &session_dir,
+                wrapper,
+            )?
+            .portable_history;
+        portable.extend_from_slice(&items[1..]);
+        Ok(portable)
+    }
+
+    async fn prepare_server_request(
+        &self,
+        user_context: Option<&str>,
+        normal_request: Option<&ConversationRequest>,
+        trigger: xai_grok_telemetry::events::CompactionTrigger,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<PreparedServerRequest>, acp::Error> {
+        let sampling = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("missing sampling config"))?;
+        if sampling.api_backend != ApiBackend::Responses {
+            return Ok(None);
+        }
+        let request = match normal_request {
+            Some(request) => request.clone(),
+            None => {
+                let tool_definitions = self.prepare_tool_definitions().await;
+                let tools = if let Some(ref override_tools) = self.forked_tool_override {
+                    override_tools.clone()
+                } else {
+                    self.turn_base_tool_specs(&tool_definitions)
+                };
+                let request_id = format!("compact-{}", uuid::Uuid::now_v7());
+                let mut request = self
+                    .chat_state_handle
+                    .build_request(
+                        tools,
+                        None,
+                        false,
+                        None,
+                        self.session_info.id.to_string(),
+                        request_id,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        acp::Error::internal_error().data("chat-state actor unavailable")
+                    })?;
+                request.x_grok_session_id = Some(self.session_info.id.to_string());
+                request.x_grok_turn_idx =
+                    Some(self.chat_state_handle.get_prompt_index().await.to_string());
+                request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+                request.hosted_tools = self.hosted_tools_for_turn();
+                request
+            }
+        };
+
+        let request_history_revision = request.history_revision.ok_or_else(|| {
+            acp::Error::internal_error().data("responses_compaction_missing_request_revision")
+        })?;
+        let final_request = FinalResponsesRequest::try_from(&request)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let full_config = self.reconstruct_full_config().await;
+        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
+            .map_err(|error| self.to_acp_error(error))?;
+        let Some((credential, principal)) = self.compact_credential(&full_config) else {
+            return Ok(None);
+        };
+        let endpoint_fingerprint = client.responses_compact_endpoint_fingerprint();
+        let prompt_projection = self.current_prompt_projection(&final_request, &request.items)?;
+        let identity =
+            crate::session::responses_server_compaction::build_checkpoint_identity_with_projection(
+                if crate::util::is_xai_api_url(&full_config.base_url) {
+                    "xai"
+                } else {
+                    "openai_compatible"
+                },
+                &endpoint_fingerprint,
+                &principal,
+                &final_request,
+                Some(prompt_projection.clone()),
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let bound = self
+            .chat_state_handle
+            .bind_request_identity_at_revision(identity.clone(), request_history_revision)
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        let (binding, state) = match bound {
+            xai_chat_state::RequestIdentityBindResult::Bound {
+                binding,
+                compaction_snapshot,
+            } => (binding, *compaction_snapshot),
+            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => {
+                return Err(acp::Error::internal_error().data("responses_compaction_stale_request"));
+            }
+        };
+        let portable_history = self
+            .portable_history_for_request(&request.items)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let (_, mut semantic_envelope) =
+            crate::session::responses_server_compaction::canonical_prompt_envelope(&final_request)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        semantic_envelope["canonical_prompt_projection"] = prompt_projection.clone();
+        let semantic_envelope_tokens = crate::session::responses_server_compaction::prompt_envelope_token_estimate_with_projection(
+            &final_request,
+            Some(prompt_projection),
+        )
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let body = final_request.body();
+        let input = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let string_field = |name: &str| {
+            body.get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let compact_request =
+            xai_grok_sampler::ResponsesCompactRequest::from_final(&final_request, user_context)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+                .with_correlation(xai_grok_sampler::CompactCorrelationHeaders {
+                    conversation_id: request.x_grok_conv_id.clone(),
+                    request_id: request.x_grok_req_id.clone(),
+                    session_id: request.x_grok_session_id.clone(),
+                    turn_index: request.x_grok_turn_idx.clone(),
+                    agent_id: request.x_grok_agent_id.clone(),
+                    deployment_id: request.x_grok_deployment_id.clone(),
+                    user_id: request.x_grok_user_id.clone(),
+                });
+        let request_bytes = compact_request.to_bounded_bytes().map_err(|error| {
+            let reason =
+                if error.failure() == xai_grok_sampler::ResponsesCompactFailure::RequestTooLarge {
+                    "responses_compaction_request_too_large"
+                } else {
+                    "responses_compaction_request_build_failed"
+                };
+            acp::Error::internal_error().data(reason)
+        })?;
+        let capability_key = crate::session::responses_server_compaction::CapabilityKey {
+            endpoint_fingerprint,
+            model: identity.model.clone(),
+            auth_principal_fingerprint: principal,
+            contract_version: identity.contract_version.clone(),
+        };
+        Ok(Some(PreparedServerRequest {
+            snapshot: crate::session::responses_server_compaction::ResponsesRequestSnapshot {
+                chat_revision: state.history_revision,
+                request_identity_generation: binding.request_identity_generation,
+                prompt_index: state.prompt_index,
+                pre_compaction_tokens: state.total_tokens,
+                final_request: final_request.clone(),
+                credential,
+                model: identity.model.clone(),
+                input,
+                portable_history,
+                instructions: string_field("instructions"),
+                prompt_cache_key: string_field("prompt_cache_key"),
+                prompt_cache_options: body.get("prompt_cache_options").cloned(),
+                prompt_cache_retention: string_field("prompt_cache_retention"),
+                service_tier: string_field("service_tier"),
+                semantic_envelope,
+                semantic_envelope_tokens,
+                identity,
+                request_bytes,
+                trigger,
+                mode: self.responses_mode_metadata(),
+                user_context: user_context.map(str::to_owned),
+                cancellation,
+            },
+            client,
+            request: compact_request,
+            capability_key,
+            checkpoint_status: binding.checkpoint_status,
+        }))
+    }
+
+    pub(crate) async fn ensure_checkpoint_replayable_for_request(
+        self: &Arc<Self>,
+        request: &ConversationRequest,
+        full_config: &xai_grok_sampler::SamplerConfig,
+    ) -> Result<bool, acp::Error> {
+        let has_wrapper = matches!(
+            request.items.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        );
+        if full_config.api_backend != ApiBackend::Responses {
+            if !has_wrapper {
+                return Ok(false);
+            }
+            self.maybe_pre_compaction_flush(
+                self.chat_state_handle.get_total_tokens().await,
+                full_config.context_window,
+                "continuity_migration",
+            )
+            .await;
+            self.run_compact_inner(
+                None,
+                None,
+                xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::BuiltinMigration("non_responses"),
+                Some(request.clone()),
+                None,
+                false,
+                0,
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let request_history_revision = request.history_revision.ok_or_else(|| {
+            acp::Error::internal_error().data("responses_compaction_missing_request_revision")
+        })?;
+        let final_request = FinalResponsesRequest::try_from(request)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
+            .map_err(|error| self.to_acp_error(error))?;
+        let Some((_, principal)) = self.compact_credential(full_config) else {
+            if !has_wrapper {
+                return Ok(false);
+            }
+            self.maybe_pre_compaction_flush(
+                self.chat_state_handle.get_total_tokens().await,
+                full_config.context_window,
+                "continuity_migration",
+            )
+            .await;
+            self.run_compact_inner(
+                None,
+                None,
+                xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::BuiltinMigration("continuity_mismatch"),
+                Some(request.clone()),
+                None,
+                false,
+                0,
+            )
+            .await?;
+            return Ok(true);
+        };
+        let projection = self
+            .current_prompt_projection(&final_request, &request.items)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let identity =
+            crate::session::responses_server_compaction::build_checkpoint_identity_with_projection(
+                if crate::util::is_xai_api_url(&full_config.base_url) {
+                    "xai"
+                } else {
+                    "openai_compatible"
+                },
+                &client.responses_compact_endpoint_fingerprint(),
+                &principal,
+                &final_request,
+                Some(projection),
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let binding = match self
+            .chat_state_handle
+            .bind_request_identity_at_revision(identity, request_history_revision)
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?
+        {
+            xai_chat_state::RequestIdentityBindResult::Bound { binding, .. } => binding,
+            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => return Ok(true),
+        };
+        if matches!(
+            binding.checkpoint_status,
+            xai_chat_state::CheckpointReplayStatus::Replayable
+        ) {
+            self.portable_history_for_request(&request.items)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        }
+        if matches!(
+            binding.checkpoint_status,
+            xai_chat_state::CheckpointReplayStatus::MigrationRequired
+                | xai_chat_state::CheckpointReplayStatus::InvalidCheckpoint
+        ) {
+            self.maybe_pre_compaction_flush(
+                self.chat_state_handle.get_total_tokens().await,
+                full_config.context_window,
+                "continuity_migration",
+            )
+            .await;
+            self.run_compact_inner(
+                None,
+                None,
+                xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::BuiltinMigration("continuity_mismatch"),
+                Some(request.clone()),
+                None,
+                false,
+                0,
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn responses_mode_metadata(&self) -> ResponsesCompactionModeV1 {
+        ResponsesCompactionModeV1 {
+            name: self.compaction.compaction_mode.to_string(),
+            detail: self
+                .compaction
+                .compaction_mode
+                .segment_detail()
+                .map(|detail| serde_json::Value::String(detail.to_string())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_strategy_attempt(
+        &self,
+        compaction_id: &str,
+        supersedes_compaction_id: Option<&str>,
+        prepared: Option<&PreparedServerRequest>,
+        strategy: &'static str,
+        eligible: bool,
+        skip_reason: Option<&'static str>,
+        attempts: u8,
+        outcome: &'static str,
+        failure: Option<&'static str>,
+        status: Option<u16>,
+        latency_ms: u64,
+        response_bytes: u64,
+        output_items: u64,
+        capability_cache_hit: bool,
+        cas_outcome: &'static str,
+        checkpoint_bytes: Option<u64>,
+        tokens_after: Option<u64>,
+        token_seed_source: Option<&'static str>,
+        commit_failure_step: Option<&'static str>,
+    ) {
+        let fallback_model = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .compact_model
+            .clone();
+        xai_grok_telemetry::session_ctx::log_event(
+            xai_grok_telemetry::events::CompactionStrategyAttempt {
+                compaction_id: compaction_id.to_string(),
+                supersedes_compaction_id: supersedes_compaction_id.map(str::to_owned),
+                strategy,
+                eligible,
+                skip_reason,
+                attempts,
+                outcome,
+                failure,
+                status,
+                latency_ms,
+                request_bytes: prepared
+                    .map(|prepared| prepared.snapshot.request_bytes.len() as u64)
+                    .unwrap_or(0),
+                response_bytes,
+                output_items,
+                capability_cache_hit,
+                fallback_model,
+                fallback_latency_ms: None,
+                prefire_consumed: strategy == "builtin_fallback",
+                prefire_wasted: strategy == "server" && outcome == "committed",
+                prefire_stale: false,
+                history_revision: prepared
+                    .map(|prepared| prepared.snapshot.chat_revision)
+                    .unwrap_or(0),
+                request_identity_generation: prepared
+                    .map(|prepared| prepared.snapshot.request_identity_generation)
+                    .unwrap_or(0),
+                cas_outcome,
+                checkpoint_schema: (outcome == "committed").then_some(if strategy == "server" {
+                    2
+                } else {
+                    1
+                }),
+                checkpoint_bytes,
+                restore_outcome: None,
+                marker_repaired: false,
+                tokens_before: prepared
+                    .map(|prepared| prepared.snapshot.pre_compaction_tokens)
+                    .unwrap_or(0),
+                tokens_after,
+                token_seed_source,
+                commit_failure_step,
+            },
+        );
+    }
+
+    async fn notify_compaction_fallback(
+        &self,
+        strategy_started_notified: &mut bool,
+        reason: crate::session::responses_server_compaction::ServerCompactionFailureReason,
+    ) {
+        if !*strategy_started_notified {
+            *strategy_started_notified = true;
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::CompactionFallbackStarted {
+                    reason: reason.as_str().to_string(),
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn notify_compaction_migration(
+        &self,
+        strategy_started_notified: &mut bool,
+        reason: &str,
+    ) {
+        if !*strategy_started_notified {
+            *strategy_started_notified = true;
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::CompactionMigrationStarted {
+                    reason: reason.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn discard_prefire(&self) {
+        if let Some(handle) = self.compaction.prefire.take_handle() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        self.compaction.prefire.clear();
+        self.compaction.prefire.finish();
+    }
+
+    async fn persist_server_sidecar(
+        &self,
+        relative_path: String,
+        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV2,
+    ) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::ResponsesCompactionCheckpointV2 {
+                relative_path,
+                checkpoint,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("checkpoint persistence channel unavailable")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error().data("checkpoint persistence acknowledgement lost")
+            })?
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+    }
+
+    async fn stage_server_segment(
+        &self,
+        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV1,
+    ) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::ResponsesCompactionSegmentStage {
+                staging,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("segment staging channel unavailable")
+            })?;
+        response
+            .await
+            .map_err(|_| acp::Error::internal_error().data("segment staging acknowledgement lost"))?
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+    }
+
+    async fn publish_server_segment(&self, checkpoint_id: String) -> Result<(), acp::Error> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::ResponsesCompactionSegmentPublish {
+                checkpoint_id,
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data("segment publication channel unavailable")
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                acp::Error::internal_error().data("segment publication acknowledgement lost")
+            })?
+            .map(|_| ())
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+    }
+
+    async fn persist_server_marker(
+        &self,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV1,
+    ) {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let marker = crate::session::storage::responses_compaction::marker_for_wrapper(wrapper);
+        self.persist_xai_update_only(XaiSessionUpdate::CompactionCheckpoint(Box::new(marker)));
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        if self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::FlushAndAck { respond_to })
+            .is_ok()
+        {
+            let _ = response.await;
+        }
+    }
+
+    async fn commit_compaction_replacement(
+        &self,
+        operation_id: String,
+        history_revision: u64,
+        request_identity_generation: u64,
+        replacement: Vec<ConversationItem>,
+        committed_total_tokens: u64,
+    ) -> Result<bool, acp::Error> {
+        let result = self
+            .chat_state_handle
+            .commit_compaction(xai_chat_state::CommitCompaction {
+                operation_id,
+                expected_history_revision: history_revision,
+                expected_request_identity_generation: request_identity_generation,
+                replacement,
+                committed_total_tokens,
+            })
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        match result {
+            xai_chat_state::CommitCompactionResult::Committed { .. } => Ok(true),
+            xai_chat_state::CommitCompactionResult::Superseded { .. } => Ok(false),
+            xai_chat_state::CommitCompactionResult::PersistenceFailed(error) => {
+                Err(acp::Error::internal_error().data(error.to_string()))
+            }
+        }
+    }
+
+    async fn finish_committed_compaction(
+        &self,
+        new_len: usize,
+        context_window: u64,
+        compact_source: &str,
+    ) -> u64 {
+        if self.startup_hints.inherited_prefix_len.is_some() {
+            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
+            if xai_token_estimation::exceeds_threshold(
+                post_replace_tokens,
+                context_window,
+                self.compaction.threshold_percent.get(),
+            ) {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    post_replace_tokens,
+                    context_window,
+                    "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
+                );
+            } else {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.compaction
+                .auto_compact_suppressed
+                .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last_idle_flush_conversation_len
+            .store(new_len, std::sync::atomic::Ordering::Relaxed);
+        self.memory
+            .context_injected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if self.memory.is_enabled() {
+            tracing::info!(target: xai_grok_telemetry::memory_log::TARGET, "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)");
+        }
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::PlanState(
+                crate::tools::todo::TodoState::default(),
+            ));
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_agents_md_compaction()
+            .await;
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_skill_discovery_compaction()
+            .await;
+        self.persist_announcement_state().await;
+        self.plan_mode.lock().reset_after_compaction();
+        self.persist_plan_mode_state();
+        self.dispatch_hook(
+            xai_grok_hooks::event::HookEventName::PostCompact,
+            xai_grok_hooks::event::HookPayload::PostCompact {
+                source: compact_source.into(),
+            },
+            None,
+            None,
+        )
+        .await;
+        self.chat_state_handle.get_total_tokens().await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_compact_inner(
+        &self,
+        user_context: Option<String>,
+        auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
+        trigger: xai_grok_telemetry::events::CompactionTrigger,
+        strategy: CompactionStrategy,
+        mut normal_request: Option<ConversationRequest>,
+        mut supersedes_compaction_id: Option<String>,
+        mut strategy_started_notified: bool,
+        mut supersede_attempt: u8,
+    ) -> Result<(), acp::Error> {
+        loop {
+            match self
+                .run_compact_attempt(
+                    user_context.clone(),
+                    auto_continue.clone(),
+                    trigger,
+                    strategy,
+                    normal_request.take(),
+                    supersedes_compaction_id.clone(),
+                    strategy_started_notified,
+                    supersede_attempt,
+                )
+                .await?
+            {
+                CompactionAttemptOutcome::Committed => return Ok(()),
+                CompactionAttemptOutcome::Superseded {
+                    compaction_id,
+                    strategy_started_notified: notified,
+                } => {
+                    supersedes_compaction_id = Some(compaction_id);
+                    strategy_started_notified = notified;
+                    supersede_attempt = supersede_attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
     /// Inner implementation of compaction that supports an optional `auto_continue`
     /// payload for the checkpoint.
     #[tracing::instrument(
@@ -898,16 +1803,23 @@ impl SessionActor {
             compaction_prefix_released = tracing::field::Empty,
         )
     )]
-    async fn run_compact_inner(
+    async fn run_compact_attempt(
         &self,
         user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
-    ) -> Result<(), acp::Error> {
+        strategy: CompactionStrategy,
+        normal_request: Option<ConversationRequest>,
+        supersedes_compaction_id: Option<String>,
+        mut strategy_started_notified: bool,
+        supersede_attempt: u8,
+    ) -> Result<CompactionAttemptOutcome, acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
-        self.signals_handle().record_compaction(tokens_before);
+        if supersede_attempt == 0 {
+            self.signals_handle().record_compaction(tokens_before);
+        }
         let trigger_str = match trigger {
             xai_grok_telemetry::events::CompactionTrigger::Manual => "manual",
             xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
@@ -944,22 +1856,119 @@ impl SessionActor {
             user_context.is_some(),
         );
         let compact_source = trigger_str;
-        self.dispatch_hook(
-            xai_grok_hooks::event::HookEventName::PreCompact,
-            xai_grok_hooks::event::HookPayload::PreCompact {
-                source: compact_source.into(),
-            },
-            None,
-            None,
-        )
-        .await;
+        if supersede_attempt == 0 {
+            self.dispatch_hook(
+                xai_grok_hooks::event::HookEventName::PreCompact,
+                xai_grok_hooks::event::HookPayload::PreCompact {
+                    source: compact_source.into(),
+                },
+                None,
+                None,
+            )
+            .await;
+        }
         let max_retries = 3u32;
         let retry_delay_secs = 3u64;
-        let (conv_len, system_message, full_conversation) = tokio::join!(
-            self.chat_state_handle.get_conversation_len(),
-            self.chat_state_handle.get_system_message(),
-            self.chat_state_handle.get_conversation(),
-        );
+        let cancellation = super::tasks_cancel::current_turn_cancellation();
+        let preparation = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                self.send_xai_notification(
+                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                        reason: "cancelled".into(),
+                    },
+                )
+                .await;
+                compaction.complete(tokens_before);
+                return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
+            }
+            result = self.prepare_server_request(
+                user_context.as_deref(),
+                normal_request.as_ref(),
+                trigger,
+                cancellation.clone(),
+            ) => result,
+        };
+        let (prepared_server, server_preparation_failure) = match preparation {
+            Ok(prepared) => (prepared, None),
+            Err(error)
+                if error.data.as_ref().and_then(serde_json::Value::as_str)
+                    == Some("responses_compaction_stale_request") =>
+            {
+                self.log_strategy_attempt(
+                    &compaction.compaction_id,
+                    supersedes_compaction_id.as_deref(),
+                    None,
+                    "server",
+                    true,
+                    None,
+                    0,
+                    "superseded",
+                    None,
+                    None,
+                    0,
+                    0,
+                    0,
+                    false,
+                    "superseded",
+                    None,
+                    None,
+                    None,
+                    Some("request_snapshot"),
+                );
+                let current_tokens = self.chat_state_handle.get_total_tokens().await;
+                let superseded_compaction_id = compaction.compaction_id.clone();
+                compaction.complete(current_tokens);
+                return Ok(CompactionAttemptOutcome::Superseded {
+                    compaction_id: superseded_compaction_id,
+                    strategy_started_notified,
+                });
+            }
+            Err(error) => {
+                let reason = if error.data.as_ref().and_then(serde_json::Value::as_str)
+                    == Some("responses_compaction_request_too_large")
+                {
+                    crate::session::responses_server_compaction::ServerCompactionFailureReason::RequestTooLarge
+                } else {
+                    crate::session::responses_server_compaction::ServerCompactionFailureReason::InvalidResponse
+                };
+                (None, Some(reason))
+            }
+        };
+        let actor_snapshot = if let Some(prepared) = prepared_server.as_ref() {
+            xai_chat_state::ChatCompactionSnapshot {
+                history_revision: prepared.snapshot.chat_revision,
+                request_identity_generation: prepared.snapshot.request_identity_generation,
+                prompt_index: prepared.snapshot.prompt_index,
+                total_tokens: prepared.snapshot.pre_compaction_tokens,
+                conversation: prepared.snapshot.portable_history.clone(),
+                sampling_config: self
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .ok_or_else(|| acp::Error::internal_error().data("missing sampling config"))?,
+                bound_request_identity: Some(prepared.snapshot.identity.clone()),
+            }
+        } else {
+            let mut snapshot = self
+                .chat_state_handle
+                .get_compaction_snapshot()
+                .await
+                .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+            snapshot.conversation = self
+                .portable_history_for_request(&snapshot.conversation)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            snapshot
+        };
+        let expected_history_revision = actor_snapshot.history_revision;
+        let expected_identity_generation = actor_snapshot.request_identity_generation;
+        let prompt_index_at_compaction = actor_snapshot.prompt_index;
+        let full_conversation = actor_snapshot.conversation.clone();
+        let conv_len = full_conversation.len();
+        let system_message = full_conversation
+            .iter()
+            .find(|item| matches!(item, ConversationItem::System(_)))
+            .cloned();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
                 full_conversation.clone(),
@@ -967,16 +1976,658 @@ impl SessionActor {
         } else {
             Vec::new()
         };
+
+        let migration_reason = match strategy {
+            CompactionStrategy::BuiltinMigration(reason) => Some(reason),
+            CompactionStrategy::ServerFirst => {
+                prepared_server
+                    .as_ref()
+                    .and_then(|prepared| match prepared.checkpoint_status {
+                        xai_chat_state::CheckpointReplayStatus::MigrationRequired
+                        | xai_chat_state::CheckpointReplayStatus::InvalidCheckpoint => {
+                            Some("continuity_mismatch")
+                        }
+                        _ => None,
+                    })
+            }
+        };
+        if let Some(reason) = migration_reason {
+            self.discard_prefire().await;
+            self.notify_compaction_migration(&mut strategy_started_notified, reason)
+                .await;
+        }
+
+        let server_enabled = matches!(strategy, CompactionStrategy::ServerFirst)
+            && self.agent.borrow().compaction_policy().server_compaction
+            && migration_reason.is_none();
+        let server_preparation_fallback = (server_enabled
+            && actor_snapshot.sampling_config.api_backend == ApiBackend::Responses)
+            .then_some(server_preparation_failure)
+            .flatten();
+        if let Some(reason) = server_preparation_fallback {
+            self.log_strategy_attempt(
+                &compaction.compaction_id,
+                supersedes_compaction_id.as_deref(),
+                None,
+                "server",
+                true,
+                None,
+                0,
+                "fallback_started",
+                Some(reason.as_str()),
+                None,
+                0,
+                0,
+                0,
+                false,
+                "not_started",
+                None,
+                None,
+                None,
+                Some("request_build"),
+            );
+            self.notify_compaction_fallback(&mut strategy_started_notified, reason)
+                .await;
+        }
+        let uses_builtin_fallback =
+            server_preparation_fallback.is_some() || (server_enabled && prepared_server.is_some());
+        if server_enabled && let Some(prepared) = prepared_server.as_ref() {
+            let cache_hit =
+                crate::session::responses_server_compaction::process_cache_is_unsupported(
+                    &prepared.capability_key,
+                );
+            let mut server_latency_ms = 0;
+            let server_response = if cache_hit {
+                self.log_strategy_attempt(
+                    &compaction.compaction_id,
+                    supersedes_compaction_id.as_deref(),
+                    Some(prepared),
+                    "server",
+                    true,
+                    None,
+                    0,
+                    "fallback_started",
+                    Some("unsupported"),
+                    None,
+                    0,
+                    0,
+                    0,
+                    true,
+                    "not_started",
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                self.notify_compaction_fallback(
+                    &mut strategy_started_notified,
+                    crate::session::responses_server_compaction::ServerCompactionFailureReason::Unsupported,
+                )
+                .await;
+                None
+            } else {
+                let server_started = std::time::Instant::now();
+                match prepared
+                    .client
+                    .compact_responses(
+                        &prepared.request,
+                        &prepared.snapshot.credential,
+                        &prepared.snapshot.cancellation,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        server_latency_ms = server_started.elapsed().as_millis() as u64;
+                        Some(response)
+                    }
+                    Err(error)
+                        if error.failure()
+                            == xai_grok_sampler::ResponsesCompactFailure::Cancelled =>
+                    {
+                        self.log_strategy_attempt(
+                            &compaction.compaction_id,
+                            supersedes_compaction_id.as_deref(),
+                            Some(prepared),
+                            "server",
+                            true,
+                            None,
+                            error.attempts(),
+                            "cancelled",
+                            None,
+                            error.status(),
+                            server_started.elapsed().as_millis() as u64,
+                            0,
+                            0,
+                            false,
+                            "not_started",
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        self.send_xai_notification(
+                            crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                                reason: "cancelled".into(),
+                            },
+                        )
+                        .await;
+                        return Err(
+                            acp::Error::internal_error().data("responses_compaction_cancelled")
+                        );
+                    }
+                    Err(error) => {
+                        if error.status().is_some_and(
+                            crate::session::responses_server_compaction::NegativeCapabilityCache::status_is_unsupported,
+                        ) {
+                            crate::session::responses_server_compaction::process_cache_record_unsupported(
+                                prepared.capability_key.clone(),
+                            );
+                        }
+                        let reason =
+                            crate::session::responses_server_compaction::classify_compact_failure(
+                                error.failure(),
+                                error.status(),
+                                error.error_code(),
+                            )
+                            .expect("non-cancel compact failures always map to fallback");
+                        self.log_strategy_attempt(
+                            &compaction.compaction_id,
+                            supersedes_compaction_id.as_deref(),
+                            Some(prepared),
+                            "server",
+                            true,
+                            None,
+                            error.attempts(),
+                            "fallback_started",
+                            Some(reason.as_str()),
+                            error.status(),
+                            server_started.elapsed().as_millis() as u64,
+                            0,
+                            0,
+                            false,
+                            "not_started",
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        self.notify_compaction_fallback(&mut strategy_started_notified, reason)
+                            .await;
+                        None
+                    }
+                }
+            };
+            if let Some(response) = server_response {
+                let server_attempts = response.attempts;
+                let server_response_bytes = response.response_bytes as u64;
+                let server_output_items = response.output.len() as u64;
+                match crate::session::responses_server_compaction::server_checkpoint_token_seed(
+                    &response,
+                    prepared.snapshot.semantic_envelope_tokens,
+                    prepared.snapshot.pre_compaction_tokens,
+                ) {
+                    Ok((token_seed, token_seed_source)) => {
+                        let token_seed_source_name = match token_seed_source {
+                            xai_grok_sampling_types::TokenSeedSource::UsageOutputTokens => {
+                                "usage_output_tokens"
+                            }
+                            xai_grok_sampling_types::TokenSeedSource::EstimatedCanonicalOutput => {
+                                "estimated_canonical_output"
+                            }
+                        };
+                        self.discard_prefire().await;
+                        let checkpoint_id = uuid::Uuid::now_v7().to_string();
+                        let operation_id = uuid::Uuid::now_v7().to_string();
+                        let branch_id = uuid::Uuid::now_v7().to_string();
+                        let relative_path = format!("compaction_checkpoints/{checkpoint_id}.json");
+                        let mode_tail = self
+                            .transcript_hint()
+                            .map(ConversationItem::system_reminder)
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let provisional =
+                            crate::session::responses_server_compaction::build_server_successor(
+                                &checkpoint_id,
+                                &operation_id,
+                                prepared.snapshot.prompt_index,
+                                auto_continue.is_some(),
+                                prepared.snapshot.mode.clone(),
+                                &branch_id,
+                                prepared.snapshot.identity.clone(),
+                                response.output,
+                                &relative_path,
+                                token_seed,
+                                token_seed_source,
+                                mode_tail.clone(),
+                            );
+                        let ConversationItem::ResponsesCompactionCheckpoint(wrapper) =
+                            provisional[0].clone()
+                        else {
+                            unreachable!("server successor starts with a wrapper")
+                        };
+                        let original_user_info = prepared
+                            .snapshot
+                            .portable_history
+                            .iter()
+                            .find_map(|item| match item {
+                                ConversationItem::User(user) => {
+                                    user.content.iter().find_map(|part| match part {
+                                        xai_grok_sampling_types::ContentPart::Text { text } => {
+                                            Some(text.to_string())
+                                        }
+                                        _ => None,
+                                    })
+                                }
+                                _ => None,
+                            });
+                        let sidecar = crate::session::storage::responses_compaction::CompactionCheckpointFileV2::new(
+                            *wrapper,
+                            prepared.snapshot.portable_history.clone(),
+                            original_user_info,
+                            Vec::new(),
+                        )
+                        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+                        let segment_staging = self
+                            .compaction
+                            .compaction_mode
+                            .segment_detail()
+                            .map(|detail| {
+                                crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV1::new(
+                                    checkpoint_id.clone(),
+                                    prepared.snapshot.portable_history.clone(),
+                                    "Server Responses checkpoint",
+                                    detail,
+                                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                )
+                            })
+                            .transpose()
+                            .map_err(|error| {
+                                acp::Error::internal_error().data(error.to_string())
+                            })?;
+                        let mut replacement =
+                            vec![ConversationItem::ResponsesCompactionCheckpoint(Box::new(
+                                sidecar.wrapper.clone(),
+                            ))];
+                        replacement.extend(mode_tail);
+                        let committed_total_tokens = token_seed.saturating_add(
+                            xai_chat_state::estimate_conversation_tokens(&replacement[1..]),
+                        );
+                        if prepared.snapshot.pre_compaction_tokens > 0
+                            && committed_total_tokens >= prepared.snapshot.pre_compaction_tokens
+                        {
+                            self.log_strategy_attempt(
+                                &compaction.compaction_id,
+                                supersedes_compaction_id.as_deref(),
+                                Some(prepared),
+                                "server",
+                                true,
+                                None,
+                                server_attempts,
+                                "fallback_started",
+                                Some("invalid_response"),
+                                Some(200),
+                                server_latency_ms,
+                                server_response_bytes,
+                                server_output_items,
+                                false,
+                                "not_started",
+                                None,
+                                None,
+                                Some(token_seed_source_name),
+                                None,
+                            );
+                            self.notify_compaction_fallback(
+                                &mut strategy_started_notified,
+                                crate::session::responses_server_compaction::ServerCompactionFailureReason::InvalidResponse,
+                            )
+                            .await;
+                        } else {
+                            if prepared.snapshot.cancellation.is_cancelled() {
+                                self.log_strategy_attempt(
+                                    &compaction.compaction_id,
+                                    supersedes_compaction_id.as_deref(),
+                                    Some(prepared),
+                                    "server",
+                                    true,
+                                    None,
+                                    server_attempts,
+                                    "cancelled",
+                                    None,
+                                    Some(200),
+                                    server_latency_ms,
+                                    server_response_bytes,
+                                    server_output_items,
+                                    false,
+                                    "not_started",
+                                    None,
+                                    None,
+                                    Some(token_seed_source_name),
+                                    None,
+                                );
+                                self.send_xai_notification(
+                                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                                        reason: "cancelled".into(),
+                                    },
+                                )
+                                .await;
+                                compaction
+                                    .complete(self.chat_state_handle.get_total_tokens().await);
+                                return Err(acp::Error::internal_error()
+                                    .data("responses_compaction_cancelled"));
+                            }
+                            let checkpoint_bytes = sidecar.wrapper.portable_history_bytes;
+                            if let Err(error) = self
+                                .persist_server_sidecar(relative_path, sidecar.clone())
+                                .await
+                            {
+                                self.log_strategy_attempt(
+                                    &compaction.compaction_id,
+                                    supersedes_compaction_id.as_deref(),
+                                    Some(prepared),
+                                    "server",
+                                    true,
+                                    None,
+                                    server_attempts,
+                                    "failed",
+                                    None,
+                                    Some(200),
+                                    server_latency_ms,
+                                    server_response_bytes,
+                                    server_output_items,
+                                    false,
+                                    "not_started",
+                                    Some(checkpoint_bytes),
+                                    None,
+                                    Some(token_seed_source_name),
+                                    Some("sidecar"),
+                                );
+                                return Err(error);
+                            }
+                            if let Some(staging) = segment_staging.clone()
+                                && let Err(error) = self.stage_server_segment(staging).await
+                            {
+                                self.log_strategy_attempt(
+                                    &compaction.compaction_id,
+                                    supersedes_compaction_id.as_deref(),
+                                    Some(prepared),
+                                    "server",
+                                    true,
+                                    None,
+                                    server_attempts,
+                                    "failed",
+                                    None,
+                                    Some(200),
+                                    server_latency_ms,
+                                    server_response_bytes,
+                                    server_output_items,
+                                    false,
+                                    "not_started",
+                                    Some(checkpoint_bytes),
+                                    None,
+                                    Some(token_seed_source_name),
+                                    Some("segment_staging"),
+                                );
+                                return Err(error);
+                            }
+                            if prepared.snapshot.cancellation.is_cancelled() {
+                                self.log_strategy_attempt(
+                                    &compaction.compaction_id,
+                                    supersedes_compaction_id.as_deref(),
+                                    Some(prepared),
+                                    "server",
+                                    true,
+                                    None,
+                                    server_attempts,
+                                    "cancelled",
+                                    None,
+                                    Some(200),
+                                    server_latency_ms,
+                                    server_response_bytes,
+                                    server_output_items,
+                                    false,
+                                    "not_started",
+                                    Some(checkpoint_bytes),
+                                    None,
+                                    Some(token_seed_source_name),
+                                    Some("precommit"),
+                                );
+                                self.send_xai_notification(
+                                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                                        reason: "cancelled".into(),
+                                    },
+                                )
+                                .await;
+                                compaction
+                                    .complete(self.chat_state_handle.get_total_tokens().await);
+                                return Err(acp::Error::internal_error()
+                                    .data("responses_compaction_cancelled"));
+                            }
+                            let committed = match self
+                                .commit_compaction_replacement(
+                                    operation_id,
+                                    prepared.snapshot.chat_revision,
+                                    prepared.snapshot.request_identity_generation,
+                                    replacement.clone(),
+                                    committed_total_tokens,
+                                )
+                                .await
+                            {
+                                Ok(committed) => committed,
+                                Err(error) => {
+                                    self.log_strategy_attempt(
+                                        &compaction.compaction_id,
+                                        supersedes_compaction_id.as_deref(),
+                                        Some(prepared),
+                                        "server",
+                                        true,
+                                        None,
+                                        server_attempts,
+                                        "failed",
+                                        None,
+                                        Some(200),
+                                        server_latency_ms,
+                                        server_response_bytes,
+                                        server_output_items,
+                                        false,
+                                        "failed",
+                                        Some(checkpoint_bytes),
+                                        None,
+                                        Some(token_seed_source_name),
+                                        Some("history"),
+                                    );
+                                    return Err(error);
+                                }
+                            };
+                            if !committed {
+                                self.log_strategy_attempt(
+                                    &compaction.compaction_id,
+                                    supersedes_compaction_id.as_deref(),
+                                    Some(prepared),
+                                    "server",
+                                    true,
+                                    None,
+                                    server_attempts,
+                                    "superseded",
+                                    None,
+                                    Some(200),
+                                    server_latency_ms,
+                                    server_response_bytes,
+                                    server_output_items,
+                                    false,
+                                    "superseded",
+                                    Some(checkpoint_bytes),
+                                    None,
+                                    Some(token_seed_source_name),
+                                    None,
+                                );
+                                let current_tokens =
+                                    self.chat_state_handle.get_total_tokens().await;
+                                let superseded_compaction_id = compaction.compaction_id.clone();
+                                compaction.complete(current_tokens);
+                                return Ok(CompactionAttemptOutcome::Superseded {
+                                    compaction_id: superseded_compaction_id,
+                                    strategy_started_notified,
+                                });
+                            }
+                            self.chat_state_handle
+                                .record_compaction_at(prepared.snapshot.prompt_index);
+                            self.compaction
+                                .prefix_released
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.persist_server_marker(&sidecar.wrapper).await;
+                            let segment_publish_failed = if segment_staging.is_some() {
+                                self.publish_server_segment(checkpoint_id).await.err()
+                            } else {
+                                None
+                            };
+                            if let Some(error) = segment_publish_failed.as_ref() {
+                                tracing::warn!(
+                                    error = %error,
+                                    "committed Responses compaction segment will be repaired on resume"
+                                );
+                            }
+                            let tokens_after = self
+                                .finish_committed_compaction(
+                                    replacement.len(),
+                                    context_window,
+                                    compact_source,
+                                )
+                                .await;
+                            self.log_strategy_attempt(
+                                &compaction.compaction_id,
+                                supersedes_compaction_id.as_deref(),
+                                Some(prepared),
+                                "server",
+                                true,
+                                None,
+                                server_attempts,
+                                "committed",
+                                None,
+                                Some(200),
+                                server_latency_ms,
+                                server_response_bytes,
+                                server_output_items,
+                                false,
+                                "committed",
+                                Some(checkpoint_bytes),
+                                Some(tokens_after),
+                                Some(token_seed_source_name),
+                                segment_publish_failed.as_ref().map(|_| "segment_publish"),
+                            );
+                            let span = tracing::Span::current();
+                            span.record("compaction_tokens_after", tokens_after as i64);
+                            span.record("compaction_attempts", 1_i64);
+                            span.record("compaction_outcome", "server_success");
+                            compaction.complete(tokens_after);
+                            return Ok(CompactionAttemptOutcome::Committed);
+                        }
+                    }
+                    Err(_) => {
+                        self.log_strategy_attempt(
+                            &compaction.compaction_id,
+                            supersedes_compaction_id.as_deref(),
+                            Some(prepared),
+                            "server",
+                            true,
+                            None,
+                            server_attempts,
+                            "fallback_started",
+                            Some("invalid_response"),
+                            Some(200),
+                            server_latency_ms,
+                            server_response_bytes,
+                            server_output_items,
+                            false,
+                            "not_started",
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        self.notify_compaction_fallback(
+                            &mut strategy_started_notified,
+                            crate::session::responses_server_compaction::ServerCompactionFailureReason::InvalidResponse,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        if let Some(reason) = migration_reason {
+            self.log_strategy_attempt(
+                &compaction.compaction_id,
+                supersedes_compaction_id.as_deref(),
+                prepared_server.as_ref(),
+                "builtin_migration",
+                false,
+                Some(reason),
+                0,
+                "started",
+                None,
+                None,
+                0,
+                0,
+                0,
+                false,
+                "not_started",
+                None,
+                None,
+                None,
+                None,
+            );
+        } else if (!server_enabled || prepared_server.is_none())
+            && server_preparation_fallback.is_none()
+        {
+            let skip_reason = if !self.agent.borrow().compaction_policy().server_compaction {
+                "feature_off"
+            } else if actor_snapshot.sampling_config.api_backend != ApiBackend::Responses {
+                "non_responses"
+            } else {
+                "unstable_principal"
+            };
+            self.log_strategy_attempt(
+                &compaction.compaction_id,
+                supersedes_compaction_id.as_deref(),
+                prepared_server.as_ref(),
+                "builtin_direct",
+                false,
+                Some(skip_reason),
+                0,
+                "started",
+                None,
+                None,
+                0,
+                0,
+                0,
+                false,
+                "not_started",
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        if cancellation.is_cancelled() {
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                    reason: "cancelled".into(),
+                },
+            )
+            .await;
+            compaction.complete(self.chat_state_handle.get_total_tokens().await);
+            return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
+        }
+        let builtin_started = std::time::Instant::now();
         const SUMMARY_BUDGET_RESERVE_TOKENS: u64 = 32_768;
         let verbatim_input_enabled = self.compaction.verbatim_input;
         let simplified_messages = if verbatim_input_enabled {
             xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
-                full_conversation,
+                full_conversation.clone(),
                 summary_strips_reasoning,
             )
         } else {
             xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
-                full_conversation,
+                full_conversation.clone(),
             )
         };
         if conv_len == 0 {
@@ -1022,8 +2673,7 @@ impl SessionActor {
             return Err(acp::Error::internal_error()
                 .data("Compaction failed: no system message in simplified conversation"));
         }
-        let sampling_config = self.reconstruct_full_config().await;
-        let sampling_client = self.prepare_chat_completion(false).await?;
+        let (sampling_config, sampling_client) = self.prepare_builtin_compaction_sampling().await?;
         let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
             .prepare_tool_definitions()
@@ -1183,7 +2833,7 @@ impl SessionActor {
                                 error = %message,
                                 "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
                             );
-                            let conv = self.chat_state_handle.get_conversation().await;
+                            let conv = full_conversation.clone();
                             request_turns = match stage {
                                 InputStage::VerbatimFitted => {
                                     let budget = context_window
@@ -1303,7 +2953,7 @@ impl SessionActor {
         };
         let generate_session_compact = compact_output.content.clone();
         let user_message_prefix = self.build_user_message_prefix().await;
-        let conversation = self.chat_state_handle.get_conversation().await;
+        let conversation = full_conversation.clone();
         let (discovered_agents_md, all_skills_for_compaction, _agent_edited_paths, state_context) =
             if use_short_prompt {
                 let empty_edited: std::collections::BTreeSet<String> = Default::default();
@@ -1648,32 +3298,27 @@ impl SessionActor {
                 summary_count,
             })
         };
-        let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
-        let original_user_info = self
-            .chat_state_handle
-            .get_conversation_item_at(1)
-            .await
-            .and_then(|item| match item {
-                ConversationItem::User(parts) => {
-                    parts.content.into_iter().next().and_then(|p| match p {
-                        xai_grok_sampling_types::ContentPart::Text { text } => {
-                            Some(text.as_ref().to_owned())
-                        }
-                        _ => None,
-                    })
-                }
+        let original_user_info = full_conversation.iter().find_map(|item| match item {
+            ConversationItem::User(parts) => parts.content.iter().find_map(|part| match part {
+                xai_grok_sampling_types::ContentPart::Text { text } => Some(text.to_string()),
                 _ => None,
-            });
+            }),
+            _ => None,
+        });
         if cancel.is_cancelled() {
-            return self.emit_compact_cancelled(auto_trigger).await;
+            let tokens = self.chat_state_handle.get_total_tokens().await;
+            let result = self.emit_compact_cancelled(auto_trigger).await;
+            compaction.complete(tokens);
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => unreachable!("emit_compact_cancelled always returns Err"),
+            };
         }
         self.persist_compaction_segment(&segment_messages, &generate_session_compact);
-        self.chat_state_handle
-            .record_compaction_at(prompt_index_at_compaction);
-        self.persist_compaction_checkpoint(
+        let checkpoint_marker = self.persist_compaction_checkpoint_file(
             &compacted_history,
             prompt_index_at_compaction,
-            auto_continue,
+            auto_continue.clone(),
             original_user_info,
         );
         let prefix_len = if self
@@ -1697,71 +3342,92 @@ impl SessionActor {
             .await
         };
         let new_len = compacted_history.len();
+        let committed_total_tokens =
+            xai_chat_state::estimate_conversation_tokens(&compacted_history);
+        if cancel.is_cancelled() {
+            let tokens = self.chat_state_handle.get_total_tokens().await;
+            let result = self.emit_compact_cancelled(auto_trigger).await;
+            compaction.complete(tokens);
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => unreachable!("emit_compact_cancelled always returns Err"),
+            };
+        }
+        if cancellation.is_cancelled() {
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
+                    reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
+                },
+            )
+            .await;
+            compaction.complete(self.chat_state_handle.get_total_tokens().await);
+            return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
+        }
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        if !self
+            .commit_compaction_replacement(
+                operation_id,
+                expected_history_revision,
+                expected_identity_generation,
+                compacted_history,
+                committed_total_tokens,
+            )
+            .await?
+        {
+            self.log_strategy_attempt(
+                &compaction.compaction_id,
+                supersedes_compaction_id.as_deref(),
+                prepared_server.as_ref(),
+                if migration_reason.is_some() {
+                    "builtin_migration"
+                } else if uses_builtin_fallback {
+                    "builtin_fallback"
+                } else {
+                    "builtin_direct"
+                },
+                false,
+                migration_reason,
+                telemetry.attempts.min(u32::from(u8::MAX)) as u8,
+                "superseded",
+                None,
+                None,
+                builtin_started.elapsed().as_millis() as u64,
+                0,
+                0,
+                false,
+                "superseded",
+                None,
+                None,
+                None,
+                None,
+            );
+            let current_tokens = self.chat_state_handle.get_total_tokens().await;
+            let superseded_compaction_id = compaction.compaction_id.clone();
+            compaction.complete(current_tokens);
+            return Ok(CompactionAttemptOutcome::Superseded {
+                compaction_id: superseded_compaction_id,
+                strategy_started_notified,
+            });
+        }
         self.chat_state_handle
-            .replace_conversation_for_compaction(compacted_history);
-        if self.startup_hints.inherited_prefix_len.is_some() {
-            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
-            if xai_token_estimation::exceeds_threshold(
-                post_replace_tokens,
-                context_window,
-                self.compaction.threshold_percent.get(),
-            ) {
-                self.compaction
-                    .auto_compact_suppressed
-                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    post_replace_tokens,
-                    context_window,
-                    "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
-                );
-            } else {
-                self.compaction
-                    .auto_compact_suppressed
-                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
-            }
-        } else {
-            self.compaction
-                .auto_compact_suppressed
-                .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.last_idle_flush_conversation_len
-            .store(new_len, std::sync::atomic::Ordering::Relaxed);
-        self.memory
-            .context_injected
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        if self.memory.is_enabled() {
-            tracing::info!(target: xai_grok_telemetry::memory_log::TARGET, "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)");
-        }
-        let _ = self
+            .record_compaction_at(prompt_index_at_compaction);
+        self.persist_xai_update_only(
+            crate::extensions::notification::SessionUpdate::CompactionCheckpoint(Box::new(
+                checkpoint_marker,
+            )),
+        );
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        if self
             .notifications
             .persistence_tx
-            .send(PersistenceMsg::PlanState(
-                crate::tools::todo::TodoState::default(),
-            ));
-        self.agent
-            .borrow()
-            .tool_bridge()
-            .on_agents_md_compaction()
+            .send(PersistenceMsg::FlushAndAck { respond_to })
+            .is_ok()
+        {
+            let _ = response.await;
+        }
+        let tokens_after = self
+            .finish_committed_compaction(new_len, context_window, compact_source)
             .await;
-        self.agent
-            .borrow()
-            .tool_bridge()
-            .on_skill_discovery_compaction()
-            .await;
-        self.persist_announcement_state().await;
-        self.plan_mode.lock().reset_after_compaction();
-        self.persist_plan_mode_state();
-        self.dispatch_hook(
-            xai_grok_hooks::event::HookEventName::PostCompact,
-            xai_grok_hooks::event::HookPayload::PostCompact {
-                source: compact_source.into(),
-            },
-            None,
-            None,
-        )
-        .await;
-        let tokens_after = self.chat_state_handle.get_total_tokens().await;
         {
             let span = tracing::Span::current();
             span.record("compaction_tokens_after", tokens_after as i64);
@@ -1805,8 +3471,36 @@ impl SessionActor {
                 span.record("compaction_itl_max_ms", ms as i64);
             }
         }
+        let builtin_strategy = if migration_reason.is_some() {
+            "builtin_migration"
+        } else if uses_builtin_fallback {
+            "builtin_fallback"
+        } else {
+            "builtin_direct"
+        };
+        self.log_strategy_attempt(
+            &compaction.compaction_id,
+            supersedes_compaction_id.as_deref(),
+            prepared_server.as_ref(),
+            builtin_strategy,
+            false,
+            migration_reason,
+            telemetry.attempts.min(u32::from(u8::MAX)) as u8,
+            "committed",
+            None,
+            None,
+            builtin_started.elapsed().as_millis() as u64,
+            0,
+            0,
+            false,
+            "committed",
+            None,
+            Some(tokens_after),
+            None,
+            None,
+        );
         compaction.complete(tokens_after);
-        Ok(())
+        Ok(CompactionAttemptOutcome::Committed)
     }
     /// Check if auto-compact should be triggered based on context window usage.
     /// Returns Some(AutoCompactTriggerInfo) if threshold is reached, None otherwise.
@@ -1993,12 +3687,11 @@ impl SessionActor {
             cfg.context_window.get(),
             trigger_info.percentage,
         );
-        if let Err(e) = self.run_compact_only(trigger_info).await {
-            tracing::error!(error = %e, "Model-switch compaction failed");
-            if Self::is_auth_compact_error(&e) {
-                return Err(self.surface_compact_auth_failure(e).await);
-            }
-        }
+        // Defer to the next exact-request pre-provider stage so the downshift
+        // compaction snapshots the final tools/prompt/auth envelope.
+        self.compaction
+            .force_compact
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     /// Record the current model for model-switch detection on the next turn.
@@ -2013,6 +3706,14 @@ impl SessionActor {
         }
     }
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
+    pub(crate) async fn run_compact_only(
+        self: &Arc<Self>,
+        trigger_info: AutoCompactTriggerInfo,
+    ) -> Result<(), acp::Error> {
+        self.run_compact_only_with_request(trigger_info, None).await
+    }
+
+    /// Same operation when the turn already froze its exact normal request.
     /// Emits telemetry (`auto_compact_fired`) and UI notifications automatically.
     #[tracing::instrument(
         name = "session.compact",
@@ -2028,9 +3729,10 @@ impl SessionActor {
             error = tracing::field::Empty,
         )
     )]
-    pub(crate) async fn run_compact_only(
+    pub(crate) async fn run_compact_only_with_request(
         self: &Arc<Self>,
         trigger_info: AutoCompactTriggerInfo,
+        normal_request: Option<ConversationRequest>,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
@@ -2041,8 +3743,6 @@ impl SessionActor {
             tokens_before: trigger_info.tokens_used,
             percentage: trigger_info.percentage,
         });
-        self.signals_handle()
-            .record_compaction(trigger_info.tokens_used);
         self.send_xai_notification(XaiSessionUpdate::AutoCompactStarted {
             tokens_used: trigger_info.tokens_used,
             context_window: trigger_info.context_window,
@@ -2062,6 +3762,11 @@ impl SessionActor {
                 None,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
+                CompactionStrategy::ServerFirst,
+                normal_request,
+                None,
+                false,
+                0,
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -2084,16 +3789,24 @@ impl SessionActor {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
-                let cancelled = self.compaction.cancel.is_cancelled()
-                    || e.data.as_ref().and_then(|d| d.as_str()).is_some_and(|s| {
-                        s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
-                    });
-                if !cancelled
-                    && self
-                        .compaction
-                        .auto_compact_suppressed
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == SUPPRESS_NONE
+                let cancelled = Self::is_compaction_cancelled(&e)
+                    || self.compaction.cancel.is_cancelled()
+                    || e.data
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| {
+                            message.contains(
+                                crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
+                            )
+                        });
+                if cancelled {
+                    return Err(e);
+                }
+                if self
+                    .compaction
+                    .auto_compact_suppressed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == SUPPRESS_NONE
                 {
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
                         error: String::new(),
@@ -2179,21 +3892,16 @@ impl SessionActor {
             );
         }
     }
-    /// Persist a compaction checkpoint: writes the compacted history to a separate file
-    /// and records a `CompactionCheckpoint` marker in `updates.jsonl`.
-    ///
-    /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
-    /// and an auto-continue prompt will follow.
-    fn persist_compaction_checkpoint(
+    /// Queue the builtin checkpoint file before history commit. The caller
+    /// appends the returned marker only after the acknowledged CAS commits.
+    fn persist_compaction_checkpoint_file(
         &self,
         compacted_history: &[ConversationItem],
         prompt_index_at_compaction: usize,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         original_user_info: Option<String>,
-    ) {
-        use crate::extensions::notification::{
-            CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
-        };
+    ) -> crate::extensions::notification::CompactionCheckpointInfo {
+        use crate::extensions::notification::{CompactionCheckpointFile, CompactionCheckpointInfo};
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
         let checkpoint_file = format!("compaction_checkpoints/{checkpoint_id}.json");
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -2220,13 +3928,18 @@ impl SessionActor {
             checkpoint_file,
             auto_continue,
             schema_version: 1,
+            operation_id: None,
+            branch_id: None,
+            portable_history_sha256: None,
+            responses_mode: None,
+            responses_auto_continue: None,
             created_at,
         };
-        self.persist_xai_update_only(XaiSessionUpdate::CompactionCheckpoint(Box::new(info)));
         tracing::info!(
             prompt_index_at_compaction,
-            "Persisted compaction checkpoint"
+            "Queued compaction checkpoint file"
         );
+        info
     }
 }
 #[cfg(test)]

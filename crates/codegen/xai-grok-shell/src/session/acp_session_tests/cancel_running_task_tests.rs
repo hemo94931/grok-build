@@ -1081,6 +1081,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         })
                         .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state
                     .pending_inputs
@@ -1170,6 +1171,7 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert_eq!(actor.events.take_prior_interrupt_category(), None);
@@ -1212,6 +1214,7 @@ async fn cancel_without_active_tool_arms_interrupt_reminder() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert!(!actor.events.has_active_tool());
@@ -1253,6 +1256,7 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             let zombie_guard = crate::tools::tool_context::BlockingWaitGuard::enter(
@@ -1317,6 +1321,7 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert!(!actor.events.has_active_tool());
@@ -1565,6 +1570,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(running_item);
                 state.pending_inputs.push_back(q1_item);
@@ -2360,6 +2366,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 state.running_task = Some(AgentTask {
                     prompt_id: "running".into(),
                     handle: task.abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             actor.cancel_running_task(true, false, false, None).await;
@@ -2506,6 +2513,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state
                     .pending_inputs

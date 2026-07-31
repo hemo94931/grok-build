@@ -286,8 +286,6 @@ impl SessionActor {
         }
         save_prompt_context(&self.session_info, &new_prompt_context);
         save_system_prompt(&self.session_info, &new_system_prompt);
-        let snapshot = self.chat_state_handle.get_conversation().await;
-        persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
         self.mcp_reminder_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.send_available_commands_update().await;
@@ -326,17 +324,26 @@ impl SessionActor {
             return;
         };
         save_system_prompt(&self.session_info, &system_prompt);
-        if changed {
-            tracing::info!(
-                session_id = %self.session_info.id.0,
-                prompt_len = system_prompt.len(),
-                "handle_replace_system_prompt: client override applied"
-            );
-        } else {
-            tracing::debug!(
-                session_id = %self.session_info.id.0,
-                "handle_replace_system_prompt: head already matches, no-op"
-            );
+        match changed {
+            xai_chat_state::ReplaceSystemHeadResult::Replaced => {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    prompt_len = system_prompt.len(),
+                    "handle_replace_system_prompt: client override applied"
+                );
+            }
+            xai_chat_state::ReplaceSystemHeadResult::MigrationRequired => {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    "handle_replace_system_prompt: checkpoint continuity migration required"
+                );
+            }
+            xai_chat_state::ReplaceSystemHeadResult::Unchanged => {
+                tracing::debug!(
+                    session_id = %self.session_info.id.0,
+                    "handle_replace_system_prompt: head already matches, no-op"
+                );
+            }
         }
     }
 }

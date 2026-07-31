@@ -53,9 +53,20 @@ impl Drop for TurnActiveGuard {
     }
 }
 
+tokio::task_local! {
+    static TURN_CANCELLATION: tokio_util::sync::CancellationToken;
+}
+
+pub(super) fn current_turn_cancellation() -> tokio_util::sync::CancellationToken {
+    TURN_CANCELLATION
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new())
+}
+
 pub(crate) struct AgentTask {
     pub(crate) prompt_id: String,
     pub(crate) handle: tokio::task::AbortHandle,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl AgentTask {
@@ -75,9 +86,10 @@ impl AgentTask {
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
     ) -> Self {
         let pid = prompt_id.clone();
-        Self {
-            prompt_id,
-            handle: tokio::task::spawn_local(async move {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let handle =
+            tokio::task::spawn_local(TURN_CANCELLATION.scope(task_cancellation, async move {
                 run_task(
                     session.clone(),
                     input,
@@ -94,12 +106,21 @@ impl AgentTask {
                     parsed_prompt_tx,
                 )
                 .await
-            })
-            .abort_handle(),
+            }))
+            .abort_handle();
+        Self {
+            prompt_id,
+            handle,
+            cancellation,
         }
     }
 
+    fn signal_cancellation(&self) {
+        self.cancellation.cancel();
+    }
+
     fn abort(&self) {
+        self.signal_cancellation();
         if !self.handle.is_finished() {
             self.handle.abort();
         }
@@ -247,6 +268,12 @@ impl SessionActor {
         rewind_if_pristine: bool,
         trigger: Option<String>,
     ) {
+        {
+            let state = self.state.try_lock().expect("session state is actor-owned");
+            if let Some(task) = state.running_task.as_ref() {
+                task.signal_cancellation();
+            }
+        }
         let suppress_task_wakes = trigger.as_deref() == Some("ctrl_c");
         // Abort in-flight `/compact` or auto-compact generation (stream select +
         // pre-replace guard). Safe when no compact is running.
@@ -700,7 +727,7 @@ impl SessionActor {
 mod task_slot_tests {
     // Exercises the shared `TaskSlot<T>` primitive that backs both the deferred
     // prefix and the idle-notification debounce: arm / take / cancel / re-arm.
-    use super::TaskSlot;
+    use super::{AgentTask, TURN_CANCELLATION, TaskSlot, current_turn_cancellation};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -712,6 +739,29 @@ mod task_slot_tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
             f.fetch_add(by, Ordering::SeqCst);
         }));
+    }
+
+    #[tokio::test]
+    async fn running_turn_shares_the_cancel_source() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        TURN_CANCELLATION
+            .scope(cancellation.clone(), async {
+                let current = current_turn_cancellation();
+                assert!(!current.is_cancelled());
+                cancellation.cancel();
+                current.cancelled().await;
+            })
+            .await;
+
+        let pending = tokio::spawn(std::future::pending::<()>());
+        let task = AgentTask {
+            prompt_id: "prompt".into(),
+            handle: pending.abort_handle(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let linked = task.cancellation.clone();
+        task.abort();
+        assert!(linked.is_cancelled());
     }
 
     /// A task left armed runs to completion once its delay elapses.

@@ -528,6 +528,7 @@ pub(crate) fn running_task_stub(prompt_id: &str) -> AgentTask {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         })
         .abort_handle(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
     }
 }
 #[cfg(test)]

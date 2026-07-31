@@ -1026,6 +1026,8 @@ pub(crate) async fn run_shell_child(
         ctx.resolve_compaction_verbatim_input(),
         ctx.resolve_compaction_tool_choice(),
         false,
+        ctx.resolve_server_compaction_enabled(),
+        ctx.resolve_compact_model(&subagent_model_id),
         None,
         None,
         std::sync::Arc::new(parking_lot::Mutex::new(

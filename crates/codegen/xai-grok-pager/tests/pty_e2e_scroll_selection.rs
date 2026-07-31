@@ -10,6 +10,7 @@ mod common;
 #[path = "pty_e2e/scroll.rs"]
 mod scroll;
 
+#[cfg(unix)]
 #[path = "pty_e2e/bash_full_output_double_click_fold_pty.rs"]
 mod bash_full_output_double_click_fold_pty;
 #[path = "pty_e2e/drag_autoscroll_no_bounce_pty.rs"]
@@ -68,5 +69,6 @@ mod wheel_flood_paints_no_ghost_frames;
 mod wheel_overscroll_at_bottom_reengages_follow_mid_stream;
 #[path = "pty_e2e/wheel_scrolls_viewport_during_streaming_turn.rs"]
 mod wheel_scrolls_viewport_during_streaming_turn;
+#[cfg(unix)]
 #[path = "pty_e2e/word_select_tip_on_double_click_pty.rs"]
 mod word_select_tip_on_double_click_pty;

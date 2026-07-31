@@ -452,7 +452,14 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if compactions_remaining.is_some() || compaction_at_tokens.is_some() {
+        let send_inline_compaction_headers =
+            crate::session::responses_server_compaction::should_send_inline_compaction_headers(
+                self.agent.borrow().compaction_policy().server_compaction,
+                &cfg.api_backend,
+            );
+        if send_inline_compaction_headers
+            && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
+        {
             let has_compaction_summary = self
                 .chat_state_handle
                 .get_last_compaction_prompt_index()
@@ -728,7 +735,7 @@ impl SessionActor {
     /// newly issued session token. The previous client cache inside
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> SamplingConfig {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
@@ -737,7 +744,8 @@ impl SessionActor {
             sampler_config.doom_loop_recovery = None;
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
-        self.sampler_handle.update_config(sampler_config);
+        self.sampler_handle.update_config(sampler_config.clone());
+        sampler_config
     }
     fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
         let auth = self
@@ -764,6 +772,14 @@ impl SessionActor {
     pub(crate) async fn handle_sampling_failure(
         self: &Arc<Self>,
         error: xai_grok_sampler::SamplingErrorInfo,
+    ) -> Result<SamplerFailureRecovery, acp::Error> {
+        self.handle_sampling_failure_for_request(error, None).await
+    }
+
+    async fn handle_sampling_failure_for_request(
+        self: &Arc<Self>,
+        error: xai_grok_sampler::SamplingErrorInfo,
+        normal_request: Option<ConversationRequest>,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
         if self.tool_context.task_output_token_budget.is_some() {
@@ -812,7 +828,10 @@ impl SessionActor {
                     context_window: cw,
                     percentage,
                 };
-                if let Err(e) = self.run_compact_only(trigger_info).await {
+                if let Err(e) = self
+                    .run_compact_only_with_request(trigger_info, normal_request)
+                    .await
+                {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
@@ -1137,7 +1156,24 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        self.prepare_sampler_for_turn().await;
+        let full_config = self.prepare_sampler_for_turn().await;
+        if self
+            .ensure_checkpoint_replayable_for_request(&request, &full_config)
+            .await?
+        {
+            return Ok(SamplerTurnOutcome::CompactAndResubmit);
+        }
+        if matches!(
+            request.items.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            // Freeze the just-validated credential for this provider send.
+            // A later 401 resubmit rebuilds config and may refresh only after
+            // the continuity gate runs again.
+            let mut request_config = full_config.clone();
+            request_config.bearer_resolver = None;
+            self.sampler_handle.update_config(request_config);
+        }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1147,7 +1183,7 @@ impl SessionActor {
         let request_id_str = request_id.as_str().to_string();
         match self
             .sampler_handle
-            .submit_and_collect(request_id, request)
+            .submit_and_collect(request_id, request.clone())
             .await
         {
             Ok((response, metrics)) => {
@@ -1177,7 +1213,10 @@ impl SessionActor {
             Err(rich_err) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
+                match self
+                    .handle_sampling_failure_for_request(info, Some(request))
+                    .await?
+                {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }

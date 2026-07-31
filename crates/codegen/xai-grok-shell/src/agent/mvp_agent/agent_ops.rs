@@ -4212,6 +4212,14 @@ impl MvpAgent {
             .resolve_compaction_verbatim_input();
         let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
+        let server_compaction_enabled = self.cfg.borrow().is_server_compaction_enabled();
+        let compact_model = self
+            .cfg
+            .borrow()
+            .resolve_compact_model_override()
+            .filter(|model| {
+                config::find_model_by_id(&self.models_manager.models(), model).is_some()
+            });
         let auto_update = self.cfg.borrow().cli.auto_update;
         let client_type = *self.client_type.borrow();
         let buffering_settings = self.buffering_settings.borrow().clone();
@@ -4603,6 +4611,8 @@ impl MvpAgent {
                     compaction_verbatim_input,
                     compaction_tool_choice,
                     two_pass_enabled,
+                    server_compaction_enabled,
+                    compact_model,
                     buffering_settings,
                     origin_client.clone(),
                     self.codebase_indexes.clone(),

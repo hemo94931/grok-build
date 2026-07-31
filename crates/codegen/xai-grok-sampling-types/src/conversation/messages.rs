@@ -270,6 +270,9 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     });
                 }
             }
+            ConversationItem::ResponsesCompactionCheckpoint(_) => unreachable!(
+                "validate_for_backend must reject checkpoints before Messages conversion"
+            ),
         }
     }
 

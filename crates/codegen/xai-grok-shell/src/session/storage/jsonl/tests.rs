@@ -778,6 +778,11 @@ fn checkpoint_record_with_path(id: &str, checkpoint_file: &str) -> SessionUpdate
                     checkpoint_file: checkpoint_file.to_string(),
                     auto_continue: None,
                     schema_version: 1,
+                    operation_id: None,
+                    branch_id: None,
+                    portable_history_sha256: None,
+                    responses_mode: None,
+                    responses_auto_continue: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                 }),
             ),
@@ -3152,6 +3157,7 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3213,6 +3219,7 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3288,6 +3295,7 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);

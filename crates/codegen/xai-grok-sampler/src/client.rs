@@ -32,6 +32,8 @@ use xai_grok_sampling_types::{
 use crate::attribution::bearer_tail_fragment;
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 
+pub mod responses_compact;
+
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
 
@@ -121,7 +123,6 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
             }
             tracing::error!(
                 error = %first_err,
-                raw_data = %data,
                 "Failed to deserialize ResponseStreamEvent from stream"
             );
             return Err(SamplingError::Serialization(first_err));
@@ -309,6 +310,7 @@ fn apply_env_http_headers(
 #[derive(Clone)]
 pub struct SamplingClient {
     http: reqwest::Client,
+    compact_http: reqwest::Client,
     default_headers: HeaderMap,
     base_url: String,
     defaults: ClientDefaults,
@@ -328,7 +330,10 @@ pub struct SamplingClient {
 impl std::fmt::Debug for SamplingClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SamplingClient")
-            .field("base_url", &self.base_url)
+            .field(
+                "endpoint_fingerprint",
+                &self.endpoint.fingerprint_for_path("responses"),
+            )
             .field("defaults", &self.defaults)
             .field(
                 "has_attribution_callback",
@@ -351,71 +356,66 @@ struct ClientDefaults {
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
-/// Endpoint URL builder, resolved once at client construction so each request
-/// only appends its path.
+/// Endpoint URL builder. The raw base query is preserved byte-for-byte so
+/// duplicate pairs, order, and percent encoding remain part of continuity.
 #[derive(Clone, Debug)]
-enum EndpointTemplate {
-    /// No query params and no query on the base URL (or an unparseable base):
-    /// append the path to the base verbatim.
-    Plain(String),
-    /// Query params configured: `{prefix}/{path}{suffix}`. `suffix` starts with
-    /// `?` and folds any base-URL params, with a configured key winning over the
-    /// same key in `base_url` (percent-encoded, no duplicates).
-    WithQuery { prefix: String, suffix: String },
+pub struct EndpointTemplate {
+    prefix: String,
+    suffix: String,
 }
 
 impl EndpointTemplate {
-    fn new(base_url: &str, query_params: &IndexMap<String, String>) -> Self {
-        let base = base_url.trim_end_matches('/').to_string();
-        // The fast path is safe only when there is nothing to fold: no configured
-        // params and no query already on the base (which would otherwise land
-        // before the appended path).
-        if query_params.is_empty() && !base.contains('?') {
-            return Self::Plain(base);
-        }
-        let mut url = match reqwest::Url::parse(&base) {
-            Ok(url) => url,
-            Err(error) => {
-                tracing::warn!(
-                    url = %base,
-                    %error,
-                    "failed to parse base URL for endpoint; sending without folded query"
-                );
-                return Self::Plain(base);
-            }
-        };
-        let overridden: std::collections::HashSet<&str> =
-            query_params.keys().map(String::as_str).collect();
-        let kept: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(k, _)| !overridden.contains(k.as_ref()))
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        let prefix = {
-            let mut prefix_url = url.clone();
-            prefix_url.set_query(None);
-            prefix_url.as_str().trim_end_matches('/').to_string()
-        };
+    pub fn new(base_url: &str, query_params: &IndexMap<String, String>) -> Self {
+        let (base_without_query, raw_query) = base_url
+            .split_once('?')
+            .map_or((base_url, ""), |(base, query)| (base, query));
+        let base_without_query = base_without_query.trim_end_matches('/');
+        let prefix = reqwest::Url::parse(base_without_query)
+            .map(|url| url.as_str().trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| base_without_query.to_string());
+
+        let mut encoded = reqwest::Url::parse("http://endpoint.invalid/")
+            .expect("static endpoint encoding URL is valid");
         {
-            let mut pairs = url.query_pairs_mut();
-            pairs.clear();
-            for (key, value) in &kept {
-                pairs.append_pair(key, value);
-            }
+            let mut pairs = encoded.query_pairs_mut();
             for (key, value) in query_params {
                 pairs.append_pair(key, value);
             }
         }
-        let suffix = url.query().map(|q| format!("?{q}")).unwrap_or_default();
-        Self::WithQuery { prefix, suffix }
+        let configured = encoded.query().unwrap_or_default();
+        let encoded_keys: std::collections::HashSet<&str> = configured
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').map(|(key, _)| key))
+            .collect();
+        let mut merged: Vec<&str> = raw_query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| {
+                let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                !encoded_keys.contains(key)
+            })
+            .collect();
+        if !configured.is_empty() {
+            merged.extend(configured.split('&'));
+        }
+        let suffix = if merged.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", merged.join("&"))
+        };
+        Self { prefix, suffix }
     }
 
-    fn url_for_path(&self, path: &str) -> String {
+    pub fn url_for_path(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
-        match self {
-            Self::Plain(base) => format!("{base}/{path}"),
-            Self::WithQuery { prefix, suffix } => format!("{prefix}/{path}{suffix}"),
-        }
+        format!("{}/{path}{}", self.prefix, self.suffix)
+    }
+
+    /// SHA-256 of the exact normalized endpoint string used by transport.
+    pub fn fingerprint_for_path(&self, path: &str) -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(self.url_for_path(path).as_bytes());
+        format!("{digest:x}")
     }
 }
 
@@ -529,7 +529,6 @@ impl SamplingClient {
                 AuthScheme::XApiKey => {
                     let header_value = HeaderValue::from_str(api_key).map_err(|_| {
                         tracing::debug!(
-                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP header"
                         );
                         SamplingError::auth_unknown(
@@ -542,7 +541,6 @@ impl SamplingClient {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
                         tracing::debug!(
-                            api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
                         );
                         SamplingError::auth_unknown(
@@ -625,17 +623,22 @@ impl SamplingClient {
             }
         }
 
-        let http = if config.force_http1 {
+        let (http, compact_http) = if config.force_http1 {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
-            crate::shared_http::client_http1().map_err(SamplingError::Http)?
+            (
+                crate::shared_http::client_http1().map_err(SamplingError::Http)?,
+                crate::shared_http::compact_client_http1().map_err(SamplingError::Http)?,
+            )
         } else {
-            crate::shared_http::client().map_err(SamplingError::Http)?
+            (
+                crate::shared_http::client().map_err(SamplingError::Http)?,
+                crate::shared_http::compact_client().map_err(SamplingError::Http)?,
+            )
         };
 
         tracing::info!(
             target: crate::sampling_log::TARGET,
             event = "client_new",
-            base_url = %config.base_url,
             model = %config.model,
             api_backend = ?config.api_backend,
             auth_scheme = ?config.auth_scheme,
@@ -663,6 +666,7 @@ impl SamplingClient {
 
         Ok(Self {
             http,
+            compact_http,
             default_headers: headers,
             base_url: config.base_url,
             defaults,
@@ -676,6 +680,11 @@ impl SamplingClient {
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    /// Stable digest of the exact standalone compaction endpoint template.
+    pub fn responses_compact_endpoint_fingerprint(&self) -> String {
+        self.endpoint.fingerprint_for_path("responses/compact")
     }
 
     /// POST with default headers, returning the builder coupled to the tail
@@ -718,7 +727,6 @@ impl SamplingClient {
             tracing::info!(
                 target: crate::sampling_log::TARGET,
                 event = "client_post",
-                base_url = %self.base_url,
                 model = %self.defaults.model,
                 api_backend = ?self.defaults.api_backend,
                 auth_scheme = ?self.defaults.auth_scheme,
@@ -1173,6 +1181,54 @@ impl SamplingClient {
         Ok(())
     }
 
+    fn serialize_response_body(
+        &self,
+        request: &mut CreateResponseWrapper,
+    ) -> Result<serde_json::Value> {
+        let raw = request.raw_body.take();
+        let is_raw = raw.is_some();
+        let mut body = match raw {
+            Some(body) => body,
+            None => serde_json::to_value(&request.inner).map_err(SamplingError::Serialization)?,
+        };
+        if body.get("store").is_none_or(serde_json::Value::is_null) {
+            body["store"] = serde_json::Value::Bool(false);
+        }
+        let encrypted_reasoning = serde_json::to_value(rs::IncludeEnum::ReasoningEncryptedContent)
+            .expect("Responses include enum serializes");
+        let includes = body
+            .as_object_mut()
+            .expect("Responses request serializes as an object")
+            .entry("include")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if includes.is_null() {
+            *includes = serde_json::Value::Array(Vec::new());
+        }
+        let includes = includes
+            .as_array_mut()
+            .expect("Responses include serializes as an array");
+        if !includes.contains(&encrypted_reasoning) {
+            includes.push(encrypted_reasoning);
+        }
+        if !is_raw {
+            xai_grok_sampling_types::patch_reasoning_text_types(&mut body);
+        }
+        Ok(body)
+    }
+
+    fn response_request_has_compaction(request: &CreateResponseWrapper) -> bool {
+        request
+            .raw_body
+            .as_ref()
+            .and_then(|body| body.get("input"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|input| {
+                input.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                })
+            })
+    }
+
     /// Create a response using the Responses API (non-streaming).
     ///
     /// This uses the Responses API format which provides a simpler interface
@@ -1183,17 +1239,16 @@ impl SamplingClient {
     ) -> Result<rs::Response> {
         self.apply_response_defaults(&mut request)?;
 
-        let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
-        let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
         let model_id = request.inner.model.clone().unwrap_or_default();
 
         // The trace field is process-local: it is consumed by upstream
         // session code (which may upload a payload artifact) and is not
         // forwarded by the sampler. Drop it before we send.
         request.trace.take();
-
-        tracing::debug!("create_response: {:?}", &request);
-        tracing::debug!("endpoint: {:?}", self.endpoint("responses"));
+        let checkpoint_request = Self::response_request_has_compaction(&request);
+        let request_body = self.serialize_response_body(&mut request)?;
+        let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
+        let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
 
         let grok_headers = GrokRequestHeaders {
             conv_id: x_grok_conv_id,
@@ -1205,15 +1260,6 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
-            tracing::error!("Failed to serialize responses request: {}", e);
-            SamplingError::Serialization(e)
-        })?;
-        // async-openai's ReasoningTextContent struct omits the `type`
-        // discriminator that the Responses API requires on input. Patch
-        // it in post-serialize. This is the last surviving piece of the
-        // old raw_output machinery.
-        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         let SentRequest {
             builder,
             sent_bearer,
@@ -1245,11 +1291,16 @@ impl SamplingClient {
                 ));
             }
 
-            let message = user_facing_api_error_message(status, bytes.as_ref());
+            let message = if checkpoint_request {
+                format!(
+                    "Responses API request failed with status {}",
+                    status.as_u16()
+                )
+            } else {
+                user_facing_api_error_message(status, bytes.as_ref())
+            };
             tracing::warn!(
                 status = %status,
-                error_message = %message,
-                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "responses API error"
             );
@@ -1263,12 +1314,7 @@ impl SamplingClient {
         }
 
         let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
-            let raw_body = String::from_utf8_lossy(&bytes);
-            tracing::error!(
-                error = %e,
-                raw_body = %raw_body,
-                "Failed to deserialize rs::Response"
-            );
+            tracing::error!(error = %e, "Failed to deserialize rs::Response");
             SamplingError::Serialization(e)
         })?;
         Ok(response_obj)
@@ -1293,7 +1339,7 @@ impl SamplingClient {
         name = "http.create_response_stream",
         skip_all,
         fields(
-            endpoint = %self.endpoint("responses"),
+            endpoint = "responses",
             model_id = request.inner.model.as_deref().unwrap_or(""),
             status_code = tracing::field::Empty,
             success = tracing::field::Empty,
@@ -1314,34 +1360,14 @@ impl SamplingClient {
         // Enable streaming
         request.inner.stream = Some(true);
 
-        let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
-        let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
         let model_id = request.inner.model.clone().unwrap_or_default();
 
         // Drop process-local trace data (see note in `create_response`).
         request.trace.take();
-
-        tracing::debug!(
-            base_url = %self.base_url,
-            model_id = model_id.as_str(),
-            "Sending responses API stream request"
-        );
-
-        let grok_headers = GrokRequestHeaders {
-            conv_id: x_grok_conv_id,
-            req_id: x_grok_req_id,
-            model_id: &model_id,
-            session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
-            turn_idx: request.x_grok_turn_idx.as_deref(),
-            agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
-            deployment_id: request.x_grok_deployment_id.as_deref(),
-            user_id: request.x_grok_user_id.as_deref(),
-        };
+        let checkpoint_request = Self::response_request_has_compaction(&request);
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
-        let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
-            tracing::error!("Failed to serialize responses request: {}", e);
-            SamplingError::Serialization(e)
-        })?;
+        let mut request_body = self.serialize_response_body(&mut request)?;
+        request_body["stream"] = serde_json::Value::Bool(true);
         // Inject xAI-specific fields not in async-openai's CreateResponse type.
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
@@ -1355,7 +1381,18 @@ impl SamplingClient {
                 request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
-        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
+        let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
+        let grok_headers = GrokRequestHeaders {
+            conv_id: x_grok_conv_id,
+            req_id: x_grok_req_id,
+            model_id: &model_id,
+            session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
+            turn_idx: request.x_grok_turn_idx.as_deref(),
+            agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
+            deployment_id: request.x_grok_deployment_id.as_deref(),
+            user_id: request.x_grok_user_id.as_deref(),
+        };
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
@@ -1381,11 +1418,9 @@ impl SamplingClient {
         })?;
 
         tracing::debug!(
-            url = %built_request.url(),
             method = %built_request.method(),
             "Sending responses API stream request"
         );
-        Self::log_request_headers(&built_request, "responses");
 
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1416,12 +1451,17 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
-            let message = user_facing_api_error_message(status, bytes.as_ref());
-            span.record("error", message.as_str());
+            let message = if checkpoint_request {
+                format!(
+                    "Responses API request failed with status {}",
+                    status.as_u16()
+                )
+            } else {
+                user_facing_api_error_message(status, bytes.as_ref())
+            };
+            span.record("error", "responses_api_error");
             tracing::error!(
                 status = %status,
-                error_message = %message,
-                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "responses API error"
             );
@@ -1856,6 +1896,11 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::ChatCompletions)
+            .map_err(|_| {
+                SamplingError::InvalidConfiguration("checkpoint requires Responses API")
+            })?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -1874,6 +1919,11 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<ChatCompletionResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::ChatCompletions)
+            .map_err(|_| {
+                SamplingError::InvalidConfiguration("checkpoint requires Responses API")
+            })?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -1900,31 +1950,27 @@ impl SamplingClient {
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::Responses)
+            .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses checkpoint"))?;
 
         let trace = request.trace.take();
-        let x_grok_conv_id = request.x_grok_conv_id.clone();
-        let x_grok_req_id = request.x_grok_req_id.clone();
-        let x_grok_session_id = request.x_grok_session_id.clone();
-        let x_grok_turn_idx = request.x_grok_turn_idx.clone();
-        let x_grok_agent_id = request.x_grok_agent_id.clone();
-
-        // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
-
-        let responses_request: rs::CreateResponse = (&request).into();
-
+        let final_request = xai_grok_sampling_types::FinalResponsesRequest::try_from(&request)
+            .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses request"))?;
+        let responses_request = rs::CreateResponse {
+            model: request.model.clone(),
+            ..Default::default()
+        };
         let mut wrapper = CreateResponseWrapper::new(responses_request);
-        wrapper.x_grok_conv_id = x_grok_conv_id;
-        wrapper.x_grok_req_id = x_grok_req_id;
-        wrapper.x_grok_session_id = x_grok_session_id;
-        wrapper.x_grok_turn_idx = x_grok_turn_idx;
-        wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.extra_tool_entries = extra_tools;
-
-        if let Some(trace) = trace {
-            wrapper.trace = Some(trace);
-        }
+        wrapper.x_grok_conv_id = request.x_grok_conv_id.clone();
+        wrapper.x_grok_req_id = request.x_grok_req_id.clone();
+        wrapper.x_grok_session_id = request.x_grok_session_id.clone();
+        wrapper.x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        wrapper.x_grok_agent_id = request.x_grok_agent_id.clone();
+        wrapper.x_grok_deployment_id = request.x_grok_deployment_id.clone();
+        wrapper.x_grok_user_id = request.x_grok_user_id.clone();
+        wrapper.raw_body = Some(final_request.into_body());
+        wrapper.trace = trace;
 
         self.create_response_stream(wrapper).await
     }
@@ -1937,26 +1983,27 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<rs::Response> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::Responses)
+            .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses checkpoint"))?;
 
         let trace = request.trace.take();
-        let x_grok_conv_id = request.x_grok_conv_id.clone();
-        let x_grok_req_id = request.x_grok_req_id.clone();
-        let x_grok_session_id = request.x_grok_session_id.clone();
-        let x_grok_turn_idx = request.x_grok_turn_idx.clone();
-        let x_grok_agent_id = request.x_grok_agent_id.clone();
-
-        let responses_request: rs::CreateResponse = (&request).into();
-
+        let final_request = xai_grok_sampling_types::FinalResponsesRequest::try_from(&request)
+            .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses request"))?;
+        let responses_request = rs::CreateResponse {
+            model: request.model.clone(),
+            ..Default::default()
+        };
         let mut wrapper = CreateResponseWrapper::new(responses_request);
-        wrapper.x_grok_conv_id = x_grok_conv_id;
-        wrapper.x_grok_req_id = x_grok_req_id;
-        wrapper.x_grok_session_id = x_grok_session_id;
-        wrapper.x_grok_turn_idx = x_grok_turn_idx;
-        wrapper.x_grok_agent_id = x_grok_agent_id;
-
-        if let Some(trace) = trace {
-            wrapper.trace = Some(trace);
-        }
+        wrapper.x_grok_conv_id = request.x_grok_conv_id.clone();
+        wrapper.x_grok_req_id = request.x_grok_req_id.clone();
+        wrapper.x_grok_session_id = request.x_grok_session_id.clone();
+        wrapper.x_grok_turn_idx = request.x_grok_turn_idx.clone();
+        wrapper.x_grok_agent_id = request.x_grok_agent_id.clone();
+        wrapper.x_grok_deployment_id = request.x_grok_deployment_id.clone();
+        wrapper.x_grok_user_id = request.x_grok_user_id.clone();
+        wrapper.raw_body = Some(final_request.into_body());
+        wrapper.trace = trace;
 
         self.create_response(wrapper).await
     }
@@ -1972,6 +2019,11 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::Messages)
+            .map_err(|_| {
+                SamplingError::InvalidConfiguration("checkpoint requires Responses API")
+            })?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -2004,6 +2056,11 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<messages::MessagesResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        request
+            .validate_for_backend(&ApiBackend::Messages)
+            .map_err(|_| {
+                SamplingError::InvalidConfiguration("checkpoint requires Responses API")
+            })?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();

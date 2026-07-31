@@ -818,6 +818,7 @@ async fn interject_after_cancel_does_nothing_and_keeps_prompt_queued() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             *actor

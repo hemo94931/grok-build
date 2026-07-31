@@ -34,7 +34,7 @@ impl ChatStateActor {
     /// already-repaired state, so there is no need to run
     /// `dedup_duplicate_tool_results` / `repair_dangling_tool_calls` on the
     /// clone — those would be O(n) no-ops.
-    pub(super) fn build_conversation_request(
+    pub(super) async fn build_conversation_request(
         &mut self,
         tool_definitions: Vec<ToolSpec>,
         memory_reminder: Option<String>,
@@ -51,15 +51,42 @@ impl ChatStateActor {
         if let Some(reminder) = memory_reminder.as_deref()
             && persist_memory_reminder
         {
-            // A live in-place inject can prepend a `System` item, shifting indices
-            // under an active capture; snapshot + rebase like the other mutators.
-            self.snapshot_turn_slice();
-            let injected = inject_memory_reminder(&mut self.state.conversation, reminder);
-            if injected {
-                self.persistence.replace_history(&self.state.conversation);
+            if matches!(
+                self.state.conversation.first(),
+                Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+            ) {
+                // A new reminder is a strict typed-tail append. An existing
+                // dedicated reminder is durably replaced before memory changes.
+                let _ = self.persist_checkpoint_memory_reminder(reminder).await;
+                // Never send a reminder that failed its persistence boundary.
                 memory_reminder = None;
+            } else {
+                // A live in-place inject can prepend a `System` item, shifting indices
+                // under an active capture; snapshot + rebase like the other mutators.
+                self.snapshot_turn_slice();
+                let before_tokens =
+                    super::state::estimate_conversation_tokens(&self.state.conversation);
+                let injected = inject_memory_reminder(&mut self.state.conversation, reminder);
+                if injected {
+                    let after_tokens =
+                        super::state::estimate_conversation_tokens(&self.state.conversation);
+                    if after_tokens >= before_tokens {
+                        self.state.estimated_tokens_since_model = self
+                            .state
+                            .estimated_tokens_since_model
+                            .saturating_add(after_tokens - before_tokens);
+                    } else {
+                        self.state.estimated_tokens_since_model = self
+                            .state
+                            .estimated_tokens_since_model
+                            .saturating_sub(before_tokens - after_tokens);
+                    }
+                    self.persistence.replace_history(&self.state.conversation);
+                    self.state.bump_history_revision();
+                    memory_reminder = None;
+                }
+                self.rebase_turn_capture_offset();
             }
-            self.rebase_turn_capture_offset();
         }
         // Measure the exact serialized body and evict only once it approaches
         // the 50 MB ceiling. `conversation_body_bytes` is wire-accurate yet
@@ -93,7 +120,14 @@ impl ChatStateActor {
 
             // Step 2: Prune old tool results if context is > 50% utilized
             if needs_prune {
-                prune_conversation(&mut items, &self.pruning_config);
+                if matches!(
+                    items.first(),
+                    Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+                ) {
+                    prune_conversation(&mut items[1..], &self.pruning_config);
+                } else {
+                    prune_conversation(&mut items, &self.pruning_config);
+                }
             }
 
             // Step 3: Inject memory reminder into the system message
@@ -126,6 +160,7 @@ impl ChatStateActor {
 
         // Step 4: Assemble request
         ConversationRequest {
+            history_revision: Some(self.state.history_revision),
             items,
             tools: tool_definitions,
             hosted_tools: vec![],
@@ -142,10 +177,90 @@ impl ChatStateActor {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace,
+            instructions: None,
             prompt_cache_key: None,
+            prompt_cache_options: None,
+            prompt_cache_retention: None,
+            service_tier: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }
+    }
+
+    async fn persist_checkpoint_memory_reminder(&mut self, reminder: &str) -> bool {
+        let existing = self
+            .state
+            .conversation
+            .iter()
+            .skip(1)
+            .position(|item| {
+                matches!(
+                    item,
+                    ConversationItem::System(system)
+                        if system.content.contains(crate::types::MEMORY_CONTEXT_OPEN_TAG)
+                )
+            })
+            .map(|index| index + 1);
+        if existing.is_none() {
+            let item = ConversationItem::system(reminder);
+            if self.persist_append(&item).await {
+                self.apply_pushed_message(item);
+                return true;
+            }
+            return false;
+        }
+
+        let mut replacement = self.state.conversation.clone();
+        if !inject_memory_reminder(&mut replacement, reminder) {
+            return true;
+        }
+        let checkpoint_id = match replacement.first() {
+            Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) => {
+                checkpoint.checkpoint_id.clone()
+            }
+            _ => return false,
+        };
+        let operation_id = format!(
+            "memory-{checkpoint_id}-{}",
+            self.state.history_revision.saturating_add(1)
+        );
+        let persisted = self
+            .persistence
+            .replace_history_and_ack(&operation_id, &replacement)
+            .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(crate::persistence::HistoryReplaceError::Committed(error))) => {
+                tracing::warn!(%error, "checkpoint memory reminder committed but acknowledgement was lost");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "checkpoint memory reminder was not committed");
+                return false;
+            }
+            Err(_) => {
+                tracing::error!("checkpoint memory reminder acknowledgement was dropped");
+                return false;
+            }
+        }
+
+        self.snapshot_turn_slice();
+        let before_tokens = super::state::estimate_conversation_tokens(&self.state.conversation);
+        let after_tokens = super::state::estimate_conversation_tokens(&replacement);
+        if after_tokens >= before_tokens {
+            self.state.estimated_tokens_since_model = self
+                .state
+                .estimated_tokens_since_model
+                .saturating_add(after_tokens - before_tokens);
+        } else {
+            self.state.estimated_tokens_since_model = self
+                .state
+                .estimated_tokens_since_model
+                .saturating_sub(before_tokens - after_tokens);
+        }
+        self.state.conversation = replacement;
+        self.state.bump_history_revision();
+        self.rebase_turn_capture_offset();
+        true
     }
 }
 
@@ -468,6 +583,24 @@ pub(super) fn inject_memory_reminder(items: &mut Vec<ConversationItem>, reminder
     let reminder = reminder.trim();
     if reminder.is_empty() {
         return false;
+    }
+
+    if matches!(
+        items.first(),
+        Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+    ) {
+        if let Some(system) = items.iter_mut().skip(1).find_map(|item| match item {
+            ConversationItem::System(system)
+                if system.content.contains(MEMORY_CONTEXT_OPEN_TAG) =>
+            {
+                Some(system)
+            }
+            _ => None,
+        }) {
+            return upsert_memory_reminder_text(&mut system.content, reminder);
+        }
+        items.push(ConversationItem::system(reminder));
+        return true;
     }
 
     if let Some(ConversationItem::System(sys)) = items.first_mut() {

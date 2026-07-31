@@ -15,6 +15,9 @@ pub struct CompactionPolicy {
     /// None = use the session's current model.
     pub compact_model: Option<String>,
 
+    /// Whether standalone Responses server compaction is enabled.
+    pub server_compaction: bool,
+
     /// Whether to run a memory flush turn before each compaction.
     /// When enabled, the session actor asks the model to summarize
     /// important information from the conversation before it's compacted.
@@ -38,6 +41,7 @@ impl Default for CompactionPolicy {
         Self {
             auto_compact_threshold_percent: 85,
             compact_model: None,
+            server_compaction: true,
             memory_flush_enabled: false,
             wall_clock_budget_secs: 300,
             two_pass_enabled: false,

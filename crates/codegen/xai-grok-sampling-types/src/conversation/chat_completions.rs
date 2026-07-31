@@ -181,6 +181,9 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             "conversation_to_chat_messages folds Reasoning siblings; \
                  conversation_item_to_chat_message is never called with one"
         ),
+        ConversationItem::ResponsesCompactionCheckpoint(_) => {
+            unreachable!("validate_for_backend must reject checkpoints before Chat conversion")
+        }
     }
 }
 

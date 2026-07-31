@@ -63,7 +63,15 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
                     .sum::<usize>();
             (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
-        ConversationItem::ToolResult(tr) => xai_token_estimation::estimate_tokens(&tr.content),
+        ConversationItem::ToolResult(tr) => {
+            let images = tr
+                .images
+                .iter()
+                .filter(|part| matches!(part, ContentPart::Image { .. }))
+                .count() as u64;
+            xai_token_estimation::estimate_tokens(&tr.content)
+                + xai_token_estimation::estimate_image_tokens(images)
+        }
         ConversationItem::BackendToolCall(b) => {
             xai_token_estimation::estimate_tokens(&b.text_summary())
         }
@@ -74,6 +82,9 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
             let text_bytes = xai_grok_sampling_types::reasoning_item_text(r).len();
             let enc_bytes = r.encrypted_content.as_deref().map(str::len).unwrap_or(0);
             ((text_bytes + enc_bytes) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+        }
+        ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
+            checkpoint.checkpoint_token_seed
         }
     }
 }
@@ -137,6 +148,14 @@ pub(crate) struct ChatState {
     /// Opaque credential secrets (api key, optional extra auth, client version).
     /// Stored opaquely — the actor never interprets them.
     pub credentials: Credentials,
+    /// Monotonic provider-visible history generation.
+    pub history_revision: u64,
+    /// Monotonic request continuity-identity generation.
+    pub request_identity_generation: u64,
+    /// Identity bound by final request preparation; invalidated before semantic changes.
+    pub bound_request_identity: Option<xai_grok_sampling_types::CheckpointIdentityV1>,
+    /// Last committed typed-tail sequence for the active checkpoint branch.
+    pub active_tail_sequence: u64,
     /// Bytes/4 estimate of tokens added since the last `record_token_usage`.
     /// Used by `check_preflight_overflow` to detect context window overflows
     /// between model responses.
@@ -208,15 +227,29 @@ impl ChatState {
     /// lack matching `ToolResult` entries. Without this, the in-memory state
     /// would carry broken conversation history until the next `build_request`.
     pub fn new(mut conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
-        let deduped = dedup_duplicate_tool_results(&mut conversation);
+        let checkpoint_active = matches!(
+            conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        );
+        let (deduped, repaired) = if checkpoint_active {
+            // Startup has no acknowledged persistence boundary yet. Leave an
+            // authoritative typed tail untouched; the actor repairs it on the
+            // next serialized write boundary.
+            (0, 0)
+        } else {
+            let deduped = dedup_duplicate_tool_results(&mut conversation);
+            let repaired = repair_dangling_tool_calls(
+                &mut conversation,
+                DanglingToolCallReason::UserCancelled,
+            );
+            (deduped, repaired)
+        };
         if deduped > 0 {
             tracing::info!(
                 deduped_count = deduped,
                 "Removed duplicate tool results in initial conversation"
             );
         }
-        let repaired =
-            repair_dangling_tool_calls(&mut conversation, DanglingToolCallReason::UserCancelled);
         if repaired > 0 {
             tracing::info!(
                 repaired_count = repaired,
@@ -225,6 +258,11 @@ impl ChatState {
         }
 
         let initial_tokens = estimate_conversation_tokens(&conversation);
+        let active_tail_sequence = if checkpoint_active {
+            conversation.len().saturating_sub(1) as u64
+        } else {
+            0
+        };
 
         Self {
             conversation,
@@ -237,6 +275,10 @@ impl ChatState {
             agent_edited_paths: BTreeSet::new(),
             last_compaction_prompt_index: None,
             credentials: Credentials::default(),
+            history_revision: 0,
+            request_identity_generation: 0,
+            bound_request_identity: None,
+            active_tail_sequence,
             estimated_tokens_since_model: 0,
             estimate_at_last_response: initial_tokens,
             last_turn_usage: None,
@@ -257,6 +299,15 @@ impl ChatState {
             let turn = std::mem::take(&mut self.harness_trace_buffer);
             self.harness_trace_turns.push(turn);
         }
+    }
+
+    pub(super) fn bump_history_revision(&mut self) {
+        self.history_revision = self.history_revision.saturating_add(1);
+    }
+
+    pub(super) fn invalidate_request_identity(&mut self) {
+        self.request_identity_generation = self.request_identity_generation.saturating_add(1);
+        self.bound_request_identity = None;
     }
 }
 

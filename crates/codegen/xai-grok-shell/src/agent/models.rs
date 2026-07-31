@@ -857,6 +857,29 @@ impl ModelsManager {
             .store(false, Ordering::Relaxed);
     }
 
+    /// Build a `SamplingConfig` for one known catalog model using the
+    /// manager's current auth/config layers.
+    pub(crate) fn sampling_config_for_model_id(&self, model_id: &str) -> Option<SamplingConfig> {
+        let config = self.inner.cfg.read().clone();
+        let models = self.models();
+        let model = config::find_model_by_id(&models, model_id)?;
+        let session_auth = self.inner.auth_manager.current_or_expired();
+        let credentials =
+            resolve_credentials(model, session_auth.as_ref().map(|auth| auth.key.as_str()));
+        Some(sampling_config_for_model(
+            model,
+            credentials,
+            config.endpoints.alpha_test_key.clone(),
+            config.client_version.clone(),
+            crate::managed_config::resolve_deployment_id(
+                config.endpoints.deployment_key.as_deref(),
+            ),
+            session_auth
+                .filter(|auth| auth.is_xai_auth())
+                .map(|auth| auth.user_id),
+        ))
+    }
+
     /// Build a `SamplingConfig` from the current model + auth state.
     pub fn sampling_config(&self) -> SamplingConfig {
         let config = self.inner.cfg.read().clone();
