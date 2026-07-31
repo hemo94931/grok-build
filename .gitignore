@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+.pi-subagents
+.research
+.scratch
+CONTEXT.md
