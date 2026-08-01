@@ -125,7 +125,8 @@ pub(crate) fn bounded_goal_transcript(items: &[ConversationItem]) -> String {
             ConversationItem::ToolResult(_) => "tool",
             ConversationItem::BackendToolCall(_)
             | ConversationItem::Reasoning(_)
-            | ConversationItem::ResponsesCompactionCheckpoint(_) => continue,
+            | ConversationItem::ResponsesCompactionCheckpoint(_)
+            | ConversationItem::ResponsesCompactionCheckpointV2(_) => continue,
         };
         let text = item.text_content();
         let trimmed = text.trim();

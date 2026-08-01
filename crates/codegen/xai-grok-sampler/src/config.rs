@@ -133,6 +133,32 @@ pub struct SamplerConfig {
     pub header_injector: Option<SharedHeaderInjector>,
 }
 
+impl SamplerConfig {
+    /// Apply the same conversation defaults the sampler applies to normal
+    /// requests (model/temperature/top_p/max_output_tokens).
+    ///
+    /// The shell uses this to freeze resolved/legacy replay bodies before
+    /// dispatch: sampler retries of those dispatches reuse the frozen body
+    /// verbatim and must never re-apply defaults themselves.
+    pub fn apply_conversation_defaults_to(
+        &self,
+        request: &mut xai_grok_sampling_types::ConversationRequest,
+    ) {
+        if request.model.is_none() {
+            request.model = Some(self.model.clone());
+        }
+        if request.temperature.is_none() {
+            request.temperature = self.temperature;
+        }
+        if request.top_p.is_none() {
+            request.top_p = self.top_p;
+        }
+        if request.max_output_tokens.is_none() {
+            request.max_output_tokens = self.max_completion_tokens;
+        }
+    }
+}
+
 impl Default for SamplerConfig {
     /// Empty defaults so callers can use `..Default::default()` and
     /// new fields don't ripple through every literal site.

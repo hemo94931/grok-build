@@ -1104,10 +1104,11 @@ pub(crate) async fn spawn_session_actor(
         startup_hints.preserve_inherited_system,
         &system_prompt,
     );
-    let has_active_wrapper = matches!(
-        conversation.first(),
-        Some(ConversationItem::ResponsesCompactionCheckpoint(_))
-    );
+    // Variant-aware: both the V1 wrapper and the V2 wrapper are local-only
+    // checkpoint items that must not be re-installed over or re-sent.
+    let has_active_wrapper = conversation
+        .first()
+        .is_some_and(ConversationItem::is_responses_checkpoint);
     if !has_active_wrapper
         && !startup_hints.preserve_inherited_system
         && !conversation_has_project_instructions(&conversation)

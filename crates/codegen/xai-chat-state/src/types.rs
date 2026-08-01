@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use xai_grok_sampling_types::{CheckpointIdentityV1, ConversationItem, SamplingConfig};
+use xai_grok_sampling_types::{CheckpointIdentity, ConversationItem, SamplingConfig};
 
 /// Canonical marker for an injected memory-context block. Shared by the
 /// emitter in `xai-grok-shell` and the upsert/detection here — a drift would
@@ -61,7 +61,7 @@ pub struct ChatStateSnapshot {
     pub request_identity_generation: u64,
     /// Concrete identity bound by the most recent final request preparation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound_request_identity: Option<CheckpointIdentityV1>,
+    pub bound_request_identity: Option<CheckpointIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,7 @@ pub struct ChatCompactionSnapshot {
     pub total_tokens: u64,
     pub conversation: Vec<ConversationItem>,
     pub sampling_config: SamplingConfig,
-    pub bound_request_identity: Option<CheckpointIdentityV1>,
+    pub bound_request_identity: Option<CheckpointIdentity>,
 }
 
 /// CAS input for the single acknowledged compaction mutation boundary.

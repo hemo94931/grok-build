@@ -48,6 +48,8 @@ fn checkpoint_update(id: &str, prompt_index_at_compaction: usize) -> SessionUpda
             portable_history_sha256: None,
             responses_mode: None,
             responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         })),
         meta: None,

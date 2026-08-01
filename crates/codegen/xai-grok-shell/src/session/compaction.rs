@@ -65,6 +65,11 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
                 checkpoint.portable_history_sha256.hash(&mut h);
                 6
             }
+            ConversationItem::ResponsesCompactionCheckpointV2(checkpoint) => {
+                checkpoint.checkpoint_id.hash(&mut h);
+                checkpoint.portable_history_sha256.hash(&mut h);
+                7
+            }
         };
         tag.hash(&mut h);
         it.text_content().hash(&mut h);
@@ -330,6 +335,19 @@ impl SessionActor {
             return PrefireOutcome::DebugFailPass1.into();
         }
         let conversation = self.chat_state_handle.get_conversation().await;
+        // A live server checkpoint must be expanded through the same
+        // checkpoint-aware resolver as every other reader; otherwise the
+        // wrapper would leak into the pass-1 sampling request.
+        let conversation = match self.portable_history_for_request(&conversation) {
+            Ok(conversation) => conversation,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "two_pass: prefire skipped — checkpoint history unavailable"
+                );
+                return PrefireOutcome::SampleFailed.into();
+            }
+        };
         if conversation.len() < 4 {
             return PrefireOutcome::TooSmall.into();
         }
@@ -520,6 +538,80 @@ struct PreparedServerRequest {
     checkpoint_status: xai_chat_state::CheckpointReplayStatus,
 }
 
+/// Outcome of the checkpoint replay gate
+/// (`ensure_checkpoint_replayable_for_request`).
+#[derive(Debug)]
+pub(crate) struct CheckpointGateOutcome {
+    /// The gate ran a migration/compaction; the outer turn loop must
+    /// resubmit instead of sending the current request.
+    pub resubmit: bool,
+    /// Present when the live checkpoint was bound and proven
+    /// `CheckpointReplayStatus::Replayable` at the request's history
+    /// revision — the only state in which the shell may issue a
+    /// `ValidatedLegacyReplayV1` permit.
+    pub replayable_binding: Option<xai_chat_state::RequestIdentityBinding>,
+    /// Sidecar portable history validated alongside the binding. The replay
+    /// permit re-verifies its digest against the live wrapper, so the
+    /// permit constructor consumes the full material proof instead of
+    /// trusting caller-supplied bytes.
+    pub replay_portable_history: Option<Vec<ConversationItem>>,
+    /// Verified V2 replay (reader-first V2 path): present when a V2 wrapper
+    /// was bound and `ValidatedResponsesReplayV2::verify` passed. The shell
+    /// turns this into a `ResolvedResponsesRequest` dispatch.
+    pub replay_v2: Option<xai_grok_sampling_types::ValidatedResponsesReplayV2>,
+}
+
+impl CheckpointGateOutcome {
+    fn proceed() -> Self {
+        Self {
+            resubmit: false,
+            replayable_binding: None,
+            replay_portable_history: None,
+            replay_v2: None,
+        }
+    }
+
+    fn resubmit() -> Self {
+        Self {
+            resubmit: true,
+            replayable_binding: None,
+            replay_portable_history: None,
+            replay_v2: None,
+        }
+    }
+
+    fn replayable(
+        binding: xai_chat_state::RequestIdentityBinding,
+        portable_history: Vec<ConversationItem>,
+    ) -> Self {
+        Self {
+            resubmit: false,
+            replayable_binding: Some(binding),
+            replay_portable_history: Some(portable_history),
+            replay_v2: None,
+        }
+    }
+
+    fn replayable_v2(replay: xai_grok_sampling_types::ValidatedResponsesReplayV2) -> Self {
+        Self {
+            resubmit: false,
+            replayable_binding: None,
+            replay_portable_history: None,
+            replay_v2: Some(replay),
+        }
+    }
+}
+
+/// Result of the stage-D1b lossless-migration attempt.
+enum V1MigrationStep {
+    /// The checkpoint was migrated (or the request went stale mid-migration);
+    /// the turn must resubmit and re-plan from the new history.
+    Resubmit,
+    /// Not lossless-eligible right now; the turn proceeds on the temporary
+    /// `ValidatedLegacyReplayV1` path.
+    NotEligible,
+}
+
 #[derive(Debug)]
 struct AuthManagerCompactResolver {
     manager: Arc<crate::auth::AuthManager>,
@@ -701,7 +793,13 @@ impl SessionActor {
             last_flush,
             compaction_count,
         ) {
-            let snapshot = self.snapshot_memory_flush_state().await;
+            let snapshot = match self.snapshot_memory_flush_state().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, "memory flush skipped: checkpoint history unavailable");
+                    return;
+                }
+            };
             tokio::task::spawn_local({
                 let session = self.clone();
                 async move {
@@ -766,6 +864,7 @@ impl SessionActor {
                 None,
                 false,
                 0,
+                None,
             )
             .await
         {
@@ -1020,11 +1119,11 @@ impl SessionActor {
     }
     fn current_prompt_projection(
         &self,
-        final_request: &FinalResponsesRequest,
+        final_body: &serde_json::Value,
         items: &[ConversationItem],
     ) -> Result<serde_json::Value, serde_json::Error> {
         let (default_projection, _) =
-            crate::session::responses_server_compaction::canonical_prompt_envelope(final_request)?;
+            crate::session::responses_server_compaction::canonical_prompt_envelope(final_body)?;
         let mut projection = items
             .first()
             .and_then(|item| match item {
@@ -1112,22 +1211,260 @@ impl SessionActor {
         Some((credential, principal))
     }
 
-    fn portable_history_for_request(
+    pub(crate) fn portable_history_for_request(
         &self,
         items: &[ConversationItem],
     ) -> std::io::Result<Vec<ConversationItem>> {
-        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = items.first() else {
-            return Ok(items.to_vec());
-        };
+        // Fail closed on any checkpoint that is not the unique item at
+        // index 0: a wrapper buried mid-history must never flow into
+        // request construction (recap budgeting, auxiliary preprocessing
+        // or a POST body).
+        let checkpoint_count = items
+            .iter()
+            .filter(|item| item.is_responses_checkpoint())
+            .count();
+        if checkpoint_count > 1
+            || (checkpoint_count == 1
+                && !items
+                    .first()
+                    .is_some_and(|item| item.is_responses_checkpoint()))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a responses compaction checkpoint must be the unique item at index 0",
+            ));
+        }
+        match items.first() {
+            Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) => {
+                let portable = self.sidecar_portable_history(wrapper)?;
+                let mut portable = portable;
+                portable.extend_from_slice(&items[1..]);
+                Ok(portable)
+            }
+            Some(ConversationItem::ResponsesCompactionCheckpointV2(wrapper)) => {
+                let session_dir = crate::session::persistence::session_dir(&self.session_info);
+                let mut portable =
+                    crate::session::storage::responses_compaction::read_checkpoint_for_wrapper_v2(
+                        &session_dir,
+                        wrapper,
+                    )?
+                    .portable_history;
+                portable.extend_from_slice(&items[1..]);
+                Ok(portable)
+            }
+            _ => Ok(items.to_vec()),
+        }
+    }
+
+    /// Sidecar portable history (prefix only) for a live wrapper, fully
+    /// validated (checkpoint id, prompt index and digest).
+    fn sidecar_portable_history(
+        &self,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV1,
+    ) -> std::io::Result<Vec<ConversationItem>> {
         let session_dir = crate::session::persistence::session_dir(&self.session_info);
-        let mut portable =
+        Ok(
             crate::session::storage::responses_compaction::read_checkpoint_for_wrapper(
                 &session_dir,
                 wrapper,
             )?
-            .portable_history;
-        portable.extend_from_slice(&items[1..]);
-        Ok(portable)
+            .portable_history,
+        )
+    }
+
+    /// Stage-D0 shadow scan: classify how the live V1 checkpoint could be
+    /// recovered (lossless sidecar/staging, lossy salvage, or unrecoverable)
+    /// and persist the status record, without changing any request behaviour.
+    /// Best-effort: all failures are swallowed into `tracing` because the scan
+    /// must never affect the request path.
+    fn shadow_scan_v1_checkpoint_recovery(&self, request: &ConversationRequest) {
+        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = request.items.first()
+        else {
+            return;
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.shadow_scan_v1_checkpoint_recovery_inner(wrapper)
+        }));
+        if let Err(_) = result {
+            tracing::warn!("checkpoint recovery shadow scan panicked; ignoring");
+        }
+    }
+
+    fn shadow_scan_v1_checkpoint_recovery_inner(
+        &self,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV1,
+    ) {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::session::checkpoint_recovery as recovery;
+        use std::sync::{Mutex, OnceLock};
+
+        // Scan-once gate: one full scan per (session, checkpoint, operation)
+        // per process, re-run only when the sidecar or staging file itself
+        // changes — and only for *terminal* outcomes. `updates.jsonl` grows
+        // every turn, so its mtime cannot be part of the cheap stamp; a
+        // cached `SalvageRequired` would otherwise never notice a journal
+        // tail that later closed losslessly. Non-terminal outcomes are
+        // therefore re-scanned on every gate call (rare — only broken
+        // sessions), while `Lossless`/`Unrecoverable` converge once. D1b
+        // always re-scans with fresh data before any migration decision.
+        #[derive(PartialEq, Clone)]
+        struct FileStamp(u64, Option<std::time::SystemTime>);
+        #[derive(PartialEq, Clone)]
+        struct CacheEntry {
+            sidecar: Option<FileStamp>,
+            staging: Option<FileStamp>,
+            terminal: bool,
+        }
+        static SCAN_CACHE: OnceLock<
+            Mutex<std::collections::HashMap<(String, String, String), CacheEntry>>,
+        > = OnceLock::new();
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let stamp = |path: std::path::PathBuf| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| FileStamp(meta.len(), meta.modified().ok()))
+        };
+        let sidecar_stamp = stamp(session_dir.join(&wrapper.portable_history_path));
+        let staging_stamp = stamp(
+            session_dir
+                .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+                .join("staging")
+                .join(format!("{}.json", wrapper.checkpoint_id)),
+        );
+        let cache_key = (
+            self.session_info.id.to_string(),
+            wrapper.checkpoint_id.clone(),
+            wrapper.operation_id.clone(),
+        );
+        {
+            let cache = SCAN_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.terminal
+                    && entry.sidecar == sidecar_stamp
+                    && entry.staging == staging_stamp
+                {
+                    return;
+                }
+            }
+        }
+
+        // Fail closed on unreadable/malformed updates: a classification
+        // built on a partially-parsed journal could call a corrupted tail
+        // "lossless". The scan simply does not happen this turn.
+        let updates = match recovery::load_updates_for_recovery(&session_dir) {
+            Ok(updates) => updates,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "checkpoint recovery shadow scan: updates unreadable"
+                );
+                return;
+            }
+        };
+        let existing = recovery::latest_recovery_record(
+            &updates,
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+        );
+        let trusted_base = super::load_system_prompt_from_dir(&session_dir);
+        let scan = recovery::scan_v1_checkpoint_recovery(
+            &session_dir,
+            &updates,
+            wrapper,
+            trusted_base.as_deref(),
+        );
+        // Cache only terminal outcomes; salvage-class outcomes re-scan on
+        // the next gate call so a later-closed journal tail is noticed.
+        let terminal = matches!(
+            scan.outcome,
+            recovery::V1RecoveryOutcome::Lossless { .. }
+                | recovery::V1RecoveryOutcome::Unrecoverable { .. }
+        );
+        {
+            let cache = SCAN_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(
+                cache_key,
+                CacheEntry {
+                    sidecar: sidecar_stamp,
+                    staging: staging_stamp,
+                    terminal,
+                },
+            );
+        }
+        let fingerprint_changed = existing
+            .as_ref()
+            .is_none_or(|record| record.source_fingerprint != scan.source_fingerprint);
+        if !fingerprint_changed {
+            return;
+        }
+
+        let status = recovery::status_for_outcome(&scan.outcome);
+        // A terminal record for an unchanged source state is only written
+        // once; Migrated/Salvaged/Migrating are owned by the migration flow
+        // and are never overwritten by the shadow scanner.
+        let dominated = existing.as_ref().is_some_and(|record| {
+            matches!(
+                record.status,
+                recovery::CheckpointRecoveryStatus::Migrating { .. }
+                    | recovery::CheckpointRecoveryStatus::Migrated
+                    | recovery::CheckpointRecoveryStatus::Salvaged { .. }
+            )
+        });
+        if !dominated {
+            self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                recovery::CheckpointRecoveryRecord::new(
+                    wrapper,
+                    status,
+                    scan.source_fingerprint.clone(),
+                ),
+            )));
+        }
+
+        let tail_items = match scan.journal_tail {
+            recovery::JournalTailRecovery::Lossless { items } => items as u64,
+            recovery::JournalTailRecovery::Partial { recovered, .. } => recovered as u64,
+            _ => 0,
+        };
+        let (source, portable_items, omissions_total, reason_code) = match &scan.outcome {
+            recovery::V1RecoveryOutcome::Lossless {
+                history, source, ..
+            } => (
+                Some(source.as_str()),
+                history.len() as u64 - tail_items,
+                0,
+                None,
+            ),
+            recovery::V1RecoveryOutcome::LossySalvageAvailable {
+                history, omissions, ..
+            } => (
+                None,
+                history.len() as u64 - tail_items,
+                omissions.iter().map(|omission| omission.count).sum(),
+                None,
+            ),
+            recovery::V1RecoveryOutcome::Unrecoverable(error) => {
+                (None, 0, 0, Some(error.reason_code.as_str().to_string()))
+            }
+        };
+        xai_grok_telemetry::session_ctx::log_event(
+            xai_grok_telemetry::events::CheckpointRecoveryScan {
+                checkpoint_id: wrapper.checkpoint_id.clone(),
+                outcome: scan.outcome.class_str(),
+                source,
+                journal_tail: scan.journal_tail.as_str(),
+                omissions_total,
+                reason_code,
+                fingerprint_changed,
+                portable_items,
+                tail_items,
+            },
+        );
     }
 
     async fn prepare_server_request(
@@ -1181,8 +1518,12 @@ impl SessionActor {
         let request_history_revision = request.history_revision.ok_or_else(|| {
             acp::Error::internal_error().data("responses_compaction_missing_request_revision")
         })?;
-        let final_request = FinalResponsesRequest::try_from(&request)
+        // Validated recompaction body: the only path that may flatten a
+        // checkpoint into a sendable request, guarded by
+        // `validate_for_backend` plus the sidecar proof below.
+        let final_request = FinalResponsesRequest::for_compact_request(&request)
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let final_body = final_request.body().clone();
         let full_config = self.reconstruct_full_config().await;
         let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
             .map_err(|error| self.to_acp_error(error))?;
@@ -1190,7 +1531,7 @@ impl SessionActor {
             return Ok(None);
         };
         let endpoint_fingerprint = client.responses_compact_endpoint_fingerprint();
-        let prompt_projection = self.current_prompt_projection(&final_request, &request.items)?;
+        let prompt_projection = self.current_prompt_projection(&final_body, &request.items)?;
         let identity =
             crate::session::responses_server_compaction::build_checkpoint_identity_with_projection(
                 if crate::util::is_xai_api_url(&full_config.base_url) {
@@ -1200,13 +1541,16 @@ impl SessionActor {
                 },
                 &endpoint_fingerprint,
                 &principal,
-                &final_request,
+                &final_body,
                 Some(prompt_projection.clone()),
             )
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let bound = self
             .chat_state_handle
-            .bind_request_identity_at_revision(identity.clone(), request_history_revision)
+            .bind_request_identity_at_revision(
+                xai_grok_sampling_types::CheckpointIdentity::V1(identity.clone()),
+                request_history_revision,
+            )
             .await
             .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
         let (binding, state) = match bound {
@@ -1222,15 +1566,15 @@ impl SessionActor {
             .portable_history_for_request(&request.items)
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let (_, mut semantic_envelope) =
-            crate::session::responses_server_compaction::canonical_prompt_envelope(&final_request)
+            crate::session::responses_server_compaction::canonical_prompt_envelope(&final_body)
                 .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         semantic_envelope["canonical_prompt_projection"] = prompt_projection.clone();
         let semantic_envelope_tokens = crate::session::responses_server_compaction::prompt_envelope_token_estimate_with_projection(
-            &final_request,
+            &final_body,
             Some(prompt_projection),
         )
         .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
-        let body = final_request.body();
+        let body = &final_body;
         let input = body
             .get("input")
             .and_then(serde_json::Value::as_array)
@@ -1274,7 +1618,7 @@ impl SessionActor {
                 request_identity_generation: binding.request_identity_generation,
                 prompt_index: state.prompt_index,
                 pre_compaction_tokens: state.total_tokens,
-                final_request: final_request.clone(),
+                final_request: final_body.clone(),
                 credential,
                 model: identity.model.clone(),
                 input,
@@ -1300,18 +1644,470 @@ impl SessionActor {
         }))
     }
 
+    /// Stage-D1b migration: when the live V1 checkpoint is `Replayable`,
+    /// attempt lossless migration into safe local continuity before the
+    /// legacy replay path is considered. Only
+    /// [`crate::session::checkpoint_recovery::V1RecoveryOutcome::Lossless`]
+    /// results are consumed; anything else keeps the checkpoint on the
+    /// temporary `ValidatedLegacyReplayV1` path (or its stable terminal
+    /// status).
+    ///
+    /// The migration is idempotent per (`checkpoint_id`, `operation_id`,
+    /// source fingerprint): a `Migrating` record precedes the commit, a
+    /// `Migrated` record closes it, and a hard commit failure parks the
+    /// checkpoint at `Unrecoverable { migration_commit_failed }` until the
+    /// recovery sources change or an explicit repair runs — never a
+    /// per-turn retry loop.
+    async fn migrate_v1_checkpoint_if_lossless(
+        self: &Arc<Self>,
+        request: &ConversationRequest,
+        binding: &xai_chat_state::RequestIdentityBinding,
+        full_config: &xai_grok_sampler::SamplerConfig,
+    ) -> Result<V1MigrationStep, acp::Error> {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::session::checkpoint_recovery as recovery;
+
+        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = request.items.first()
+        else {
+            return Ok(V1MigrationStep::NotEligible);
+        };
+        if !crate::session::responses_server_compaction::v1_migration_cohort(
+            &self.session_info.id.to_string(),
+        ) {
+            return Ok(V1MigrationStep::NotEligible);
+        }
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        // Strict updates read: on failure, skip migration this turn (the
+        // legacy replay permit path re-validates the sidecar and proceeds).
+        let Ok(updates) = recovery::load_updates_for_recovery(&session_dir) else {
+            return Ok(V1MigrationStep::NotEligible);
+        };
+        if let Some(record) = recovery::latest_recovery_record(
+            &updates,
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+        ) {
+            if !recovery::migration_eligible(Some(&record)) {
+                return Ok(V1MigrationStep::NotEligible);
+            }
+        }
+        let trusted_base = super::load_system_prompt_from_dir(&session_dir);
+        let scan = recovery::scan_v1_checkpoint_recovery(
+            &session_dir,
+            &updates,
+            wrapper,
+            trusted_base.as_deref(),
+        );
+        let recovery::V1RecoveryOutcome::Lossless {
+            history: recovered,
+            source,
+            portable_len,
+            ..
+        } = &scan.outcome
+        else {
+            // Classified but not lossless: persist the stable terminal status
+            // so this checkpoint is not re-scanned on every turn.
+            self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                recovery::CheckpointRecoveryRecord::new(
+                    wrapper,
+                    recovery::status_for_outcome(&scan.outcome),
+                    scan.source_fingerprint.clone(),
+                ),
+            )));
+            return Ok(V1MigrationStep::NotEligible);
+        };
+        let source = *source;
+        let portable_len = *portable_len;
+
+        // Assemble the replacement: verified portable prefix + the live tail
+        // (which the journal just proved durable and complete).
+        let mut replacement = recovered[..portable_len].to_vec();
+        replacement.extend_from_slice(&request.items[1..]);
+        let tail_items = request.items.len().saturating_sub(1) as u64;
+
+        // Reuse the persisted operation ID when a previous attempt already
+        // reached `Migrating` for the same source: repeated attempts stay
+        // idempotent instead of fragmenting the journal with fresh IDs.
+        let recovery_operation_id = recovery::migration_operation_id(
+            &updates,
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+            &scan.source_fingerprint,
+        )
+        .unwrap_or_else(|| format!("v1-migrate-{}", uuid::Uuid::now_v7()));
+        let mut migrating = recovery::CheckpointRecoveryRecord::new(
+            wrapper,
+            recovery::CheckpointRecoveryStatus::Migrating {
+                operation_id: recovery_operation_id.clone(),
+            },
+            scan.source_fingerprint.clone(),
+        );
+        migrating.recovery_operation_id = Some(recovery_operation_id.clone());
+        self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+            migrating,
+        )));
+
+        let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&replacement);
+        let threshold = full_config
+            .context_window
+            .saturating_mul(u64::from(self.compaction.threshold_percent.get()))
+            / 100;
+        if estimated_tokens >= threshold && threshold > 0 {
+            // Over budget: builtin-compact the frozen replacement instead of
+            // continuing with the full expansion. The replacement was fully
+            // validated by the recovery scan, so the builtin path consumes
+            // it verbatim and never re-resolves the checkpoint (this is
+            // what makes staging-only recovery migratable).
+            if let Err(error) = self
+                .run_compact_inner(
+                    None,
+                    None,
+                    xai_grok_telemetry::events::CompactionTrigger::Manual,
+                    CompactionStrategy::BuiltinMigration("v1_lossless_recovery"),
+                    Some(request.clone()),
+                    None,
+                    false,
+                    0,
+                    Some(replacement.clone()),
+                )
+                .await
+            {
+                // Commit errors are pre-commit, so nothing was applied.
+                // Record an explicit retryable state (stable operation ID)
+                // instead of stranding the checkpoint in `Migrating`.
+                let mut pending = recovery::CheckpointRecoveryRecord::new(
+                    wrapper,
+                    recovery::CheckpointRecoveryStatus::Pending,
+                    scan.source_fingerprint.clone(),
+                );
+                pending.recovery_operation_id = Some(recovery_operation_id.clone());
+                self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                    pending,
+                )));
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::CheckpointRecoveryMigration {
+                        checkpoint_id: wrapper.checkpoint_id.clone(),
+                        operation_id: wrapper.operation_id.clone(),
+                        source: source.as_str(),
+                        outcome: "error",
+                        over_threshold: true,
+                        portable_items: portable_len as u64,
+                        tail_items,
+                        tokens_after: self.chat_state_handle.get_total_tokens().await,
+                    },
+                );
+                return Err(error);
+            }
+            self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                recovery::CheckpointRecoveryRecord::new(
+                    wrapper,
+                    recovery::CheckpointRecoveryStatus::Migrated,
+                    scan.source_fingerprint.clone(),
+                ),
+            )));
+            xai_grok_telemetry::session_ctx::log_event(
+                xai_grok_telemetry::events::CheckpointRecoveryMigration {
+                    checkpoint_id: wrapper.checkpoint_id.clone(),
+                    operation_id: wrapper.operation_id.clone(),
+                    source: source.as_str(),
+                    outcome: "compacted",
+                    over_threshold: true,
+                    portable_items: portable_len as u64,
+                    tail_items,
+                    tokens_after: self.chat_state_handle.get_total_tokens().await,
+                },
+            );
+            return Ok(V1MigrationStep::Resubmit);
+        }
+
+        let history_revision = request.history_revision.ok_or_else(|| {
+            acp::Error::internal_error().data("responses_compaction_missing_request_revision")
+        })?;
+        let commit = xai_chat_state::CommitCompaction {
+            operation_id: recovery_operation_id.clone(),
+            expected_history_revision: history_revision,
+            expected_request_identity_generation: binding.request_identity_generation,
+            replacement,
+            committed_total_tokens: estimated_tokens,
+        };
+        match self.chat_state_handle.commit_compaction(commit).await {
+            Some(xai_chat_state::CommitCompactionResult::Committed { .. }) => {
+                self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                    recovery::CheckpointRecoveryRecord::new(
+                        wrapper,
+                        recovery::CheckpointRecoveryStatus::Migrated,
+                        scan.source_fingerprint.clone(),
+                    ),
+                )));
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::CheckpointRecoveryMigration {
+                        checkpoint_id: wrapper.checkpoint_id.clone(),
+                        operation_id: wrapper.operation_id.clone(),
+                        source: source.as_str(),
+                        outcome: "committed",
+                        over_threshold: false,
+                        portable_items: portable_len as u64,
+                        tail_items,
+                        tokens_after: estimated_tokens,
+                    },
+                );
+                Ok(V1MigrationStep::Resubmit)
+            }
+            Some(xai_chat_state::CommitCompactionResult::Superseded { .. }) => {
+                // History moved under us; nothing was committed. The
+                // resubmitted turn re-plans from the newer revision.
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::CheckpointRecoveryMigration {
+                        checkpoint_id: wrapper.checkpoint_id.clone(),
+                        operation_id: wrapper.operation_id.clone(),
+                        source: source.as_str(),
+                        outcome: "superseded",
+                        over_threshold: false,
+                        portable_items: portable_len as u64,
+                        tail_items,
+                        tokens_after: estimated_tokens,
+                    },
+                );
+                Ok(V1MigrationStep::Resubmit)
+            }
+            Some(xai_chat_state::CommitCompactionResult::PersistenceFailed(error)) => {
+                tracing::warn!(?error, "V1 checkpoint migration commit failed");
+                self.persist_xai_update_only(XaiSessionUpdate::CheckpointRecovery(Box::new(
+                    recovery::CheckpointRecoveryRecord::new(
+                        wrapper,
+                        recovery::CheckpointRecoveryStatus::Unrecoverable {
+                            reason_code: "migration_commit_failed".into(),
+                        },
+                        scan.source_fingerprint.clone(),
+                    ),
+                )));
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::CheckpointRecoveryMigration {
+                        checkpoint_id: wrapper.checkpoint_id.clone(),
+                        operation_id: wrapper.operation_id.clone(),
+                        source: source.as_str(),
+                        outcome: "commit_failed",
+                        over_threshold: false,
+                        portable_items: portable_len as u64,
+                        tail_items,
+                        tokens_after: estimated_tokens,
+                    },
+                );
+                Ok(V1MigrationStep::NotEligible)
+            }
+            None => Err(acp::Error::internal_error().data("chat-state actor unavailable")),
+        }
+    }
+
+    /// V2 reader path of the continuity gate. Fully separate from the V1
+    /// legacy flow: the V3 sidecar supplies the replay material, the
+    /// current compatibility envelope is resolved from the live request,
+    /// and `ValidatedResponsesReplayV2::verify` performs the pure data
+    /// proof. Any failure fails closed into builtin migration — never a
+    /// provider request.
+    async fn ensure_v2_replayable_for_request(
+        self: &Arc<Self>,
+        request: &ConversationRequest,
+        full_config: &xai_grok_sampler::SamplerConfig,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV2,
+    ) -> Result<CheckpointGateOutcome, acp::Error> {
+        if full_config.api_backend != ApiBackend::Responses {
+            self.maybe_pre_compaction_flush(
+                self.chat_state_handle.get_total_tokens().await,
+                full_config.context_window,
+                "continuity_migration",
+            )
+            .await;
+            self.run_compact_inner(
+                None,
+                None,
+                xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::BuiltinMigration("non_responses"),
+                Some(request.clone()),
+                None,
+                false,
+                0,
+                None,
+            )
+            .await?;
+            return Ok(CheckpointGateOutcome::resubmit());
+        }
+        let request_history_revision = request.history_revision.ok_or_else(|| {
+            acp::Error::internal_error().data("responses_compaction_missing_request_revision")
+        })?;
+        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
+            .map_err(|error| self.to_acp_error(error))?;
+        let Some((_, principal)) = self.compact_credential(full_config) else {
+            self.maybe_pre_compaction_flush(
+                self.chat_state_handle.get_total_tokens().await,
+                full_config.context_window,
+                "continuity_migration",
+            )
+            .await;
+            self.run_compact_inner(
+                None,
+                None,
+                xai_grok_telemetry::events::CompactionTrigger::Manual,
+                CompactionStrategy::BuiltinMigration("continuity_mismatch"),
+                Some(request.clone()),
+                None,
+                false,
+                0,
+                None,
+            )
+            .await?;
+            return Ok(CheckpointGateOutcome::resubmit());
+        };
+        let current_envelope = self.current_trusted_envelope_v2(request)?;
+        let identity = xai_grok_sampling_types::CheckpointIdentityV2 {
+            provider_id: if crate::util::is_xai_api_url(&full_config.base_url) {
+                "xai".to_string()
+            } else {
+                "openai_compatible".to_string()
+            },
+            api: "responses".to_string(),
+            endpoint_fingerprint: client.responses_compact_endpoint_fingerprint(),
+            model: request
+                .model
+                .clone()
+                .unwrap_or_else(|| full_config.model.clone()),
+            auth_principal_fingerprint: principal,
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2
+                .to_string(),
+            prompt_envelope_fingerprint: current_envelope.envelope_fingerprint.clone(),
+            base_instructions_sha256: current_envelope.base_instructions_sha256.clone(),
+            prior_checkpoint_id: wrapper.prior_checkpoint_id.clone(),
+            cache_route_fingerprint: None,
+        };
+        let binding = match self
+            .chat_state_handle
+            .bind_request_identity_at_revision(
+                xai_grok_sampling_types::CheckpointIdentity::V2(identity),
+                request_history_revision,
+            )
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?
+        {
+            xai_chat_state::RequestIdentityBindResult::Bound { binding, .. } => binding,
+            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => {
+                return Ok(CheckpointGateOutcome::resubmit());
+            }
+        };
+        if matches!(
+            binding.checkpoint_status,
+            xai_chat_state::CheckpointReplayStatus::Replayable
+        ) {
+            // Bound Replayable: read the V3 sidecar and verify the full
+            // replay material before any request may be planned.
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            let sidecar = crate::session::storage::responses_compaction::read_checkpoint_for_wrapper_v2(
+                &session_dir,
+                wrapper,
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            let replay = xai_grok_sampling_types::ValidatedResponsesReplayV2::verify(
+                wrapper,
+                &sidecar.replay_material,
+                &sidecar.portable_history,
+                &current_envelope,
+                &request.items[1..],
+                request_history_revision,
+                binding.request_identity_generation,
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            return Ok(CheckpointGateOutcome::replayable_v2(replay));
+        }
+        // MigrationRequired / InvalidCheckpoint / inconsistent layout:
+        // builtin migration, then resubmit.
+        self.maybe_pre_compaction_flush(
+            self.chat_state_handle.get_total_tokens().await,
+            full_config.context_window,
+            "continuity_migration",
+        )
+        .await;
+        self.run_compact_inner(
+            None,
+            None,
+            xai_grok_telemetry::events::CompactionTrigger::Manual,
+            CompactionStrategy::BuiltinMigration("continuity_mismatch"),
+            Some(request.clone()),
+            None,
+            false,
+            0,
+            None,
+        )
+        .await?;
+        Ok(CheckpointGateOutcome::resubmit())
+    }
+
+    /// Resolve the current compatibility envelope for the V2 contract:
+    /// base instructions hash from the live `BaseInstructions` items (or
+    /// the persisted trusted base prompt), canonical envelope fingerprint
+    /// from the request's non-transcript semantics, and the exact wire
+    /// prompt hash for diagnostics. Memory content never participates.
+    fn current_trusted_envelope_v2(
+        &self,
+        request: &ConversationRequest,
+    ) -> Result<xai_grok_sampling_types::TrustedPromptEnvelopeV2, acp::Error> {
+        let base_from_items: Vec<String> = request
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::System(system)
+                    if system.source == xai_grok_sampling_types::SystemSource::BaseInstructions =>
+                {
+                    let content = system.content.trim();
+                    (!content.is_empty()).then(|| content.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let base_instructions = if !base_from_items.is_empty() {
+            base_from_items.join(xai_grok_sampling_types::INSTRUCTIONS_MEMORY_SEPARATOR)
+        } else {
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            super::load_system_prompt_from_dir(&session_dir)
+                .map(|base| base.trim().to_string())
+                .unwrap_or_default()
+        };
+        let rendered = xai_grok_sampling_types::compose_instructions_v2(&request.items)
+            .unwrap_or_else(|| base_instructions.clone());
+        Ok(xai_grok_sampling_types::TrustedPromptEnvelopeV2 {
+            base_instructions_sha256: xai_grok_sampling_types::base_instructions_sha256_v2(
+                &base_instructions,
+            ),
+            memory_revision: None,
+            envelope_fingerprint: xai_grok_sampling_types::canonical_envelope_fingerprint_v2(
+                request,
+            ),
+            wire_prompt_sha256: xai_grok_sampling_types::wire_prompt_sha256_v2(&rendered),
+        })
+    }
+
     pub(crate) async fn ensure_checkpoint_replayable_for_request(
         self: &Arc<Self>,
         request: &ConversationRequest,
         full_config: &xai_grok_sampler::SamplerConfig,
-    ) -> Result<bool, acp::Error> {
+    ) -> Result<CheckpointGateOutcome, acp::Error> {
         let has_wrapper = matches!(
             request.items.first(),
             Some(ConversationItem::ResponsesCompactionCheckpoint(_))
         );
+        if has_wrapper {
+            self.shadow_scan_v1_checkpoint_recovery(request);
+        }
+        // V2 reader path: fully separate from the V1 legacy flow (no shadow
+        // scan, no V1 migration, no V1 flattened projection).
+        if let Some(ConversationItem::ResponsesCompactionCheckpointV2(wrapper)) =
+            request.items.first()
+        {
+            return self
+                .ensure_v2_replayable_for_request(request, full_config, wrapper)
+                .await;
+        }
         if full_config.api_backend != ApiBackend::Responses {
             if !has_wrapper {
-                return Ok(false);
+                return Ok(CheckpointGateOutcome::proceed());
             }
             self.maybe_pre_compaction_flush(
                 self.chat_state_handle.get_total_tokens().await,
@@ -1328,21 +2124,25 @@ impl SessionActor {
                 None,
                 false,
                 0,
+                None,
             )
             .await?;
-            return Ok(true);
+            return Ok(CheckpointGateOutcome::resubmit());
         }
 
         let request_history_revision = request.history_revision.ok_or_else(|| {
             acp::Error::internal_error().data("responses_compaction_missing_request_revision")
         })?;
-        let final_request = FinalResponsesRequest::try_from(request)
+        // Flattened provider-visible body for continuity projection only —
+        // raw JSON, not a sendable request. Sendable bodies are produced
+        // exclusively by the sealed permit constructors.
+        let final_body = FinalResponsesRequest::replay_projection_body(request)
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
             .map_err(|error| self.to_acp_error(error))?;
         let Some((_, principal)) = self.compact_credential(full_config) else {
             if !has_wrapper {
-                return Ok(false);
+                return Ok(CheckpointGateOutcome::proceed());
             }
             self.maybe_pre_compaction_flush(
                 self.chat_state_handle.get_total_tokens().await,
@@ -1359,12 +2159,13 @@ impl SessionActor {
                 None,
                 false,
                 0,
+                None,
             )
             .await?;
-            return Ok(true);
+            return Ok(CheckpointGateOutcome::resubmit());
         };
         let projection = self
-            .current_prompt_projection(&final_request, &request.items)
+            .current_prompt_projection(&final_body, &request.items)
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let identity =
             crate::session::responses_server_compaction::build_checkpoint_identity_with_projection(
@@ -1375,25 +2176,56 @@ impl SessionActor {
                 },
                 &client.responses_compact_endpoint_fingerprint(),
                 &principal,
-                &final_request,
+                &final_body,
                 Some(projection),
             )
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
         let binding = match self
             .chat_state_handle
-            .bind_request_identity_at_revision(identity, request_history_revision)
+            .bind_request_identity_at_revision(
+                xai_grok_sampling_types::CheckpointIdentity::V1(identity),
+                request_history_revision,
+            )
             .await
             .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?
         {
             xai_chat_state::RequestIdentityBindResult::Bound { binding, .. } => binding,
-            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => return Ok(true),
+            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => {
+                return Ok(CheckpointGateOutcome::resubmit());
+            }
         };
         if matches!(
             binding.checkpoint_status,
             xai_chat_state::CheckpointReplayStatus::Replayable
         ) {
+            // Stage D1b: lossless migration consumes the checkpoint before
+            // any legacy replay. The migration path re-runs the full
+            // recovery scan, so the sidecar read below only happens when the
+            // checkpoint stays on the temporary permit path.
+            if has_wrapper
+                && matches!(
+                    self.migrate_v1_checkpoint_if_lossless(request, &binding, full_config)
+                        .await?,
+                    V1MigrationStep::Resubmit
+                )
+            {
+                return Ok(CheckpointGateOutcome::resubmit());
+            }
             self.portable_history_for_request(&request.items)
                 .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
+                request.items.first()
+            else {
+                return Err(acp::Error::internal_error()
+                    .data("responses_compaction_replayable_without_wrapper"));
+            };
+            let replay_portable_history = self
+                .sidecar_portable_history(wrapper)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            return Ok(CheckpointGateOutcome::replayable(
+                binding,
+                replay_portable_history,
+            ));
         }
         if matches!(
             binding.checkpoint_status,
@@ -1415,11 +2247,12 @@ impl SessionActor {
                 None,
                 false,
                 0,
+                None,
             )
             .await?;
-            return Ok(true);
+            return Ok(CheckpointGateOutcome::resubmit());
         }
-        Ok(false)
+        Ok(CheckpointGateOutcome::proceed())
     }
 
     fn responses_mode_metadata(&self) -> ResponsesCompactionModeV1 {
@@ -1743,7 +2576,13 @@ impl SessionActor {
         mut supersedes_compaction_id: Option<String>,
         mut strategy_started_notified: bool,
         mut supersede_attempt: u8,
+        // Frozen full live history to compact instead of re-resolving the
+        // actor snapshot (V1 lossless migration over threshold). Consumed
+        // on the first attempt; a supersede aborts the migration instead
+        // of compacting a stale frozen source.
+        mut frozen_source: Option<Vec<ConversationItem>>,
     ) -> Result<(), acp::Error> {
+        let had_frozen_source = frozen_source.is_some();
         loop {
             match self
                 .run_compact_attempt(
@@ -1755,6 +2594,7 @@ impl SessionActor {
                     supersedes_compaction_id.clone(),
                     strategy_started_notified,
                     supersede_attempt,
+                    frozen_source.take(),
                 )
                 .await?
             {
@@ -1763,6 +2603,14 @@ impl SessionActor {
                     compaction_id,
                     strategy_started_notified: notified,
                 } => {
+                    if had_frozen_source {
+                        // The frozen replacement was planned against the
+                        // request revision; retrying it against a moved
+                        // history would commit stale content. Abort and let
+                        // the next turn re-plan the migration.
+                        return Err(acp::Error::internal_error()
+                            .data("v1_migration_superseded"));
+                    }
                     supersedes_compaction_id = Some(compaction_id);
                     strategy_started_notified = notified;
                     supersede_attempt = supersede_attempt.saturating_add(1);
@@ -1813,6 +2661,7 @@ impl SessionActor {
         supersedes_compaction_id: Option<String>,
         mut strategy_started_notified: bool,
         supersede_attempt: u8,
+        frozen_source: Option<Vec<ConversationItem>>,
     ) -> Result<CompactionAttemptOutcome, acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
@@ -1947,7 +2796,9 @@ impl SessionActor {
                     .get_sampling_config()
                     .await
                     .ok_or_else(|| acp::Error::internal_error().data("missing sampling config"))?,
-                bound_request_identity: Some(prepared.snapshot.identity.clone()),
+                bound_request_identity: Some(xai_grok_sampling_types::CheckpointIdentity::V1(
+                    prepared.snapshot.identity.clone(),
+                )),
             }
         } else {
             let mut snapshot = self
@@ -1955,9 +2806,15 @@ impl SessionActor {
                 .get_compaction_snapshot()
                 .await
                 .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
-            snapshot.conversation = self
-                .portable_history_for_request(&snapshot.conversation)
-                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            snapshot.conversation = match frozen_source {
+                // V1 lossless migration over threshold: the replacement was
+                // already fully validated by the recovery scan (sidecar OR
+                // staging + journal tail); never re-resolve the checkpoint.
+                Some(source) => source,
+                None => self
+                    .portable_history_for_request(&snapshot.conversation)
+                    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+            };
             snapshot
         };
         let expected_history_revision = actor_snapshot.history_revision;
@@ -1997,7 +2854,12 @@ impl SessionActor {
                 .await;
         }
 
+        // Stage D1b: V1 server compaction writers are disabled globally —
+        // new unsafe checkpoints must not be produced. The server attempt
+        // only proceeds for integration harnesses that opt in via
+        // `GROK_RESPONSES_V1_SERVER_COMPACTION`.
         let server_enabled = matches!(strategy, CompactionStrategy::ServerFirst)
+            && crate::session::responses_server_compaction::v1_server_compaction_writers_enabled()
             && self.agent.borrow().compaction_policy().server_compaction
             && migration_reason.is_none();
         let server_preparation_fallback = (server_enabled
@@ -3767,6 +4629,7 @@ impl SessionActor {
                 None,
                 false,
                 0,
+                None,
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -3933,6 +4796,8 @@ impl SessionActor {
             portable_history_sha256: None,
             responses_mode: None,
             responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
             created_at,
         };
         tracing::info!(

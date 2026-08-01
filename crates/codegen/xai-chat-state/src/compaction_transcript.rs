@@ -70,6 +70,7 @@ fn role_label(item: &ConversationItem) -> &'static str {
         ConversationItem::BackendToolCall(_) => "Assistant",
         ConversationItem::Reasoning(_) => "Assistant",
         ConversationItem::ResponsesCompactionCheckpoint(_) => "Checkpoint",
+        ConversationItem::ResponsesCompactionCheckpointV2(_) => "Checkpoint",
     }
 }
 

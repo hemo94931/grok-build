@@ -36,7 +36,7 @@ impl SessionActor {
         let bridge = self.agent.borrow().tool_bridge().clone();
         bridge.on_skill_discovery_clear().await;
         save_system_prompt(&self.session_info, &system_prompt);
-        let system_message = ConversationItem::system(system_prompt);
+        let system_message = ConversationItem::base_instructions(system_prompt);
         let mut messages = vec![system_message];
         if let Some(effects) = self.inject_baseline_skill_reminder(&mut messages).await
             && effects.send_available_commands

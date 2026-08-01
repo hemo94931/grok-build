@@ -86,6 +86,9 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
         ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
             checkpoint.checkpoint_token_seed
         }
+        ConversationItem::ResponsesCompactionCheckpointV2(checkpoint) => {
+            checkpoint.checkpoint_token_seed
+        }
     }
 }
 
@@ -153,7 +156,7 @@ pub(crate) struct ChatState {
     /// Monotonic request continuity-identity generation.
     pub request_identity_generation: u64,
     /// Identity bound by final request preparation; invalidated before semantic changes.
-    pub bound_request_identity: Option<xai_grok_sampling_types::CheckpointIdentityV1>,
+    pub bound_request_identity: Option<xai_grok_sampling_types::CheckpointIdentity>,
     /// Last committed typed-tail sequence for the active checkpoint branch.
     pub active_tail_sequence: u64,
     /// Bytes/4 estimate of tokens added since the last `record_token_usage`.
@@ -227,10 +230,9 @@ impl ChatState {
     /// lack matching `ToolResult` entries. Without this, the in-memory state
     /// would carry broken conversation history until the next `build_request`.
     pub fn new(mut conversation: Vec<ConversationItem>, sampling_config: SamplingConfig) -> Self {
-        let checkpoint_active = matches!(
-            conversation.first(),
-            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
-        );
+        let checkpoint_active = conversation
+            .first()
+            .is_some_and(|item| item.is_responses_checkpoint());
         let (deduped, repaired) = if checkpoint_active {
             // Startup has no acknowledged persistence boundary yet. Leave an
             // authoritative typed tail untouched; the actor repairs it on the

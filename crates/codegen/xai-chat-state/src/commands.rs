@@ -127,14 +127,14 @@ pub enum ChatStateCommand {
 
     /// Bind the identity of a fully prepared final provider request.
     BindRequestIdentity {
-        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
         reply: oneshot::Sender<RequestIdentityBinding>,
     },
 
     /// Bind only if the final request still matches its captured history revision,
     /// returning the compaction snapshot from the same actor command.
     BindRequestIdentityAtRevision {
-        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
         expected_history_revision: u64,
         reply: oneshot::Sender<RequestIdentityBindResult>,
     },

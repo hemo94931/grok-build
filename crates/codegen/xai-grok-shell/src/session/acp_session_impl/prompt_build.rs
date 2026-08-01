@@ -224,18 +224,32 @@ pub(super) fn install_system_prompt(
     preserve_inherited_system: bool,
     system_prompt: &str,
 ) {
-    if matches!(
-        conversation.first(),
-        Some(ConversationItem::ResponsesCompactionCheckpoint(_))
-    ) {
+    if conversation
+        .first()
+        .is_some_and(|item| item.is_responses_checkpoint())
+    {
         return;
     }
-    if let Some(ConversationItem::System(sys)) = conversation.first_mut() {
+    // Only a non-memory leading System is the base head; a leading
+    // MemoryContext item (base already stripped) gets a fresh base inserted
+    // before it.
+    let head_is_base = matches!(
+        conversation.first(),
+        Some(ConversationItem::System(sys)) if sys.source != xai_grok_sampling_types::SystemSource::MemoryContext
+    );
+    if head_is_base {
         if is_subagent_spawn && !preserve_inherited_system {
+            let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+                unreachable!("head_is_base implies a leading system item");
+            };
             sys.content = std::sync::Arc::<str>::from(system_prompt);
+            sys.source = xai_grok_sampling_types::SystemSource::BaseInstructions;
         }
     } else {
-        conversation.insert(0, ConversationItem::system(system_prompt.to_string()));
+        conversation.insert(
+            0,
+            ConversationItem::base_instructions(system_prompt.to_string()),
+        );
         if let Some(len) = inherited_prefix_len {
             *len += 1;
         }

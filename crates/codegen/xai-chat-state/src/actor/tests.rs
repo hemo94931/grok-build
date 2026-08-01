@@ -1471,12 +1471,16 @@ async fn build_request_injects_memory_reminder() {
         .await
         .unwrap();
 
-    if let ConversationItem::System(ref sys) = request.items[0] {
-        assert!(sys.content.contains("Remember: user prefers Rust"));
-        assert!(sys.content.starts_with("You are helpful."));
-    } else {
-        panic!("expected System item");
-    }
+    // Base instructions stay untouched; memory is a dedicated item.
+    assert_eq!(request.items[0].text_content(), "You are helpful.");
+    let ConversationItem::System(ref memory) = request.items[1] else {
+        panic!("expected dedicated memory System item");
+    };
+    assert_eq!(memory.content.as_ref(), "Remember: user prefers Rust");
+    assert_eq!(
+        memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 }
 
 #[tokio::test]
@@ -1631,24 +1635,34 @@ async fn build_request_can_persist_memory_into_actor_state() {
         .await
         .unwrap();
 
-    if let ConversationItem::System(ref sys) = request.items[0] {
-        assert!(sys.content.contains("Remember this"));
-    } else {
-        panic!("expected System item in request");
-    }
+    // Base instructions stay untouched; the request carries the memory as
+    // its own marked item.
+    assert_eq!(request.items[0].text_content(), "sys");
+    let ConversationItem::System(ref memory) = request.items[1] else {
+        panic!("expected dedicated memory System item in request");
+    };
+    assert!(memory.content.contains("Remember this"));
+    assert_eq!(
+        memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 
     let conv = h.handle.get_conversation().await;
-    if let ConversationItem::System(ref sys) = conv[0] {
-        assert!(sys.content.contains("Remember this"));
-    } else {
-        panic!("expected persisted System item");
-    }
+    assert_eq!(conv[0].text_content(), "sys");
+    let ConversationItem::System(ref persisted_memory) = conv[1] else {
+        panic!("expected persisted memory System item");
+    };
+    assert!(persisted_memory.content.contains("Remember this"));
+    assert_eq!(
+        persisted_memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 
     let records = h.drain_persistence();
     assert!(
         records
             .iter()
-            .any(|r| matches!(r, PersistenceRecord::ReplaceHistory(items) if matches!(items.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Remember this"))))
+            .any(|r| matches!(r, PersistenceRecord::ReplaceHistory(items) if items.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Remember this")))))
     );
 }
 

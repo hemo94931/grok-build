@@ -565,8 +565,9 @@ async fn compact_logs_never_expose_prompt_blob_query_or_credentials() {
             ..Default::default()
         })
         .unwrap();
-        let mut request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
-        request.instructions = Some(PROMPT.into());
+        let request = ResponsesCompactRequest::from_final(&final_request(), None)
+            .unwrap()
+            .with_instructions(Some(PROMPT.into()));
         let error = client
             .compact_responses(
                 &request,
@@ -595,8 +596,9 @@ async fn oversized_request_is_rejected_before_transport() {
         ..Default::default()
     })
     .unwrap();
-    let mut request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
-    request.instructions = Some("x".repeat(RESPONSES_COMPACT_MAX_BYTES));
+    let request = ResponsesCompactRequest::from_final(&final_request(), None)
+        .unwrap()
+        .with_instructions(Some("x".repeat(RESPONSES_COMPACT_MAX_BYTES)));
 
     let error = client
         .compact_responses(

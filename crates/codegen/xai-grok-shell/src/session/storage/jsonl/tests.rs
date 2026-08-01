@@ -783,6 +783,8 @@ fn checkpoint_record_with_path(id: &str, checkpoint_file: &str) -> SessionUpdate
                     portable_history_sha256: None,
                     responses_mode: None,
                     responses_auto_continue: None,
+                    wrapper_digest: None,
+                    prior_checkpoint_id: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                 }),
             ),
@@ -857,6 +859,142 @@ async fn copy_session_data_copies_referenced_compaction_checkpoints() {
     let original = std::fs::read(adapter.session_dir(&source_info).join(rel)).unwrap();
     assert_eq!(copied, original, "checkpoint file must be copied verbatim");
 }
+
+/// V2/V3 fork semantics: a V2 wrapper (schema-3 marker + V3 sidecar) is
+/// preserved like the V1 wrapper — the live wrapper's V3 sidecar file is
+/// copied verbatim to the target session and the target chat history keeps
+/// the V2 wrapper at index 0.
+#[tokio::test]
+async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
+    use xai_grok_sampling_types::{
+        CheckpointIdentityV2, CheckpointReplayMaterialV2, ServerResponsesCheckpointV2,
+        TokenSeedSource, TrustedPromptEnvelopeV2,
+    };
+
+    let portable = vec![
+        ConversationItem::base_instructions("base prompt"),
+        ConversationItem::user("first"),
+        ConversationItem::assistant("first answer"),
+    ];
+    let digest = xai_grok_sampling_types::portable_history_digest(&portable).unwrap();
+    let bytes =
+        super::super::responses_compaction::portable_history_bytes(&portable).unwrap();
+    let wrapper = ServerResponsesCheckpointV2 {
+        schema_version: xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2,
+        checkpoint_id: "ckpt-v2".into(),
+        operation_id: "op-v2".into(),
+        prompt_index: 2,
+        created_at: chrono::Utc::now(),
+        auto_continue: false,
+        mode: xai_grok_sampling_types::ResponsesCompactionModeV1 {
+            name: "default".into(),
+            detail: None,
+        },
+        branch_id: "branch-1".into(),
+        identity: CheckpointIdentityV2 {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: None,
+            cache_route_fingerprint: None,
+        },
+        output: vec![serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })],
+        portable_history_path: "compaction_checkpoints/ckpt-v2.json".into(),
+        portable_history_sha256: digest,
+        portable_history_bytes: bytes.len() as u64,
+        checkpoint_token_seed: 42,
+        token_seed_source: TokenSeedSource::UsageOutputTokens,
+        server_output_item_count: 1,
+        prior_checkpoint_id: None,
+        memory_revision: Some(3),
+    };
+    let material = CheckpointReplayMaterialV2::try_new(
+        &wrapper,
+        TrustedPromptEnvelopeV2 {
+            base_instructions_sha256: "base-hash".into(),
+            memory_revision: Some(3),
+            envelope_fingerprint: "envelope-fp".into(),
+            wire_prompt_sha256: "wire-hash".into(),
+        },
+        &portable,
+    )
+    .unwrap();
+    let sidecar = super::super::responses_compaction::CompactionCheckpointFileV3::new(
+        wrapper.clone(),
+        material,
+        portable,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("ckpt-v2-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter.init_session(&source_info, default_model_id()).await.unwrap();
+    super::super::responses_compaction::write_checkpoint_v3_durable(
+        &adapter.session_dir(&source_info),
+        &wrapper.portable_history_path,
+        &sidecar,
+    )
+    .unwrap();
+    // Durable chat history head: the live V2 wrapper.
+    let mut head = serde_json::to_vec(&ConversationItem::ResponsesCompactionCheckpointV2(
+        Box::new(wrapper.clone()),
+    ))
+    .unwrap();
+    head.push(b'\n');
+    std::fs::write(adapter.chat_file(&source_info), head).unwrap();
+    adapter
+        .append_update(
+            &source_info,
+            &SessionUpdate::Xai(Box::new(
+                crate::extensions::notification::SessionNotification {
+                    session_id: acp::SessionId::new("ckpt-v2-src"),
+                    update: crate::extensions::notification::SessionUpdate::CompactionCheckpoint(
+                        Box::new(
+                            super::super::responses_compaction::marker_for_wrapper_v3(&wrapper),
+                        ),
+                    ),
+                    meta: None,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+    let target_info = Info {
+        id: acp::SessionId::new("ckpt-v2-dst"),
+        cwd: "/target/workspace".to_string(),
+    };
+    let result = adapter
+        .copy_session_data(&source_info, &target_info, CopySessionOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.compaction_checkpoints_copied, 1);
+    assert_eq!(result.updates_copied, 1, "schema-3 marker must be copied");
+    let rel = "compaction_checkpoints/ckpt-v2.json";
+    let copied = std::fs::read(adapter.session_dir(&target_info).join(rel)).unwrap();
+    let original = std::fs::read(adapter.session_dir(&source_info).join(rel)).unwrap();
+    assert_eq!(copied, original, "V3 sidecar must be copied verbatim on fork");
+    let target_chat = std::fs::read_to_string(adapter.chat_file(&target_info)).unwrap();
+    let first: ConversationItem = serde_json::from_str(target_chat.lines().next().unwrap()).unwrap();
+    assert!(
+        matches!(first, ConversationItem::ResponsesCompactionCheckpointV2(_)),
+        "target chat history must keep the V2 wrapper at index 0"
+    );
+}
+
 #[tokio::test]
 async fn fork_filter_copy_skips_compaction_checkpoints() {
     let temp_dir = TempDir::new().unwrap();
@@ -3158,6 +3296,7 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
+            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3220,6 +3359,7 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
+            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3296,6 +3436,7 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
+            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);

@@ -625,6 +625,13 @@ pub enum SessionUpdate {
     ConversationAppendCommittedV2(
         crate::session::storage::responses_compaction::ConversationAppendCommittedV2,
     ),
+    /// Persist-only recovery bookkeeping for one Responses server checkpoint.
+    ///
+    /// Records the graded recovery classification (lossless / salvage /
+    /// unrecoverable) and the recovery-source fingerprint so a checkpoint in
+    /// a terminal state is not re-scanned — let alone re-migrated — on every
+    /// user turn. Keyed by `checkpoint_id` + `checkpoint_operation_id`.
+    CheckpointRecovery(Box<crate::session::checkpoint_recovery::CheckpointRecoveryRecord>),
     /// A rewind marker written to `updates.jsonl` when a rewind occurs.
     ///
     /// This is **persist-only** — it is never sent to the gateway/UI. Because
@@ -1296,6 +1303,14 @@ pub struct CompactionCheckpointInfo {
     /// Whether the server checkpoint was followed by auto-continue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_auto_continue: Option<bool>,
+    /// Wrapper digest binding this marker to a V2 server checkpoint
+    /// (schema v3 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_digest: Option<String>,
+    /// Recompact chain link: the checkpoint this one was built on
+    /// (schema v3 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_checkpoint_id: Option<String>,
     /// ISO 8601 timestamp of when the checkpoint was created.
     pub created_at: String,
 }

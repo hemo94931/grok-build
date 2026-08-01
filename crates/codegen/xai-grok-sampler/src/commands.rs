@@ -6,11 +6,11 @@
 
 use tokio::sync::oneshot;
 
-use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, SamplingError};
+use xai_grok_sampling_types::{ConversationResponse, SamplingError};
 
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
-use crate::types::RequestId;
+use crate::types::{RequestId, SamplingDispatch};
 
 /// Commands sent from a [`SamplerHandle`](crate::handle::SamplerHandle)
 /// to the actor task.
@@ -23,7 +23,7 @@ pub(crate) enum SamplerCommand {
     /// signals that channel for `submit_and_collect` callers.
     Submit {
         request_id: RequestId,
-        request: Box<ConversationRequest>,
+        request: SamplingDispatch,
         config: Option<Box<SamplerConfig>>,
         completion_tx: Option<
             oneshot::Sender<Result<(ConversationResponse, InferenceLatencyStats), SamplingError>>,

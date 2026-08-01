@@ -454,6 +454,45 @@ pub struct CompactionTriggered {
     pub compaction_id: String,
 }
 
+/// Metadata-only V1 checkpoint recovery scan (shadow mode). Records only
+/// classifications and digests — never prompt content, portable history or
+/// provider output.
+#[derive(Serialize)]
+pub struct CheckpointRecoveryScan {
+    pub checkpoint_id: String,
+    /// `lossless` | `lossy_salvage_available` | `unrecoverable` | `skipped_fresh`
+    pub outcome: &'static str,
+    /// Recovery source for lossless outcomes: `sidecar_v2` | `segment_staging_v1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    /// Journal typed-tail recovery: `empty` | `lossless` | `partial` | `unusable`.
+    pub journal_tail: &'static str,
+    pub omissions_total: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Whether the recovery-source fingerprint changed since the last record.
+    pub fingerprint_changed: bool,
+    pub portable_items: u64,
+    pub tail_items: u64,
+}
+
+/// Metadata-only V1 lossless-migration attempt (stage D1b).
+#[derive(Serialize)]
+pub struct CheckpointRecoveryMigration {
+    pub checkpoint_id: String,
+    pub operation_id: String,
+    /// `sidecar_v2` | `segment_staging_v1`
+    pub source: &'static str,
+    /// `committed` | `compacted` | `superseded` | `commit_failed`
+    pub outcome: &'static str,
+    /// Whether the recovered history exceeded the context threshold and
+    /// therefore went through builtin compaction.
+    pub over_threshold: bool,
+    pub portable_items: u64,
+    pub tail_items: u64,
+    pub tokens_after: u64,
+}
+
 /// Metadata-only strategy attempt for standalone Responses compaction.
 /// Deliberately excludes endpoint/auth identity digests and all wire content.
 #[derive(Serialize)]
@@ -1718,6 +1757,8 @@ telemetry_event!(
 telemetry_event!(AutoCompactFired, "auto_compact_fired");
 telemetry_event!(CompactionTriggered, "compaction_triggered");
 telemetry_event!(CompactionStrategyAttempt, "compaction_strategy_attempt");
+telemetry_event!(CheckpointRecoveryScan, "checkpoint_recovery_scan");
+telemetry_event!(CheckpointRecoveryMigration, "checkpoint_recovery_migration");
 telemetry_event!(
     CompactionCompleted,
     "compaction_completed",

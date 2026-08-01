@@ -45,7 +45,7 @@ impl SamplerHandle {
     pub fn submit(&self, request_id: RequestId, request: ConversationRequest) {
         let _ = self.cmd_tx.send(SamplerCommand::Submit {
             request_id,
-            request: Box::new(request),
+            request: crate::types::SamplingDispatch::from(request),
             config: None,
             completion_tx: None,
         });
@@ -61,7 +61,7 @@ impl SamplerHandle {
     ) {
         let _ = self.cmd_tx.send(SamplerCommand::Submit {
             request_id,
-            request: Box::new(request),
+            request: crate::types::SamplingDispatch::from(request),
             config: Some(Box::new(config)),
             completion_tx: None,
         });
@@ -115,6 +115,20 @@ impl SamplerHandle {
         request_id: RequestId,
         request: ConversationRequest,
     ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
+        self.submit_dispatch_and_collect(request_id, crate::types::SamplingDispatch::from(request))
+            .await
+    }
+
+    /// Submit an explicit dispatch (normal typed request, opaque resolved
+    /// request, or a legacy replay permit) and await its completion.
+    ///
+    /// Resolved/legacy dispatches carry a frozen body: every sampler retry
+    /// re-sends the identical bytes with the identical correlation headers.
+    pub async fn submit_dispatch_and_collect(
+        &self,
+        request_id: RequestId,
+        dispatch: crate::types::SamplingDispatch,
+    ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
         // RAII guard: when this future is dropped (cancel, panic, or normal return),
         // tell the sampler actor to cancel the in-flight request_id. No-op if the
         // actor already finished and removed it from its active set.
@@ -139,7 +153,7 @@ impl SamplerHandle {
             .cmd_tx
             .send(SamplerCommand::Submit {
                 request_id,
-                request: Box::new(request),
+                request: dispatch,
                 config: None,
                 completion_tx: Some(completion_tx),
             })

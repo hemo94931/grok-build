@@ -826,11 +826,72 @@ impl JsonlStorageAdapter {
         info: &Info,
         conversation: &[ConversationItem],
     ) -> io::Result<()> {
-        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = conversation.first()
+        let Some(checkpoint) = conversation
+            .first()
+            .and_then(ConversationItem::as_responses_checkpoint)
         else {
             return Ok(());
         };
-        let history = super::responses_compaction::read_history_v2(&self.chat_file(info))?;
+        // Variant-aware: V1 wrappers bind to schema-2 markers/V2 sidecars,
+        // V2 wrappers bind to schema-3 markers/V3 sidecars — never mix.
+        match checkpoint {
+            xai_grok_sampling_types::ResponsesCheckpointRef::V1(wrapper) => {
+                self.repair_responses_marker_sync(
+                    info,
+                    |marker| {
+                        super::responses_compaction::validate_marker_for_wrapper(marker, wrapper)
+                            .is_ok()
+                    },
+                    || super::responses_compaction::marker_for_wrapper(wrapper),
+                    super::responses_compaction::read_history_v2(&self.chat_file(info))?,
+                )?;
+                if wrapper.mode.name == "segments" {
+                    super::responses_compaction::publish_staged_compaction_segment_durable(
+                        &self.session_dir(info),
+                        &wrapper.checkpoint_id,
+                    )?;
+                }
+            }
+            xai_grok_sampling_types::ResponsesCheckpointRef::V2(wrapper) => {
+                self.repair_responses_marker_sync(
+                    info,
+                    |marker| {
+                        super::responses_compaction::validate_marker_for_wrapper_v3(marker, wrapper)
+                            .is_ok()
+                    },
+                    || super::responses_compaction::marker_for_wrapper_v3(wrapper),
+                    super::recover_history_entries_v3(super::read_persisted_chat_entries(
+                        &self.chat_file(info),
+                    )?)?,
+                )?;
+                if wrapper.mode.name == "segments" {
+                    // TODO(integration): V2 segment staging
+                    // (`ResponsesCompactionSegmentStagingV2`) has no publish
+                    // API yet; the V1 publish cannot consume V2 staging.
+                    tracing::warn!(
+                        checkpoint_id = %wrapper.checkpoint_id,
+                        "V2 checkpoint in segments mode: V2 staging publish not yet \
+                         available, skipping segment publish during recovery repair"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared marker/journal repair for both checkpoint variants: append a
+    /// missing marker and missing prepared/committed tail journal records so
+    /// a crash between CAS and marker/journal persist is healed from the
+    /// live wrapper + authoritative history.
+    fn repair_responses_marker_sync(
+        &self,
+        info: &Info,
+        marker_matches: impl Fn(
+            &crate::extensions::notification::CompactionCheckpointInfo,
+        ) -> bool,
+        build_marker: impl Fn() -> crate::extensions::notification::CompactionCheckpointInfo,
+        history: super::responses_compaction::RecoveredHistoryV2,
+    ) -> io::Result<()> {
         let updates = self.read_updates_jsonl(self.updates_file(info))?;
         let marker_present = updates.iter().any(|update| {
             matches!(
@@ -839,7 +900,7 @@ impl JsonlStorageAdapter {
                     if matches!(
                         &notification.update,
                         crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker)
-                            if super::responses_compaction::validate_marker_for_wrapper(marker, wrapper).is_ok()
+                            if marker_matches(marker)
                     )
             )
         });
@@ -847,7 +908,7 @@ impl JsonlStorageAdapter {
             self.append_recovery_update_sync(
                 info,
                 crate::extensions::notification::SessionUpdate::CompactionCheckpoint(Box::new(
-                    super::responses_compaction::marker_for_wrapper(wrapper),
+                    build_marker(),
                 )),
             )?;
         }
@@ -903,16 +964,10 @@ impl JsonlStorageAdapter {
                 )?;
             }
         }
-        if wrapper.mode.name == "segments" {
-            super::responses_compaction::publish_staged_compaction_segment_durable(
-                &self.session_dir(info),
-                &wrapper.checkpoint_id,
-            )?;
-        }
         Ok(())
     }
 
-    fn read_chat_history_sync(
+fn read_chat_history_sync(
         &self,
         path: PathBuf,
         chat_format_version: u8,
@@ -926,11 +981,23 @@ impl JsonlStorageAdapter {
             .any(|window| window == b"\"persisted_entry\"")
             || contents
                 .windows(b"\"type\":\"responses_compaction_checkpoint\"".len())
-                .any(|window| window == b"\"type\":\"responses_compaction_checkpoint\"");
+                .any(|window| window == b"\"type\":\"responses_compaction_checkpoint\"")
+            || contents
+                .windows(b"\"type\":\"responses_compaction_checkpoint_v2\"".len())
+                .any(|window| window == b"\"type\":\"responses_compaction_checkpoint_v2\"");
         if has_v2_boundary {
-            let history = super::responses_compaction::read_history_v2(&path)?;
-            if let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
-                history.conversation.first()
+            // Variant-aware typed read: a V2 wrapper head binds to a V3
+            // sidecar (never a V2 sidecar), a V1 wrapper head binds to a V2
+            // sidecar. The V1 recovery cannot consume V3 entries (V2 wrapper
+            // head + typed tail), so dispatch on the first line's wrapper
+            // variant before calling it.
+            let first_line = contents
+                .split(|byte| *byte == b'\n')
+                .find(|line| !line.iter().all(u8::is_ascii_whitespace));
+            if let Some(first_line) = first_line
+                && let Ok(first) = serde_json::from_slice::<ConversationItem>(first_line)
+                && let Some(xai_grok_sampling_types::ResponsesCheckpointRef::V2(wrapper)) =
+                    first.as_responses_checkpoint()
             {
                 let session_dir = path.parent().ok_or_else(|| {
                     io::Error::new(
@@ -938,7 +1005,36 @@ impl JsonlStorageAdapter {
                         "chat history has no session dir",
                     )
                 })?;
-                super::responses_compaction::read_checkpoint_for_wrapper(session_dir, wrapper)?;
+                let history = super::recover_history_entries_v3(super::read_persisted_chat_entries(
+                    &path,
+                )?)?;
+                super::responses_compaction::read_checkpoint_for_wrapper_v2(session_dir, wrapper)?;
+                return Ok(history.conversation);
+            }
+            let history = super::responses_compaction::read_history_v2(&path)?;
+            if let Some(checkpoint) = history
+                .conversation
+                .first()
+                .and_then(ConversationItem::as_responses_checkpoint)
+            {
+                let session_dir = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chat history has no session dir",
+                    )
+                })?;
+                match checkpoint {
+                    xai_grok_sampling_types::ResponsesCheckpointRef::V1(wrapper) => {
+                        super::responses_compaction::read_checkpoint_for_wrapper(
+                            session_dir, wrapper,
+                        )?;
+                    }
+                    xai_grok_sampling_types::ResponsesCheckpointRef::V2(wrapper) => {
+                        super::responses_compaction::read_checkpoint_for_wrapper_v2(
+                            session_dir, wrapper,
+                        )?;
+                    }
+                }
             }
             return Ok(history.conversation);
         }
@@ -1134,7 +1230,9 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
     let mut i = 0;
     while i < items.len() {
         match &items[i] {
-            ConversationItem::ResponsesCompactionCheckpoint(_) if i == 0 => {
+            // Variant-aware: both checkpoint wrapper variants are opaque
+            // compacted history at index 0 and are preserved as-is.
+            item if i == 0 && item.is_responses_checkpoint() => {
                 last_complete_end = 1;
                 i += 1;
             }
@@ -1204,13 +1302,17 @@ impl JsonlStorageAdapter {
         if let Some(target_idx) = options.target_prompt_index {
             updates_to_copy = super::filter_rewind_updates(updates_to_copy);
             updates_to_copy.truncate(updates_truncate_for_prompt(&updates_to_copy, target_idx));
-            if matches!(
-                chat_to_copy.first(),
-                Some(ConversationItem::ResponsesCompactionCheckpoint(_))
-            ) {
+            if chat_to_copy
+                .first()
+                .is_some_and(ConversationItem::is_responses_checkpoint)
+            {
+                // Pass the live checkpoint so a schema-3 marker can bind its
+                // V3 sidecar (the schema-2 path stays marker-driven).
+                let live_checkpoint = chat_to_copy.first();
                 chat_to_copy = crate::session::helpers::replay::replay_to_prompt(
                     &self.updates_file(source_info),
                     &self.session_dir(source_info),
+                    live_checkpoint,
                     target_idx,
                 )?
                 .conversation;
@@ -1227,11 +1329,20 @@ impl JsonlStorageAdapter {
         } else {
             updates_to_copy.retain(|update| !is_orchestration_projection_update(update));
         }
+        // Variant-aware branch rotation: both wrapper variants rotate their
+        // active branch on fork/rewind (V2 wrappers bind to V3 sidecars).
         if (options.target_prompt_index.is_some() || options.fork_filter)
-            && let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
-                chat_to_copy.first_mut()
+            && let Some(first) = chat_to_copy.first_mut()
         {
-            wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+            match first {
+                ConversationItem::ResponsesCompactionCheckpoint(wrapper) => {
+                    wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+                }
+                ConversationItem::ResponsesCompactionCheckpointV2(wrapper) => {
+                    wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+                }
+                _ => {}
+            }
         }
         let mut checkpoint_files: std::collections::BTreeSet<String> = updates_to_copy
             .iter()
@@ -1247,10 +1358,19 @@ impl JsonlStorageAdapter {
                 Some(info.checkpoint_file.clone())
             })
             .collect();
-        if let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = chat_to_copy.first()
+        // Sidecar copy set: every marker's checkpoint file plus the live
+        // wrapper's portable history (V1 wrapper → V2 sidecar, V2 wrapper →
+        // V3 sidecar — both are copied verbatim on fork).
+        if let Some(checkpoint) = chat_to_copy
+            .first()
+            .and_then(ConversationItem::as_responses_checkpoint)
         {
-            checkpoint_files.insert(wrapper.portable_history_path.clone());
+            checkpoint_files.insert(checkpoint.portable_history_path().to_string());
         }
+        // Marker-schema dispatch for the fork/copy path, mirroring the shared
+        // replay/rebuild rules: schema 1 markers are legacy builtin (opaque
+        // copy), schema 2 validates marker + V2 sidecar, schema 3 validates
+        // marker + V3 sidecar, any other schema fails closed.
         for update in &updates_to_copy {
             let super::SessionUpdate::Xai(notification) = update else {
                 continue;
@@ -1260,29 +1380,54 @@ impl JsonlStorageAdapter {
             else {
                 continue;
             };
-            if marker.schema_version == 2 {
-                let digest = marker.portable_history_sha256.as_deref().ok_or_else(|| {
-                    io::Error::new(
+            match marker.schema_version {
+                1 => {}
+                2 => {
+                    let digest = marker.portable_history_sha256.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Responses checkpoint marker has no portable digest",
+                        )
+                    })?;
+                    let checkpoint = super::responses_compaction::read_checkpoint_v2(
+                        &self.session_dir(source_info),
+                        &marker.checkpoint_file,
+                        &marker.checkpoint_id,
+                        marker.prompt_index_at_compaction,
+                        digest,
+                    )?;
+                    super::responses_compaction::validate_marker_for_wrapper(
+                        marker,
+                        &checkpoint.wrapper,
+                    )?;
+                }
+                3 => {
+                    let checkpoint = super::responses_compaction::read_checkpoint_v3(
+                        &self.session_dir(source_info),
+                        &marker.checkpoint_file,
+                        &marker.checkpoint_id,
+                        marker.prompt_index_at_compaction,
+                        marker.portable_history_sha256.as_deref().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Responses checkpoint marker has no portable digest",
+                            )
+                        })?,
+                    )?;
+                    super::responses_compaction::validate_marker_for_wrapper_v3(
+                        marker,
+                        &checkpoint.wrapper,
+                    )?;
+                }
+                other => {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Responses checkpoint marker has no portable digest",
-                    )
-                })?;
-                let checkpoint = super::responses_compaction::read_checkpoint_v2(
-                    &self.session_dir(source_info),
-                    &marker.checkpoint_file,
-                    &marker.checkpoint_id,
-                    marker.prompt_index_at_compaction,
-                    digest,
-                )?;
-                super::responses_compaction::validate_marker_for_wrapper(
-                    marker,
-                    &checkpoint.wrapper,
-                )?;
-            } else if marker.schema_version > 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported compaction checkpoint marker schema",
-                ));
+                        format!(
+                            "unsupported compaction checkpoint marker schema {other}: \
+                             refusing to copy the session"
+                        ),
+                    ));
+                }
             }
         }
         for target in [
@@ -1361,10 +1506,14 @@ impl JsonlStorageAdapter {
         let summary_bytes = serde_json::to_vec_pretty(&target_summary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(self.summary_file(target_info), summary_bytes)?;
-        if matches!(
-            chat_to_copy.first(),
-            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
-        ) {
+        // Variant-aware: both wrapper variants take the typed persisted
+        // entries write path (V1 wrapper → V2 sidecar contract, V2 wrapper →
+        // V3 contract; the V1 entry builder keeps V2 wrappers as plain
+        // items, which the variant-aware reader handles).
+        if chat_to_copy
+            .first()
+            .is_some_and(ConversationItem::is_responses_checkpoint)
+        {
             let entries = super::responses_compaction::persisted_entries_for_replacement(
                 &format!("fork-{}", uuid::Uuid::now_v7()),
                 &chat_to_copy,

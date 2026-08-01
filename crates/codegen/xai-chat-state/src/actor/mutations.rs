@@ -25,6 +25,7 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
         ConversationItem::Reasoning(_) => "reasoning",
         ConversationItem::ResponsesCompactionCheckpoint(_) => "responses_compaction_checkpoint",
+        ConversationItem::ResponsesCompactionCheckpointV2(_) => "responses_compaction_checkpoint_v2",
     }
 }
 
@@ -457,6 +458,7 @@ impl ChatStateActor {
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
                 }
                 ConversationItem::ResponsesCompactionCheckpoint(_) => 0,
+                ConversationItem::ResponsesCompactionCheckpointV2(_) => 0,
             })
             .sum()
     }
@@ -547,7 +549,7 @@ impl ChatStateActor {
 
     pub(super) fn bind_request_identity(
         &mut self,
-        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
     ) -> RequestIdentityBinding {
         if self.state.bound_request_identity.as_ref() != Some(&identity) {
             self.state.request_identity_generation =
@@ -558,22 +560,38 @@ impl ChatStateActor {
             .state
             .conversation
             .iter()
-            .filter(|item| matches!(item, ConversationItem::ResponsesCompactionCheckpoint(_)))
+            .filter(|item| item.is_responses_checkpoint())
             .count();
-        let checkpoint_status = match self.state.conversation.first() {
-            Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint))
+        let first_checkpoint = self
+            .state
+            .conversation
+            .first()
+            .and_then(|item| item.as_responses_checkpoint());
+        let checkpoint_status = match (first_checkpoint, &identity) {
+            (Some(xai_grok_sampling_types::ResponsesCheckpointRef::V1(checkpoint)),
+             xai_grok_sampling_types::CheckpointIdentity::V1(identity))
                 if checkpoint_count == 1 && checkpoint.schema_version == 1 =>
             {
-                if checkpoint.identity == identity {
+                if checkpoint.identity == *identity {
                     CheckpointReplayStatus::Replayable
                 } else {
                     CheckpointReplayStatus::MigrationRequired
                 }
             }
-            Some(ConversationItem::ResponsesCompactionCheckpoint(_)) => {
-                CheckpointReplayStatus::InvalidCheckpoint
+            (Some(xai_grok_sampling_types::ResponsesCheckpointRef::V2(checkpoint)),
+             xai_grok_sampling_types::CheckpointIdentity::V2(identity))
+                if checkpoint_count == 1
+                    && checkpoint.schema_version
+                        == xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2 =>
+            {
+                if checkpoint.identity == *identity {
+                    CheckpointReplayStatus::Replayable
+                } else {
+                    CheckpointReplayStatus::MigrationRequired
+                }
             }
-            _ if checkpoint_count == 0 => CheckpointReplayStatus::NoCheckpoint,
+            (Some(_), _) => CheckpointReplayStatus::InvalidCheckpoint,
+            (None, _) if checkpoint_count == 0 => CheckpointReplayStatus::NoCheckpoint,
             _ => CheckpointReplayStatus::InvalidCheckpoint,
         };
         RequestIdentityBinding {
@@ -584,7 +602,7 @@ impl ChatStateActor {
 
     pub(super) fn bind_request_identity_at_revision(
         &mut self,
-        identity: xai_grok_sampling_types::CheckpointIdentityV1,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
         expected_history_revision: u64,
     ) -> RequestIdentityBindResult {
         if self.state.history_revision != expected_history_revision {
@@ -773,6 +791,20 @@ impl ChatStateActor {
     /// in-flight turn-capture tail from `state.conversation` before swapping,
     /// so the state must stay intact until then.
     pub(super) fn replace_system_head(&mut self, prompt: &str) -> ReplaceSystemHeadResult {
+        if let Some(ConversationItem::ResponsesCompactionCheckpointV2(checkpoint)) =
+            self.state.conversation.first()
+        {
+            // V2: compatibility is the base-instructions hash, not the V1
+            // prompt projection. A head change post-checkpoint makes the
+            // checkpoint incompatible → migration, exactly like V1.
+            let matches = xai_grok_sampling_types::base_instructions_sha256_v2(prompt.trim())
+                == checkpoint.identity.base_instructions_sha256;
+            if matches {
+                return ReplaceSystemHeadResult::Unchanged;
+            }
+            self.state.invalidate_request_identity();
+            return ReplaceSystemHeadResult::MigrationRequired;
+        }
         if let Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) =
             self.state.conversation.first()
         {

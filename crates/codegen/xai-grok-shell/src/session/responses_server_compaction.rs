@@ -18,7 +18,10 @@ pub struct ResponsesRequestSnapshot {
     pub request_identity_generation: u64,
     pub prompt_index: usize,
     pub pre_compaction_tokens: u64,
-    pub final_request: FinalResponsesRequest,
+    /// Flattened provider-visible body at snapshot time. Raw JSON: the
+    /// snapshot feeds identity/token accounting and the (currently
+    /// disabled) V1 writer, never a normal POST gate.
+    pub final_request: serde_json::Value,
     pub credential: xai_grok_sampler::RequestCredentialSnapshot,
     pub model: String,
     pub input: Vec<serde_json::Value>,
@@ -85,11 +88,61 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// Derive a stable, isolated prompt-cache namespace for auxiliary requests
+/// (recap and other side queries) so they never share the main session's
+/// cache route or pollute its cache-affinity metrics.
+///
+/// `aux_cache_namespace = hash(session_namespace + auxiliary_kind)`, capped
+/// to the provider's 64-character key budget. Stage D3 will re-base
+/// `session_namespace` onto the persisted `logical_cache_namespace_id`.
+pub fn aux_prompt_cache_key(session_namespace: &str, auxiliary_kind: &str) -> String {
+    let digest =
+        sha256_hex(format!("grok-aux-cache-v1:{auxiliary_kind}:{session_namespace}").as_bytes());
+    format!("aux:{:.60}", digest)
+}
+
+/// Stage D1b kill switch: new V1 server checkpoints are disabled globally
+/// and compaction falls back to builtin, so no new unsafe checkpoints are
+/// produced. V2 writers (stage D4) supersede this switch; the env var
+/// exists only for integration harnesses verifying the legacy path.
+pub fn v1_server_compaction_writers_enabled() -> bool {
+    std::env::var("GROK_RESPONSES_V1_SERVER_COMPACTION")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Stage-D1b migration cohort from `GROK_V1_MIGRATION_PERCENT`
+/// (1 → 10 → 50 → 100 during the rollout; defaults to 100).
+pub fn v1_migration_cohort(session_id: &str) -> bool {
+    let percent = std::env::var("GROK_V1_MIGRATION_PERCENT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(100);
+    v1_migration_cohort_percent(session_id, percent)
+}
+
+/// Pure cohort decision: stable session-hash bucket in `[0, 100)`.
+pub fn v1_migration_cohort_percent(session_id: &str, percent: u32) -> bool {
+    let percent = percent.min(100);
+    if percent >= 100 {
+        return true;
+    }
+    if percent == 0 {
+        return false;
+    }
+    let digest = sha2::Sha256::digest(session_id.as_bytes());
+    let bucket = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) % 100;
+    bucket < u64::from(percent)
+}
+
 /// Canonical normal-request semantics that are outside the compactable transcript.
+///
+/// Takes the flattened provider-visible body as raw JSON (see
+/// `FinalResponsesRequest::replay_projection_body`): identity computation
+/// never needs a sendable request.
 pub fn canonical_prompt_envelope(
-    final_request: &FinalResponsesRequest,
+    body: &serde_json::Value,
 ) -> Result<(serde_json::Value, serde_json::Value), serde_json::Error> {
-    let body = final_request.body();
     let prompt_projection = serde_json::Value::Array(
         body.get("input")
             .and_then(serde_json::Value::as_array)
@@ -132,13 +185,13 @@ pub fn build_checkpoint_identity(
     provider_id: &str,
     endpoint_fingerprint: &str,
     auth_principal_fingerprint: &str,
-    final_request: &FinalResponsesRequest,
+    final_body: &serde_json::Value,
 ) -> Result<CheckpointIdentityV1, serde_json::Error> {
     build_checkpoint_identity_with_projection(
         provider_id,
         endpoint_fingerprint,
         auth_principal_fingerprint,
-        final_request,
+        final_body,
         None,
     )
 }
@@ -147,16 +200,15 @@ pub fn build_checkpoint_identity_with_projection(
     provider_id: &str,
     endpoint_fingerprint: &str,
     auth_principal_fingerprint: &str,
-    final_request: &FinalResponsesRequest,
+    final_body: &serde_json::Value,
     prompt_projection: Option<serde_json::Value>,
 ) -> Result<CheckpointIdentityV1, serde_json::Error> {
-    let model = final_request
-        .body()
+    let model = final_body
         .get("model")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let (default_projection, mut envelope) = canonical_prompt_envelope(final_request)?;
+    let (default_projection, mut envelope) = canonical_prompt_envelope(final_body)?;
     let prompt_projection = prompt_projection.unwrap_or(default_projection);
     envelope["canonical_prompt_projection"] = prompt_projection.clone();
     let prompt_envelope_fingerprint =
@@ -174,16 +226,16 @@ pub fn build_checkpoint_identity_with_projection(
 }
 
 pub fn prompt_envelope_token_estimate(
-    final_request: &FinalResponsesRequest,
+    final_body: &serde_json::Value,
 ) -> Result<u64, serde_json::Error> {
-    prompt_envelope_token_estimate_with_projection(final_request, None)
+    prompt_envelope_token_estimate_with_projection(final_body, None)
 }
 
 pub fn prompt_envelope_token_estimate_with_projection(
-    final_request: &FinalResponsesRequest,
+    final_body: &serde_json::Value,
     prompt_projection: Option<serde_json::Value>,
 ) -> Result<u64, serde_json::Error> {
-    let (default_projection, mut envelope) = canonical_prompt_envelope(final_request)?;
+    let (default_projection, mut envelope) = canonical_prompt_envelope(final_body)?;
     envelope["canonical_prompt_projection"] = prompt_projection.unwrap_or(default_projection);
     let bytes = xai_grok_sampling_types::canonical_json_bytes(&envelope)?.len() as u64;
     Ok(bytes.div_ceil(4))

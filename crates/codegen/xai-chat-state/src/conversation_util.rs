@@ -28,19 +28,30 @@ pub fn replace_or_insert_system_head(
     conversation: &mut Vec<ConversationItem>,
     prompt: &str,
 ) -> bool {
-    match conversation.first_mut() {
-        Some(ConversationItem::System(sys)) => {
-            if canonical_system_prompt_eq(sys.content.as_ref(), prompt) {
-                return false;
-            }
-            sys.content = Arc::from(prompt);
-            true
-        }
-        _ => {
-            conversation.insert(0, ConversationItem::system(prompt));
-            true
-        }
+    // Only a non-memory leading System is a legitimate base head. A leading
+    // MemoryContext item means the base was stripped; a fresh base is
+    // inserted before it rather than clobbering memory.
+    let head_is_base = matches!(
+        conversation.first(),
+        Some(ConversationItem::System(sys))
+            if sys.source != xai_grok_sampling_types::SystemSource::MemoryContext
+    );
+    if !head_is_base {
+        conversation.insert(0, ConversationItem::base_instructions(prompt));
+        return true;
     }
+    let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+        unreachable!("head_is_base implies a leading system item");
+    };
+    if canonical_system_prompt_eq(sys.content.as_ref(), prompt) {
+        // Content-equal: leave the item (and its canonical bytes) untouched
+        // for KV-cache-friendly idempotency. The source is only upgraded
+        // when the content is actually rewritten.
+        return false;
+    }
+    sys.content = Arc::from(prompt);
+    sys.source = xai_grok_sampling_types::SystemSource::BaseInstructions;
+    true
 }
 
 #[cfg(test)]

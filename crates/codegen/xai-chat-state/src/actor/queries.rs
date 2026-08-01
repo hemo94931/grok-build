@@ -247,6 +247,7 @@ impl ChatStateActor {
                 xai_grok_sampling_types::ConversationItem::BackendToolCall(_) => {}
                 xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}
                 xai_grok_sampling_types::ConversationItem::ResponsesCompactionCheckpoint(_) => {}
+                xai_grok_sampling_types::ConversationItem::ResponsesCompactionCheckpointV2(_) => {}
             }
         }
         counts

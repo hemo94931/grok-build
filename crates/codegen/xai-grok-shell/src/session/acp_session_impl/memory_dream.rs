@@ -386,7 +386,10 @@ impl SessionActor {
                 chat_history,
             } = match snapshot {
                 Some(snapshot) => snapshot,
-                None => self.snapshot_memory_flush_state().await,
+                None => self
+                    .snapshot_memory_flush_state()
+                    .await
+                    .map_err(|error| acp::Error::internal_error().data(error))?,
             };
             xai_grok_telemetry::session_ctx::log_event(
                 xai_grok_telemetry::memory_telemetry::MemoryFlushStart {
@@ -645,18 +648,23 @@ impl SessionActor {
     }
 
     /// Capture the flush inputs before compaction mutates conversation history.
-    pub(super) async fn snapshot_memory_flush_state(&self) -> MemoryFlushSnapshot {
+    pub(super) async fn snapshot_memory_flush_state(&self) -> Result<MemoryFlushSnapshot, String> {
         let (counts, conversation) = tokio::join!(
             self.chat_state_handle.get_conversation_counts(),
             self.chat_state_handle.get_conversation(),
         );
+        // Checkpoint-aware expansion: a live server checkpoint must never be
+        // flattened implicitly into the flush request.
+        let conversation = self
+            .portable_history_for_request(&conversation)
+            .map_err(|error| format!("checkpoint portable history unavailable: {error}"))?;
         let chat_history = crate::sampling::conversation_to_chat_messages(
             xai_chat_state::compaction_utils::prepare_conversation_for_summarization(conversation),
         );
-        MemoryFlushSnapshot {
+        Ok(MemoryFlushSnapshot {
             counts,
             chat_history,
-        }
+        })
     }
 
     /// Rewrite a raw memory note into well-structured markdown via a one-shot

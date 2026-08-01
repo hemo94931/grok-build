@@ -346,10 +346,15 @@ impl SessionActor {
                 let replay_updates = updates_path.clone();
                 let replay_session_dir = session_dir.clone();
                 let replay_target = target_index;
+                // A live V2 wrapper (first conversation item) is required to bind a
+                // schema-3 marker to its V3 sidecar; V1/schema-2 replay stays
+                // marker-driven.
+                let replay_live_checkpoint = conversation.first().cloned();
                 let replay_result = tokio::task::spawn_blocking(move || {
                     crate::session::helpers::replay::replay_to_prompt(
                         &replay_updates,
                         &replay_session_dir,
+                        replay_live_checkpoint.as_ref(),
                         replay_target,
                     )
                 })
@@ -433,10 +438,18 @@ impl SessionActor {
 
             // A rewind from a server checkpoint starts a fresh tail branch;
             // abandoned future records can no longer match active replay.
-            if let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
-                conversation.first_mut()
-            {
-                wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+            // Variant-aware: V1 wrappers and V2 wrappers both rotate their
+            // active branch (V2 wrappers bind to V3 sidecars/schema-3 markers).
+            if let Some(first) = conversation.first_mut() {
+                match first {
+                    ConversationItem::ResponsesCompactionCheckpoint(wrapper) => {
+                        wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+                    }
+                    ConversationItem::ResponsesCompactionCheckpointV2(wrapper) => {
+                        wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+                    }
+                    _ => {}
+                }
             }
 
             // Cross the acknowledged dual-generation CAS boundary rather than

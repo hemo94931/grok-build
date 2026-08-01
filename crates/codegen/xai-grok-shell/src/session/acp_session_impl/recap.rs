@@ -63,14 +63,18 @@ impl SessionActor {
             .map_err(|e| SideQuestionError::PrepareClient(e.to_string()))?;
 
         // Full conversation snapshot including system prompt, tool calls, and results.
+        // A live server checkpoint is expanded into its validated lossless
+        // portable history first; if that fails the side question fails
+        // closed instead of leaking the wrapper into a typed request.
         // Strip reasoning/thinking blocks from assistant items so we don't send
         // `ContentBlock::Thinking` without a top-level `thinking` config. The
         // Anthropic Messages API rejects requests that include thinking blocks in
         // messages but omit the `thinking` parameter.
+        let conversation = self
+            .portable_history_for_request(&self.chat_state_handle.get_conversation().await)
+            .map_err(|error| format!("checkpoint portable history unavailable: {error}"))?;
         let mut items: Vec<ConversationItem> =
-            xai_chat_state::compaction_utils::strip_reasoning_blocks(
-                self.chat_state_handle.get_conversation().await,
-            );
+            xai_chat_state::compaction_utils::strip_reasoning_blocks(conversation);
 
         // /btw fires mid-turn, so the snapshot may end with an assistant
         // message whose tool_calls have no matching ToolResult yet. The
@@ -211,6 +215,21 @@ impl SessionActor {
         let recap_epoch = self.recap_epoch.get();
 
         let conversation = self.chat_state_handle.get_conversation().await;
+        // Checkpoint-aware expansion: when a server checkpoint is live, the
+        // recap must be built from the validated lossless portable history +
+        // typed tail — never from the checkpoint wrapper/output. If the
+        // sidecar cannot be read losslessly the recap fails closed (no HTTP),
+        // and it never triggers lossy salvage.
+        let conversation = match self.portable_history_for_request(&conversation) {
+            Ok(conversation) => conversation,
+            Err(error) => {
+                tracing::warn!(?error, "recap: checkpoint portable history unavailable");
+                if !auto {
+                    self.emit_recap_unavailable().await;
+                }
+                return;
+            }
+        };
         let main_turns = session_recap::main_turn_count(&conversation);
 
         let stored = self.last_recap_main_turn.get();
@@ -314,7 +333,15 @@ impl SessionActor {
             x_grok_req_id: Some(x_grok_req_id.clone()),
             x_grok_session_id: Some(self.session_info.id.to_string()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            prompt_cache_key: Some(self.session_info.id.to_string()),
+            // Auxiliary requests get a stable but isolated cache namespace:
+            // recap tokens must never share or pollute the main session's
+            // prompt-cache route (or its cache-affinity metrics).
+            prompt_cache_key: Some(
+                crate::session::responses_server_compaction::aux_prompt_cache_key(
+                    &self.session_info.id.to_string(),
+                    "recap",
+                ),
+            ),
             ..Default::default()
         };
 

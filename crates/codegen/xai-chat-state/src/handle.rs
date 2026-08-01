@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
-    CheckpointIdentityV1, ConversationItem, ConversationRequest, DanglingToolCallReason,
+    CheckpointIdentity, ConversationItem, ConversationRequest, DanglingToolCallReason,
     SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
@@ -179,7 +179,7 @@ impl ChatStateHandle {
 
     pub async fn bind_request_identity(
         &self,
-        identity: CheckpointIdentityV1,
+        identity: CheckpointIdentity,
     ) -> Option<RequestIdentityBinding> {
         self.query("BindRequestIdentity", |reply| {
             ChatStateCommand::BindRequestIdentity { identity, reply }
@@ -189,7 +189,7 @@ impl ChatStateHandle {
 
     pub async fn bind_request_identity_at_revision(
         &self,
-        identity: CheckpointIdentityV1,
+        identity: CheckpointIdentity,
         expected_history_revision: u64,
     ) -> Option<RequestIdentityBindResult> {
         self.query("BindRequestIdentityAtRevision", |reply| {

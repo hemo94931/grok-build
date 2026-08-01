@@ -129,8 +129,14 @@ impl SessionActor {
             let new_prompt = self.agent.borrow().render_prompt_for_definition(def).await;
             let mut conversation = self.chat_state_handle.get_conversation().await;
             for item in conversation.iter_mut() {
+                // Only the base-instructions item is rewritten; a dedicated
+                // MemoryContext item keeps both content and source.
                 if let ConversationItem::System(sys) = item {
-                    sys.content = std::sync::Arc::<str>::from(new_prompt);
+                    if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext {
+                        continue;
+                    }
+                    sys.content = std::sync::Arc::<str>::from(new_prompt.clone());
+                    sys.source = xai_grok_sampling_types::SystemSource::BaseInstructions;
                     break;
                 }
             }

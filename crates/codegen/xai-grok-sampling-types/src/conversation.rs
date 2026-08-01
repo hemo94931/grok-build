@@ -6,13 +6,30 @@
 
 mod chat_completions;
 mod messages;
+mod resolved;
 mod responses;
+mod v2;
 
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
+pub(crate) use resolved::SealedResponsesBody;
+pub use resolved::{
+    CheckpointReplayMaterialV2, INSTRUCTIONS_MEMORY_SEPARATOR, LegacyReplayPermitError,
+    ReplayMaterialError, ReplayVerificationError, ResolvedCheckpointBinding, ResolvedCompactError,
+    ResolvedCompactRequest, ResolvedRequestError, ResolvedResponsesRequest, ResponsesCorrelation,
+    USER_CONTEXT_DELIMITER, ValidatedLegacyReplayV1, ValidatedResponsesReplayV2,
+    compose_instructions_v2, replay_input_tail_v2,
+};
 pub use responses::{
     FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes, extra_tool_entries,
-    patch_reasoning_text_types, response_to_conversation_items,
+    patch_reasoning_text_types, portable_history_bytes, portable_history_digest,
+    response_to_conversation_items,
+};
+pub use v2::{
+    CheckpointIdentityV2, RESPONSES_CHECKPOINT_SCHEMA_V2, RESPONSES_COMPACTION_CONTRACT_V2,
+    ResponsesCheckpointRef, ServerResponsesCheckpointV2, TrustedPromptEnvelopeV2,
+    base_instructions_sha256_v2, canonical_envelope_fingerprint_v2, wire_prompt_sha256_v2,
+    wrapper_digest_v2,
 };
 
 use std::sync::Arc;
@@ -104,6 +121,10 @@ pub enum ConversationItem {
     /// requests flatten its raw `output` before serializing the typed live
     /// tail; all other backends reject it via [`ConversationRequest::validate_for_backend`].
     ResponsesCompactionCheckpoint(Box<ServerResponsesCheckpointV1>),
+    /// V2 checkpoint wrapper (reader-first; writers gated behind the V2
+    /// write flag). Same local-only semantics as V1, with an explicit
+    /// trusted prompt envelope and recompact chain binding.
+    ResponsesCompactionCheckpointV2(Box<ServerResponsesCheckpointV2>),
 }
 
 /// Frozen Codex v1 standalone `/responses/compact` contract version.
@@ -141,6 +162,21 @@ pub enum TokenSeedSource {
     EstimatedCanonicalOutput,
 }
 
+/// Versioned checkpoint identity used for request-identity binding. The
+/// chat-state actor stores this opaquely and compares it against the live
+/// wrapper's identity of the matching variant; a cross-variant comparison
+/// is always `MigrationRequired`/`InvalidCheckpoint`, never a silent match.
+///
+/// Serde is untagged with V2 first: V1 JSON lacks the V2-required
+/// `base_instructions_sha256`, so old bare-V1 snapshots parse as V1 while
+/// V2 data never collapses into the V1 shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CheckpointIdentity {
+    V2(v2::CheckpointIdentityV2),
+    V1(CheckpointIdentityV1),
+}
+
 /// Local wrapper for the canonical output of `POST /responses/compact`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerResponsesCheckpointV1 {
@@ -166,6 +202,45 @@ pub struct ServerResponsesCheckpointV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemItem {
     pub content: Arc<str>,
+    /// Where this system item originated. Digest-stable: the
+    /// `LegacyUnclassified` default is never serialized, so historical V1
+    /// items deserialize and re-serialize to byte-identical canonical JSON.
+    #[serde(default, skip_serializing_if = "SystemSource::is_default")]
+    pub source: SystemSource,
+}
+
+/// Provenance of a [`SystemItem`]. Only `BaseInstructions` and
+/// `MemoryContext` may be lifted into the top-level Responses
+/// `instructions` field; every other source stays in `input` at its
+/// original position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemSource {
+    /// The agent's rendered base system prompt.
+    BaseInstructions,
+    /// The authored `<memory-context>` block, persisted as its own item.
+    MemoryContext,
+    /// A runtime-injected system notice (not part of the stable prompt
+    /// envelope).
+    Runtime,
+    /// Historical item written before provenance tracking. The default;
+    /// never serialized, so old records keep their exact canonical bytes.
+    /// Plain `ConversationItem::system(...)` produces this source and must
+    /// never gain `BaseInstructions` privileges implicitly.
+    #[default]
+    LegacyUnclassified,
+}
+
+impl SystemSource {
+    fn is_default(value: &Self) -> bool {
+        matches!(value, Self::LegacyUnclassified)
+    }
+
+    /// Whether items with this source may enter the top-level Responses
+    /// `instructions` field.
+    pub fn lifts_into_instructions(self) -> bool {
+        matches!(self, Self::BaseInstructions | Self::MemoryContext)
+    }
 }
 
 /// Reason why a `UserItem` was synthesized by the runtime rather than typed
@@ -718,15 +793,12 @@ impl ConversationRequest {
         &self,
         backend: &crate::ApiBackend,
     ) -> Result<(), ConversationValidationError> {
-        let checkpoints: Vec<(usize, &ServerResponsesCheckpointV1)> = self
+        let checkpoints: Vec<(usize, ResponsesCheckpointRef<'_>)> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| match item {
-                ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
-                    Some((index, checkpoint.as_ref()))
-                }
-                _ => None,
+            .filter_map(|(index, item)| {
+                item.as_responses_checkpoint().map(|checkpoint| (index, checkpoint))
             })
             .collect();
         let Some((index, checkpoint)) = checkpoints.first().copied() else {
@@ -735,12 +807,18 @@ impl ConversationRequest {
         if checkpoints.len() != 1 || index != 0 {
             return Err(ConversationValidationError::InvalidCheckpointLayout);
         }
-        if checkpoint.schema_version != 1 {
+        let supported = match checkpoint {
+            ResponsesCheckpointRef::V1(wrapper) => wrapper.schema_version == 1,
+            ResponsesCheckpointRef::V2(wrapper) => {
+                wrapper.schema_version == RESPONSES_CHECKPOINT_SCHEMA_V2
+            }
+        };
+        if !supported {
             return Err(ConversationValidationError::UnsupportedCheckpointSchema(
-                checkpoint.schema_version,
+                checkpoint.schema_version(),
             ));
         }
-        if checkpoint.output.is_empty() {
+        if checkpoint.output().is_empty() {
             return Err(ConversationValidationError::EmptyCheckpointOutput);
         }
         if !matches!(backend, crate::ApiBackend::Responses) {
@@ -1059,11 +1137,47 @@ impl ConversationResponse {
 // ============================================================================
 
 impl ConversationItem {
-    /// Create a system message
+    /// Create a system message with the default [`SystemSource::LegacyUnclassified`]
+    /// provenance — it must never gain `BaseInstructions` privileges
+    /// implicitly.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
             content: Arc::<str>::from(content.into()),
+            source: SystemSource::LegacyUnclassified,
         })
+    }
+
+    /// Create the agent's rendered base system prompt item.
+    pub fn base_instructions(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::BaseInstructions,
+        })
+    }
+
+    /// Create the authored `<memory-context>` item, persisted separately
+    /// from the base instructions.
+    pub fn memory_context(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::MemoryContext,
+        })
+    }
+
+    /// Create a runtime-injected system notice.
+    pub fn runtime_system(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::Runtime,
+        })
+    }
+
+    /// Provenance of a system item, `None` for non-system items.
+    pub fn system_source(&self) -> Option<SystemSource> {
+        match self {
+            Self::System(system) => Some(system.source),
+            _ => None,
+        }
     }
 
     /// Create a user message with text content.
@@ -1396,6 +1510,7 @@ impl ConversationItem {
             // system boundary only for legacy read-only callers; converters
             // reject or flatten it explicitly.
             Self::ResponsesCompactionCheckpoint(_) => Role::System,
+            Self::ResponsesCompactionCheckpointV2(_) => Role::System,
         }
     }
 
@@ -1426,6 +1541,7 @@ impl ConversationItem {
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
             Self::ResponsesCompactionCheckpoint(_) => String::new(),
+            Self::ResponsesCompactionCheckpointV2(_) => String::new(),
         }
     }
 }
@@ -2115,6 +2231,7 @@ pub fn transform_conversation_cwd(
             }
             // The canonical provider prefix is opaque and must never be rewritten.
             ConversationItem::ResponsesCompactionCheckpoint(_) => {}
+            ConversationItem::ResponsesCompactionCheckpointV2(_) => {}
         }
     }
 }
@@ -2491,6 +2608,14 @@ mod responses_tests;
 #[cfg(test)]
 #[path = "conversation/messages_tests.rs"]
 mod messages_tests;
+
+#[cfg(test)]
+#[path = "conversation/system_source_tests.rs"]
+mod system_source_tests;
+
+#[cfg(test)]
+#[path = "conversation/v2_tests.rs"]
+mod v2_tests;
 
 #[cfg(test)]
 mod tests {

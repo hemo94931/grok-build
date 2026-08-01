@@ -14,6 +14,80 @@ use crate::extensions::notification::{
 use crate::sampling::ConversationItem;
 use crate::session::storage::{SessionUpdate, UpdatesIterator};
 
+/// Marker-schema dispatch shared by [`replay_to_prompt`] and
+/// `chat_rebuild::rebuild_chat_history`. The latest Responses server
+/// compaction marker on the current timeline selects the recovery path:
+///
+/// * schema 1 — legacy builtin compaction marker: the legacy text reducer
+///   handles it;
+/// * schema 2 — typed V1 replay/rebuild (schema-2 marker + V2 sidecar);
+/// * schema 3 — typed V3 replay/rebuild (schema-3 marker + V3 sidecar);
+/// * any other schema — hard [`io::ErrorKind::InvalidData`] error; the
+///   legacy reducer must NEVER silently reconstruct an unknown-schema
+///   checkpoint;
+/// * no Responses server compaction marker at all — legacy reducer allowed.
+#[derive(Debug)]
+pub(crate) enum ResponsesMarkerDispatch {
+    /// No `CompactionCheckpoint` marker on the current timeline.
+    None,
+    /// Marker schema 1 (legacy builtin compaction marker).
+    Legacy,
+    /// Marker schema 2: typed V1 replay/rebuild.
+    V2 {
+        marker_index: usize,
+        marker: Box<CompactionCheckpointInfo>,
+    },
+    /// Marker schema 3: typed V3 replay/rebuild.
+    V3 {
+        marker_index: usize,
+        marker: Box<CompactionCheckpointInfo>,
+    },
+}
+
+/// Scan the filtered update stream for the latest Responses server
+/// compaction marker and dispatch on its schema (see
+/// [`ResponsesMarkerDispatch`]). Shared by replay and chat rebuild so both
+/// upgrade with the same rules and neither silently falls back to the
+/// legacy reducer for an unknown marker schema.
+///
+/// `marker_index` is the marker's position in `updates`; the typed tail
+/// journal records live at `updates[marker_index + 1..]`.
+pub(crate) fn dispatch_responses_marker(
+    updates: &[SessionUpdate],
+) -> io::Result<ResponsesMarkerDispatch> {
+    let Some((marker_index, marker)) = updates.iter().enumerate().rev().find_map(
+        |(index, update)| {
+            let SessionUpdate::Xai(notification) = update else {
+                return None;
+            };
+            let XaiSessionUpdate::CompactionCheckpoint(marker) = &notification.update else {
+                return None;
+            };
+            Some((index, marker.as_ref()))
+        },
+    ) else {
+        return Ok(ResponsesMarkerDispatch::None);
+    };
+    match marker.schema_version {
+        1 => Ok(ResponsesMarkerDispatch::Legacy),
+        2 => Ok(ResponsesMarkerDispatch::V2 {
+            marker_index,
+            marker: Box::new(marker.clone()),
+        }),
+        3 => Ok(ResponsesMarkerDispatch::V3 {
+            marker_index,
+            marker: Box::new(marker.clone()),
+        }),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Responses compaction checkpoint marker schema {other}: \
+                 refusing to replay or rebuild with the legacy reducer"
+            ),
+        )),
+    }
+}
+
 /// Result of replaying updates.jsonl up to a target prompt index.
 #[derive(Debug)]
 pub struct ReplayResult {
@@ -89,12 +163,17 @@ pub fn find_latest_compaction_checkpoint(
 ///   target is before or after the compaction boundary.
 ///
 /// `session_dir` is the path to the session directory (for reading checkpoint files).
+/// `live_checkpoint` is the first item of the live conversation (when the
+/// session currently starts with a Responses compaction checkpoint). It is
+/// required to bind a schema-3 marker to its V3 sidecar; for schema-2
+/// markers the marker/sidecar pair alone is authoritative (unchanged).
 pub fn replay_to_prompt(
     updates_path: &Path,
     session_dir: &Path,
+    live_checkpoint: Option<&ConversationItem>,
     target_prompt_index: usize,
 ) -> io::Result<ReplayResult> {
-    if let Some(result) = try_replay_responses_v2(updates_path, session_dir, target_prompt_index)? {
+    if let Some(result) = try_replay_responses(updates_path, session_dir, live_checkpoint, target_prompt_index)? {
         return Ok(result);
     }
     let Some(iter) = UpdatesIterator::open(updates_path)? else {
@@ -170,9 +249,16 @@ pub fn replay_to_prompt(
     })
 }
 
-fn try_replay_responses_v2(
+/// Dispatcher over the marker-schema rules shared with chat rebuild.
+///
+/// schema 2 → typed V1 replay (unchanged); schema 3 → typed V3 replay;
+/// unknown schema → hard [`io::ErrorKind::InvalidData`] error (never
+/// `Ok(None)` fallback to the legacy reducer); no marker / schema 1 →
+/// `Ok(None)` so the legacy reducer runs.
+fn try_replay_responses(
     updates_path: &Path,
     session_dir: &Path,
+    live_checkpoint: Option<&ConversationItem>,
     target_prompt_index: usize,
 ) -> io::Result<Option<ReplayResult>> {
     let Some(iter) = UpdatesIterator::open(updates_path)? else {
@@ -180,26 +266,50 @@ fn try_replay_responses_v2(
     };
     let updates =
         crate::session::storage::filter_rewind_updates(iter.filter_map(Result::ok).collect());
-    let Some((marker_index, marker)) =
-        updates
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, update)| {
-                let SessionUpdate::Xai(notification) = update else {
-                    return None;
-                };
-                let XaiSessionUpdate::CompactionCheckpoint(marker) = &notification.update else {
-                    return None;
-                };
-                Some((index, marker.as_ref()))
-            })
-    else {
-        return Ok(None);
-    };
-    if marker.schema_version != 2 {
-        return Ok(None);
+    match dispatch_responses_marker(&updates)? {
+        ResponsesMarkerDispatch::V2 { marker_index, marker } => {
+            // A V2 wrapper binds to schema-3 markers/V3 sidecars only. A
+            // live V2 wrapper alongside a schema-2 marker is an
+            // inconsistent session — fail closed instead of replaying the
+            // V1 sidecar over it.
+            if matches!(
+                live_checkpoint.and_then(ConversationItem::as_responses_checkpoint),
+                Some(xai_grok_sampling_types::ResponsesCheckpointRef::V2(_))
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "schema-2 Responses marker cannot bind a V2 checkpoint wrapper",
+                ));
+            }
+            Ok(Some(replay_responses_v2(
+                &updates,
+                marker_index,
+                &marker,
+                session_dir,
+                target_prompt_index,
+            )?))
+        }
+        ResponsesMarkerDispatch::V3 { marker_index, marker } => Ok(Some(replay_responses_v3(
+            &updates,
+            marker_index,
+            &marker,
+            live_checkpoint,
+            session_dir,
+            target_prompt_index,
+        )?)),
+        ResponsesMarkerDispatch::None | ResponsesMarkerDispatch::Legacy => Ok(None),
     }
+}
+
+/// Existing schema-2 typed replay, unchanged apart from taking the
+/// dispatched marker instead of searching for it itself.
+fn replay_responses_v2(
+    updates: &[SessionUpdate],
+    marker_index: usize,
+    marker: &CompactionCheckpointInfo,
+    session_dir: &Path,
+    target_prompt_index: usize,
+) -> io::Result<ReplayResult> {
     let digest = marker.portable_history_sha256.as_deref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -225,12 +335,12 @@ fn try_replay_responses_v2(
             target_prompt_index,
         );
         conversation.truncate(keep);
-        return Ok(Some(ReplayResult {
+        return Ok(ReplayResult {
             conversation,
             prompt_index_reached: target_prompt_index,
             original_user_info: checkpoint.original_user_info,
             last_compaction_prompt_index: None,
-        }));
+        });
     }
 
     use crate::session::storage::responses_compaction::{PersistedChatEntry, TailJournalRecord};
@@ -267,12 +377,108 @@ fn try_replay_responses_v2(
     }
     let conversation =
         crate::session::storage::responses_compaction::recover_history_entries(kept)?.conversation;
-    Ok(Some(ReplayResult {
+    Ok(ReplayResult {
         conversation,
         prompt_index_reached: target_prompt_index,
         original_user_info: checkpoint.original_user_info,
         last_compaction_prompt_index: Some(marker.prompt_index_at_compaction),
-    }))
+    })
+}
+
+/// Schema-3 typed replay: bind the live V2 wrapper to its V3 sidecar via
+/// `read_checkpoint_for_wrapper_v2` (rotation-aware), validate the schema-3
+/// marker against the sidecar's stored wrapper, then reconstruct the typed
+/// history exactly like the schema-2 path (sidecar portable history or
+/// journal tail). Any mismatch fails closed — no legacy fallback.
+fn replay_responses_v3(
+    updates: &[SessionUpdate],
+    marker_index: usize,
+    marker: &CompactionCheckpointInfo,
+    live_checkpoint: Option<&ConversationItem>,
+    session_dir: &Path,
+    target_prompt_index: usize,
+) -> io::Result<ReplayResult> {
+    let wrapper = match live_checkpoint.and_then(ConversationItem::as_responses_checkpoint) {
+        Some(xai_grok_sampling_types::ResponsesCheckpointRef::V2(wrapper)) => wrapper.clone(),
+        Some(xai_grok_sampling_types::ResponsesCheckpointRef::V1(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "schema-3 Responses marker requires a V2 checkpoint wrapper, found V1",
+            ));
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "schema-3 Responses marker requires a live V2 checkpoint wrapper \
+                 to bind the V3 sidecar",
+            ));
+        }
+    };
+    let checkpoint =
+        crate::session::storage::responses_compaction::read_checkpoint_for_wrapper_v2(
+            session_dir,
+            &wrapper,
+        )?;
+    crate::session::storage::responses_compaction::validate_marker_for_wrapper_v3(
+        marker,
+        &checkpoint.wrapper,
+    )?;
+
+    if target_prompt_index < marker.prompt_index_at_compaction {
+        let mut conversation = checkpoint.portable_history;
+        let keep = xai_grok_sampling_types::conversation_truncate_for_prompt(
+            &conversation,
+            target_prompt_index,
+        );
+        conversation.truncate(keep);
+        return Ok(ReplayResult {
+            conversation,
+            prompt_index_reached: target_prompt_index,
+            original_user_info: checkpoint.original_user_info,
+            last_compaction_prompt_index: None,
+        });
+    }
+
+    use crate::session::storage::responses_compaction::{PersistedChatEntry, TailJournalRecord};
+    let records = updates[marker_index + 1..]
+        .iter()
+        .filter_map(|update| {
+            let SessionUpdate::Xai(notification) = update else {
+                return None;
+            };
+            match &notification.update {
+                XaiSessionUpdate::ConversationAppendPreparedV2(prepared) => {
+                    Some(TailJournalRecord::Prepared((**prepared).clone()))
+                }
+                XaiSessionUpdate::ConversationAppendCommittedV2(committed) => {
+                    Some(TailJournalRecord::Committed(committed.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let entries = crate::session::storage::rebuild_updates_only_entries_v3(
+        checkpoint.wrapper,
+        &records,
+    )?;
+    let mut kept = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match &entry {
+            PersistedChatEntry::Legacy(_) => kept.push(entry),
+            PersistedChatEntry::TailV2(tail) if tail.prompt_index <= target_prompt_index => {
+                kept.push(entry);
+            }
+            PersistedChatEntry::TailV2(_) => break,
+        }
+    }
+    let conversation =
+        crate::session::storage::recover_history_entries_v3(kept)?.conversation;
+    Ok(ReplayResult {
+        conversation,
+        prompt_index_reached: target_prompt_index,
+        original_user_info: checkpoint.original_user_info,
+        last_compaction_prompt_index: Some(marker.prompt_index_at_compaction),
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -892,6 +1098,8 @@ mod tests {
                 portable_history_sha256: None,
                 responses_mode: None,
                 responses_auto_continue: None,
+                wrapper_digest: None,
+                prior_checkpoint_id: None,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             })),
             meta: None,
@@ -934,7 +1142,7 @@ mod tests {
             content.extend(line);
         }
         std::fs::write(&updates_path, content).unwrap();
-        replay_to_prompt(&updates_path, session_dir, target).unwrap()
+        replay_to_prompt(&updates_path, session_dir, None, target).unwrap()
     }
 
     #[test]
@@ -1365,5 +1573,468 @@ mod tests {
         assert_eq!(result.conversation.len(), 2);
         assert_eq!(result.conversation[0].text_content(), "sys");
         assert_eq!(result.conversation[1].text_content(), "summary2");
+    }
+
+    // ── V2/V3 marker-schema dispatch fixtures ────────────────────────────────
+
+    fn identity_v1_fixture() -> xai_grok_sampling_types::CheckpointIdentityV1 {
+        xai_grok_sampling_types::CheckpointIdentityV1 {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: "responses-compact-codex-v1".into(),
+            prompt_envelope_fingerprint: "envelope".into(),
+            canonical_prompt_projection: None,
+        }
+    }
+
+    fn wrapper_v1_fixture(
+        checkpoint_id: &str,
+        branch_id: &str,
+        portable: &[ConversationItem],
+    ) -> xai_grok_sampling_types::ServerResponsesCheckpointV1 {
+        let digest = xai_grok_sampling_types::portable_history_digest(portable).unwrap();
+        let bytes =
+            crate::session::storage::responses_compaction::portable_history_bytes(portable)
+                .unwrap();
+        xai_grok_sampling_types::ServerResponsesCheckpointV1 {
+            schema_version: 1,
+            checkpoint_id: checkpoint_id.into(),
+            operation_id: "op-v1".into(),
+            prompt_index: 2,
+            created_at: chrono::Utc::now(),
+            auto_continue: false,
+            mode: xai_grok_sampling_types::ResponsesCompactionModeV1 {
+                name: "default".into(),
+                detail: None,
+            },
+            branch_id: branch_id.into(),
+            identity: identity_v1_fixture(),
+            output: vec![serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })],
+            portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
+            portable_history_sha256: digest,
+            portable_history_bytes: bytes.len() as u64,
+            checkpoint_token_seed: 10,
+            token_seed_source: xai_grok_sampling_types::TokenSeedSource::UsageOutputTokens,
+            server_output_item_count: 1,
+        }
+    }
+
+    fn identity_v2_fixture() -> xai_grok_sampling_types::CheckpointIdentityV2 {
+        xai_grok_sampling_types::CheckpointIdentityV2 {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: None,
+            cache_route_fingerprint: None,
+        }
+    }
+
+    fn envelope_v2_fixture() -> xai_grok_sampling_types::TrustedPromptEnvelopeV2 {
+        xai_grok_sampling_types::TrustedPromptEnvelopeV2 {
+            base_instructions_sha256: "base-hash".into(),
+            memory_revision: Some(3),
+            envelope_fingerprint: "envelope-fp".into(),
+            wire_prompt_sha256: "wire-hash".into(),
+        }
+    }
+
+    fn portable_v2_fixture() -> Vec<ConversationItem> {
+        let mut first = ConversationItem::user("first");
+        first.set_prompt_index(0);
+        let mut second = ConversationItem::user("second");
+        second.set_prompt_index(1);
+        vec![
+            ConversationItem::base_instructions("base prompt"),
+            first,
+            ConversationItem::assistant("first answer"),
+            second,
+            ConversationItem::assistant("second answer"),
+        ]
+    }
+
+    fn wrapper_v2_fixture(
+        checkpoint_id: &str,
+        branch_id: &str,
+        portable: &[ConversationItem],
+    ) -> xai_grok_sampling_types::ServerResponsesCheckpointV2 {
+        let digest = xai_grok_sampling_types::portable_history_digest(portable).unwrap();
+        let bytes =
+            crate::session::storage::responses_compaction::portable_history_bytes(portable)
+                .unwrap();
+        xai_grok_sampling_types::ServerResponsesCheckpointV2 {
+            schema_version: xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2,
+            checkpoint_id: checkpoint_id.into(),
+            operation_id: "op-v2".into(),
+            prompt_index: 2,
+            created_at: chrono::Utc::now(),
+            auto_continue: false,
+            mode: xai_grok_sampling_types::ResponsesCompactionModeV1 {
+                name: "default".into(),
+                detail: None,
+            },
+            branch_id: branch_id.into(),
+            identity: identity_v2_fixture(),
+            output: vec![serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })],
+            portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
+            portable_history_sha256: digest,
+            portable_history_bytes: bytes.len() as u64,
+            checkpoint_token_seed: 42,
+            token_seed_source: xai_grok_sampling_types::TokenSeedSource::UsageOutputTokens,
+            server_output_item_count: 1,
+            prior_checkpoint_id: None,
+            memory_revision: Some(3),
+        }
+    }
+
+    fn write_checkpoint_v2_file(
+        session_dir: &Path,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV1,
+        portable: &[ConversationItem],
+    ) {
+        let file =
+            crate::session::storage::responses_compaction::CompactionCheckpointFileV2::new(
+                wrapper.clone(),
+                portable.to_vec(),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        crate::session::storage::responses_compaction::write_checkpoint_v2_durable(
+            session_dir,
+            &wrapper.portable_history_path,
+            &file,
+        )
+        .unwrap();
+    }
+
+    fn write_checkpoint_v3_file(
+        session_dir: &Path,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV2,
+        portable: &[ConversationItem],
+    ) {
+        let material = xai_grok_sampling_types::CheckpointReplayMaterialV2::try_new(
+            wrapper,
+            envelope_v2_fixture(),
+            portable,
+        )
+        .unwrap();
+        let file = crate::session::storage::responses_compaction::CompactionCheckpointFileV3::new(
+            wrapper.clone(),
+            material,
+            portable.to_vec(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        crate::session::storage::responses_compaction::write_checkpoint_v3_durable(
+            session_dir,
+            &wrapper.portable_history_path,
+            &file,
+        )
+        .unwrap();
+    }
+
+    fn marker_update(
+        info: CompactionCheckpointInfo,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(info)),
+            meta: None,
+        }))
+    }
+
+    fn marker_v2_update(wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV1) -> SessionUpdate {
+        marker_update(crate::session::storage::responses_compaction::marker_for_wrapper(
+            wrapper,
+        ))
+    }
+
+    fn marker_v3_update(wrapper: &xai_grok_sampling_types::ServerResponsesCheckpointV2) -> SessionUpdate {
+        marker_update(crate::session::storage::responses_compaction::marker_for_wrapper_v3(
+            wrapper,
+        ))
+    }
+
+    fn marker_schema_update(schema_version: u32) -> SessionUpdate {
+        marker_update(CompactionCheckpointInfo {
+            checkpoint_id: "cp-unknown".into(),
+            prompt_index_at_compaction: 1,
+            checkpoint_file: "compaction_checkpoints/cp-unknown.json".into(),
+            auto_continue: None,
+            schema_version,
+            operation_id: None,
+            branch_id: None,
+            portable_history_sha256: None,
+            responses_mode: None,
+            responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+        })
+    }
+
+    fn tail_prepared(
+        checkpoint_id: &str,
+        branch_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        prompt_index: usize,
+        item: ConversationItem,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::ConversationAppendPreparedV2(Box::new(
+                crate::session::storage::responses_compaction::ConversationAppendPreparedV2 {
+                    operation_id: format!("{operation_id}-tail-{sequence}"),
+                    checkpoint_id: checkpoint_id.into(),
+                    branch_id: branch_id.into(),
+                    sequence,
+                    prompt_index,
+                    item,
+                },
+            )),
+            meta: None,
+        }))
+    }
+
+    fn tail_committed(
+        checkpoint_id: &str,
+        branch_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        prompt_index: usize,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::ConversationAppendCommittedV2(
+                crate::session::storage::responses_compaction::ConversationAppendCommittedV2 {
+                    operation_id: format!("{operation_id}-tail-{sequence}"),
+                    checkpoint_id: checkpoint_id.into(),
+                    branch_id: branch_id.into(),
+                    sequence,
+                    prompt_index,
+                },
+            ),
+            meta: None,
+        }))
+    }
+
+    fn replay_updates_result(
+        updates: &[SessionUpdate],
+        session_dir: &Path,
+        live: Option<ConversationItem>,
+        target: usize,
+    ) -> io::Result<ReplayResult> {
+        let updates_path = session_dir.join("updates.jsonl");
+        let mut content = Vec::new();
+        for u in updates {
+            let envelope = crate::session::storage::SessionUpdateEnvelope::from_update(u).unwrap();
+            let mut line = serde_json::to_vec(&envelope).unwrap();
+            line.push(b'\n');
+            content.extend(line);
+        }
+        std::fs::write(&updates_path, content).unwrap();
+        replay_to_prompt(&updates_path, session_dir, live.as_ref(), target)
+    }
+
+    fn replay_updates_with_live(
+        updates: &[SessionUpdate],
+        session_dir: &Path,
+        live: Option<ConversationItem>,
+        target: usize,
+    ) -> ReplayResult {
+        replay_updates_result(updates, session_dir, live, target).unwrap()
+    }
+
+    // ── marker-schema dispatch tests ─────────────────────────────────────────
+
+    /// schema 2 → existing typed V1 replay (unchanged, marker-driven).
+    #[test]
+    fn test_replay_schema2_marker_typed_v1_path() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let wrapper = wrapper_v1_fixture("cp-v1", "branch-1", &portable);
+        write_checkpoint_v2_file(tmp.path(), &wrapper, &portable);
+        let updates = vec![
+            marker_v2_update(&wrapper),
+            tail_prepared("cp-v1", "branch-1", "op-v1", 1, 2, ConversationItem::user("P2")),
+            tail_committed("cp-v1", "branch-1", "op-v1", 1, 2),
+            tail_prepared("cp-v1", "branch-1", "op-v1", 2, 2, ConversationItem::assistant("A2")),
+            tail_committed("cp-v1", "branch-1", "op-v1", 2, 2),
+        ];
+        let result = replay_updates(&updates, tmp.path(), 3);
+        assert!(matches!(
+            result.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        let texts: Vec<String> = result
+            .conversation
+            .iter()
+            .skip(1)
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(texts, vec!["P2", "A2"]);
+        assert_eq!(result.prompt_index_reached, 3);
+        assert_eq!(result.last_compaction_prompt_index, Some(2));
+    }
+
+    /// schema 3 → typed V3 replay bound to the live V2 wrapper + V3 sidecar.
+    #[test]
+    fn test_replay_schema3_marker_typed_v3_path() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let wrapper = wrapper_v2_fixture("cp-v2", "branch-1", &portable);
+        write_checkpoint_v3_file(tmp.path(), &wrapper, &portable);
+        let updates = vec![
+            marker_v3_update(&wrapper),
+            tail_prepared("cp-v2", "branch-1", "op-v2", 1, 2, ConversationItem::user("P2")),
+            tail_committed("cp-v2", "branch-1", "op-v2", 1, 2),
+            tail_prepared("cp-v2", "branch-1", "op-v2", 2, 2, ConversationItem::assistant("A2")),
+            tail_committed("cp-v2", "branch-1", "op-v2", 2, 2),
+        ];
+        let live =
+            ConversationItem::ResponsesCompactionCheckpointV2(Box::new(wrapper.clone()));
+        let result = replay_updates_with_live(&updates, tmp.path(), Some(live), 3);
+        assert!(matches!(
+            result.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpointV2(_))
+        ));
+        let texts: Vec<String> = result
+            .conversation
+            .iter()
+            .skip(1)
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(texts, vec!["P2", "A2"]);
+        assert_eq!(result.prompt_index_reached, 3);
+        assert_eq!(result.last_compaction_prompt_index, Some(2));
+    }
+
+    /// schema 3, pre-compaction target: portable history truncated, no marker.
+    #[test]
+    fn test_replay_schema3_marker_pre_compaction_target() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let wrapper = wrapper_v2_fixture("cp-v2", "branch-1", &portable);
+        write_checkpoint_v3_file(tmp.path(), &wrapper, &portable);
+        let updates = vec![marker_v3_update(&wrapper)];
+        let live =
+            ConversationItem::ResponsesCompactionCheckpointV2(Box::new(wrapper.clone()));
+        let result = replay_updates_with_live(&updates, tmp.path(), Some(live), 1);
+        let texts: Vec<String> = result
+            .conversation
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(texts, vec!["base prompt", "first", "first answer"]);
+        assert_eq!(result.prompt_index_reached, 1);
+        assert_eq!(result.last_compaction_prompt_index, None);
+    }
+
+    /// Unknown future schema → hard InvalidData error, NEVER a silent
+    /// fallback to the legacy reducer.
+    #[test]
+    fn test_replay_unknown_schema_hard_errors_no_legacy_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let updates = vec![
+            make_user_update_pi("s1", "P0", 0),
+            make_agent_update("s1", "R0"),
+            marker_schema_update(99),
+        ];
+        let err = replay_updates_result(&updates, tmp.path(), None, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("marker schema 99"),
+            "error should name the schema: {err}"
+        );
+    }
+
+    /// schema 1 → legacy builtin marker handled by the legacy reducer.
+    #[test]
+    fn test_replay_schema1_marker_legacy_path() {
+        let tmp = TempDir::new().unwrap();
+        write_checkpoint_file(
+            tmp.path(),
+            "ckpt1",
+            2,
+            vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("compacted summary"),
+            ],
+        );
+        let updates = vec![
+            make_user_update("s1", "P0"),
+            make_agent_update("s1", "R0"),
+            make_checkpoint("ckpt1", 2, None),
+            make_user_update("s1", "P1"),
+            make_agent_update("s1", "R1"),
+        ];
+        let result = replay_updates(&updates, tmp.path(), 2);
+        assert_eq!(result.conversation.len(), 2);
+        assert_eq!(result.last_compaction_prompt_index, Some(2));
+    }
+
+    /// schema 3 without a live V2 wrapper → hard error; V1 live wrapper is
+    /// also rejected (V2 wrappers bind to V3 sidecars, never mix).
+    #[test]
+    fn test_replay_schema3_marker_requires_live_v2_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let wrapper = wrapper_v2_fixture("cp-v2", "branch-1", &portable);
+        write_checkpoint_v3_file(tmp.path(), &wrapper, &portable);
+        let updates = vec![marker_v3_update(&wrapper)];
+        let err = replay_updates_result(&updates, tmp.path(), None, 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let v1 = wrapper_v1_fixture("cp-v1", "branch-1", &portable);
+        let v1_live = ConversationItem::ResponsesCompactionCheckpoint(Box::new(v1));
+        let err =
+            replay_updates_result(&updates, tmp.path(), Some(v1_live), 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// schema 2 marker + live V2 wrapper is a mixing violation → hard error.
+    #[test]
+    fn test_replay_schema2_marker_rejects_v2_live_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let v1 = wrapper_v1_fixture("cp-v1", "branch-1", &portable);
+        let updates = vec![marker_v2_update(&v1)];
+        let v2 = wrapper_v2_fixture("cp-v2", "branch-2", &portable);
+        let v2_live = ConversationItem::ResponsesCompactionCheckpointV2(Box::new(v2));
+        let err = replay_updates_result(&updates, tmp.path(), Some(v2_live), 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// schema 3 marker tampered (or bound to a different wrapper) → the
+    /// marker/sidecar validation fails closed.
+    #[test]
+    fn test_replay_schema3_marker_mismatch_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_v2_fixture();
+        let wrapper = wrapper_v2_fixture("cp-v2", "branch-1", &portable);
+        write_checkpoint_v3_file(tmp.path(), &wrapper, &portable);
+        let mut bad = crate::session::storage::responses_compaction::marker_for_wrapper_v3(&wrapper);
+        bad.prompt_index_at_compaction = 99;
+        let updates = vec![marker_update(bad)];
+        let live =
+            ConversationItem::ResponsesCompactionCheckpointV2(Box::new(wrapper.clone()));
+        let err = replay_updates_result(&updates, tmp.path(), Some(live), 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

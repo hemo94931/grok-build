@@ -1185,7 +1185,7 @@ impl SamplingClient {
         &self,
         request: &mut CreateResponseWrapper,
     ) -> Result<serde_json::Value> {
-        let raw = request.raw_body.take();
+        let raw = request.take_sealed_body();
         let is_raw = raw.is_some();
         let mut body = match raw {
             Some(body) => body,
@@ -1218,8 +1218,7 @@ impl SamplingClient {
 
     fn response_request_has_compaction(request: &CreateResponseWrapper) -> bool {
         request
-            .raw_body
-            .as_ref()
+            .sealed_body()
             .and_then(|body| body.get("input"))
             .and_then(serde_json::Value::as_array)
             .is_some_and(|input| {
@@ -1954,24 +1953,54 @@ impl SamplingClient {
             .validate_for_backend(&ApiBackend::Responses)
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses checkpoint"))?;
 
-        let trace = request.trace.take();
-        let final_request = xai_grok_sampling_types::FinalResponsesRequest::try_from(&request)
+        // Typed normal only: checkpoint-bearing requests must arrive as an
+        // opaque resolved request or a legacy replay permit so the POST layer
+        // can prove the body came from a validating constructor.
+        let wrapper = CreateResponseWrapper::try_normal(&request)
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses request"))?;
-        let responses_request = rs::CreateResponse {
-            model: request.model.clone(),
-            ..Default::default()
-        };
-        let mut wrapper = CreateResponseWrapper::new(responses_request);
-        wrapper.x_grok_conv_id = request.x_grok_conv_id.clone();
-        wrapper.x_grok_req_id = request.x_grok_req_id.clone();
-        wrapper.x_grok_session_id = request.x_grok_session_id.clone();
-        wrapper.x_grok_turn_idx = request.x_grok_turn_idx.clone();
-        wrapper.x_grok_agent_id = request.x_grok_agent_id.clone();
-        wrapper.x_grok_deployment_id = request.x_grok_deployment_id.clone();
-        wrapper.x_grok_user_id = request.x_grok_user_id.clone();
-        wrapper.raw_body = Some(final_request.into_body());
-        wrapper.trace = trace;
 
+        self.create_response_stream(wrapper).await
+    }
+
+    /// Send an opaque resolved Responses request (typed normal produced by
+    /// the shell's checkpoint planner). The body is frozen at planning time;
+    /// no conversation defaults are applied here.
+    #[allow(clippy::type_complexity)]
+    pub async fn resolved_stream_responses(
+        &self,
+        resolved: xai_grok_sampling_types::ResolvedResponsesRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
+        if self.defaults.api_backend != ApiBackend::Responses {
+            return Err(SamplingError::InvalidConfiguration(
+                "resolved responses dispatch requires the Responses backend",
+            ));
+        }
+        let wrapper = CreateResponseWrapper::from_resolved(resolved);
+        self.create_response_stream(wrapper).await
+    }
+
+    /// Send a temporary V1 replay permit (migration gray window). Issued by
+    /// the shell only after the checkpoint gate proved replayability; the
+    /// frozen body is sent verbatim on every retry.
+    #[allow(clippy::type_complexity)]
+    pub async fn legacy_replay_stream_responses(
+        &self,
+        permit: xai_grok_sampling_types::ValidatedLegacyReplayV1,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
+        if self.defaults.api_backend != ApiBackend::Responses {
+            return Err(SamplingError::InvalidConfiguration(
+                "legacy replay requires the Responses backend",
+            ));
+        }
+        let wrapper = CreateResponseWrapper::from_legacy_v1(permit);
         self.create_response_stream(wrapper).await
     }
 
@@ -1987,23 +2016,9 @@ impl SamplingClient {
             .validate_for_backend(&ApiBackend::Responses)
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses checkpoint"))?;
 
-        let trace = request.trace.take();
-        let final_request = xai_grok_sampling_types::FinalResponsesRequest::try_from(&request)
+        // See `conversation_stream_responses`: typed normal only.
+        let wrapper = CreateResponseWrapper::try_normal(&request)
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses request"))?;
-        let responses_request = rs::CreateResponse {
-            model: request.model.clone(),
-            ..Default::default()
-        };
-        let mut wrapper = CreateResponseWrapper::new(responses_request);
-        wrapper.x_grok_conv_id = request.x_grok_conv_id.clone();
-        wrapper.x_grok_req_id = request.x_grok_req_id.clone();
-        wrapper.x_grok_session_id = request.x_grok_session_id.clone();
-        wrapper.x_grok_turn_idx = request.x_grok_turn_idx.clone();
-        wrapper.x_grok_agent_id = request.x_grok_agent_id.clone();
-        wrapper.x_grok_deployment_id = request.x_grok_deployment_id.clone();
-        wrapper.x_grok_user_id = request.x_grok_user_id.clone();
-        wrapper.raw_body = Some(final_request.into_body());
-        wrapper.trace = trace;
 
         self.create_response(wrapper).await
     }

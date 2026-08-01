@@ -12,14 +12,22 @@ use xai_grok_tools::types::memory_backend::{MemorySearchResult, format_staleness
 const SNIPPET_MAX_CHARS: usize = 500;
 
 /// Returns `true` if a memory-context block is already persisted in the
-/// leading system message. Callers reuse a persisted block verbatim instead
+/// conversation. Callers reuse a persisted block verbatim instead
 /// of re-searching: a re-scored block would mutate the system-prompt prefix
 /// and bust the KV cache for the whole downstream conversation.
+///
+/// Source-aware (stage D1c): a dedicated `MemoryContext` item anywhere in
+/// the conversation counts, and so does the legacy embedded form (memory
+/// block concatenated into a leading System string).
 pub fn conversation_has_memory_context(items: &[ConversationItem]) -> bool {
-    matches!(
-        items.first(),
-        Some(ConversationItem::System(sys)) if sys.content.contains(MEMORY_CONTEXT_OPEN_TAG)
-    )
+    items.iter().any(|item| {
+        matches!(
+            item,
+            ConversationItem::System(sys)
+                if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext
+                    || sys.content.contains(MEMORY_CONTEXT_OPEN_TAG)
+        )
+    })
 }
 
 /// Format memory search results as a markdown section for system-reminder injection.

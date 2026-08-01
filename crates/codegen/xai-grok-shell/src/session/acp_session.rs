@@ -1321,7 +1321,7 @@ pub(crate) fn load_system_prompt(session_info: &SessionInfo) -> Option<String> {
     let dir = crate::session::persistence::session_dir(session_info);
     load_system_prompt_from_dir(&dir)
 }
-fn load_system_prompt_from_dir(session_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn load_system_prompt_from_dir(session_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(session_dir.join(SYSTEM_PROMPT_FILENAME)).ok()
 }
 /// Load the canonical prompt context from `{session_dir}/prompt_context.json`.

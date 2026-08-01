@@ -42,7 +42,7 @@ fn checkpoint(output: Vec<Value>) -> ConversationItem {
 }
 
 #[test]
-fn wrapper_v1_flattens_raw_output_without_patching_prefix() {
+fn wrapper_v1_replay_projection_preserves_raw_output_prefix() {
     let raw_reasoning = json!({
         "type": "reasoning",
         "id": "raw-r1",
@@ -64,12 +64,14 @@ fn wrapper_v1_flattens_raw_output_without_patching_prefix() {
         ..Default::default()
     };
 
-    let final_request = FinalResponsesRequest::try_from(&request).unwrap();
-    let input = final_request
-        .body()
-        .get("input")
-        .and_then(Value::as_array)
-        .unwrap();
+    // The public typed conversion refuses to flatten checkpoints: replay
+    // bodies only exist behind validated construction.
+    assert!(FinalResponsesRequest::try_from(&request).is_err());
+
+    // The gate's projection helper still exposes the flattened body shape
+    // for identity computation.
+    let body = FinalResponsesRequest::replay_projection_body(&request).unwrap();
+    let input = body.get("input").and_then(Value::as_array).unwrap();
 
     assert_eq!(
         input[0], raw_reasoning,
@@ -111,6 +113,9 @@ fn wrapper_layout_and_non_responses_backends_fail_closed() {
         ..Default::default()
     };
     assert!(valid.validate_for_backend(&ApiBackend::Responses).is_ok());
+    // Even a structurally valid lone wrapper cannot be flattened through
+    // the public typed conversion.
+    assert!(FinalResponsesRequest::try_from(&valid).is_err());
     assert!(
         valid
             .validate_for_backend(&ApiBackend::ChatCompletions)
@@ -124,6 +129,7 @@ fn normal_responses_fields_are_serialized() {
     let request = ConversationRequest {
         items: vec![ConversationItem::System(SystemItem {
             content: Arc::from("system"),
+            source: Default::default(),
         })],
         model: Some("grok-test".into()),
         instructions: Some("instructions".into()),

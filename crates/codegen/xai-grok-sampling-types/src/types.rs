@@ -1091,10 +1091,10 @@ pub struct CreateResponseWrapper {
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
 
-    /// Pre-serialized normal Responses body. Used when input starts with a
-    /// local server-compaction checkpoint whose canonical prefix must bypass
-    /// the typed `rs::InputItem` round-trip.
-    pub raw_body: Option<serde_json::Value>,
+    /// Sealed body override. Only the validating constructors below can
+    /// install one: `Typed` serializes `inner`, everything else carries a
+    /// body produced exclusively by typed conversion / validated replay.
+    body: crate::conversation::SealedResponsesBody,
 }
 
 impl CreateResponseWrapper {
@@ -1111,8 +1111,68 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
-            raw_body: None,
+            body: crate::conversation::SealedResponsesBody::Typed,
         }
+    }
+
+    /// Wrapper whose body comes from the typed conversion of a
+    /// checkpoint-free conversation request. Rejects every checkpoint
+    /// variant; checkpoints must use validated replay dispatch.
+    pub fn try_normal(
+        request: &crate::ConversationRequest,
+    ) -> Result<Self, crate::conversation::ResolvedRequestError> {
+        Ok(Self::from_resolved(
+            crate::conversation::ResolvedResponsesRequest::try_normal(request)?,
+        ))
+    }
+
+    /// Wrapper around an opaque resolved request (typed normal or validated
+    /// replay). Correlation headers and trace move onto the wrapper; the
+    /// frozen body is sealed inside.
+    pub fn from_resolved(mut resolved: crate::conversation::ResolvedResponsesRequest) -> Self {
+        let mut wrapper = Self::new(crate::rs::CreateResponse {
+            model: (!resolved.model().is_empty()).then(|| resolved.model().to_string()),
+            ..Default::default()
+        });
+        wrapper.apply_correlation(resolved.correlation());
+        wrapper.trace = resolved.take_trace();
+        wrapper.body = crate::conversation::SealedResponsesBody::Resolved(Box::new(resolved));
+        wrapper
+    }
+
+    /// Wrapper around a temporary V1 replay permit (migration gray window).
+    pub fn from_legacy_v1(mut permit: crate::conversation::ValidatedLegacyReplayV1) -> Self {
+        let mut wrapper = Self::new(crate::rs::CreateResponse {
+            model: (!permit.model().is_empty()).then(|| permit.model().to_string()),
+            ..Default::default()
+        });
+        wrapper.apply_correlation(permit.correlation());
+        wrapper.trace = permit.take_trace();
+        wrapper.body = crate::conversation::SealedResponsesBody::LegacyV1(Box::new(permit));
+        wrapper
+    }
+
+    fn apply_correlation(&mut self, correlation: &crate::conversation::ResponsesCorrelation) {
+        self.x_grok_conv_id = correlation.x_grok_conv_id.clone();
+        self.x_grok_req_id = correlation.x_grok_req_id.clone();
+        self.x_grok_session_id = correlation.x_grok_session_id.clone();
+        self.x_grok_turn_idx = correlation.x_grok_turn_idx.clone();
+        self.x_grok_agent_id = correlation.x_grok_agent_id.clone();
+        self.x_grok_deployment_id = correlation.x_grok_deployment_id.clone();
+        self.x_grok_user_id = correlation.x_grok_user_id.clone();
+    }
+
+    /// Borrow the sealed pre-built body, if one was installed by a
+    /// validating constructor. Read-only: bodies can never be replaced.
+    pub fn sealed_body(&self) -> Option<&serde_json::Value> {
+        self.body.override_value()
+    }
+
+    /// Take the sealed pre-built body for serialization, leaving the wrapper
+    /// in its typed state. Extraction is safe; injection is what the sealed
+    /// constructors prevent.
+    pub fn take_sealed_body(&mut self) -> Option<serde_json::Value> {
+        std::mem::take(&mut self.body).into_override_value()
     }
 
     /// Set the conversation ID header.

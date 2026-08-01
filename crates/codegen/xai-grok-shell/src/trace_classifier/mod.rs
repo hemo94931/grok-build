@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, ConversationRequest, SystemItem, UserItem,
+    ContentPart, ConversationItem, ConversationRequest, SystemItem, SystemSource, UserItem,
 };
 
 use crate::session::{
@@ -573,6 +573,7 @@ pub fn build_classifier_request(
     let convo_items = vec![
         ConversationItem::System(SystemItem {
             content: std::sync::Arc::<str>::from(LAZINESS_CLASSIFIER_PROMPT),
+            source: SystemSource::BaseInstructions,
         }),
         ConversationItem::User(UserItem {
             content: vec![ContentPart::Text {
@@ -1920,6 +1921,7 @@ mod tests {
         let mut hist: Vec<ConversationItem> = Vec::new();
         hist.push(ConversationItem::System(SystemItem {
             content: "sys".into(),
+            source: Default::default(),
         }));
         for i in 0..24 {
             hist.push(ConversationItem::User(UserItem {
@@ -2517,6 +2519,7 @@ mod tests {
         let mut hist: Vec<ConversationItem> = Vec::new();
         hist.push(ConversationItem::System(SystemItem {
             content: "sys".into(),
+            source: Default::default(),
         }));
         for i in 0..24 {
             hist.push(ConversationItem::User(UserItem {

@@ -376,3 +376,45 @@ fn unsupported_negative_cache_is_keyed_and_expires_after_one_hour() {
     assert!(!NegativeCapabilityCache::status_is_unsupported(429));
     assert!(!NegativeCapabilityCache::status_is_unsupported(500));
 }
+
+#[test]
+fn v1_migration_cohort_is_stable_and_monotonic() {
+    use xai_grok_shell::session::responses_server_compaction::v1_migration_cohort_percent;
+
+    // Extremes are unconditional.
+    assert!(v1_migration_cohort_percent("session-a", 100));
+    assert!(!v1_migration_cohort_percent("session-a", 0));
+
+    // The same session always lands in the same bucket.
+    let first = v1_migration_cohort_percent("session-b", 50);
+    for _ in 0..8 {
+        assert_eq!(first, v1_migration_cohort_percent("session-b", 50));
+    }
+
+    // Monotonic ramp: a session admitted at p% is admitted at every q >= p.
+    for session in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"] {
+        let mut admitted_at = None;
+        for percent in 1..=100u32 {
+            if v1_migration_cohort_percent(session, percent) {
+                admitted_at = Some(percent);
+                break;
+            }
+        }
+        let admitted_at = admitted_at.expect("every session admits at 100%");
+        for percent in admitted_at..=100u32 {
+            assert!(
+                v1_migration_cohort_percent(session, percent),
+                "session {session} admitted at {admitted_at} must stay admitted at {percent}"
+            );
+        }
+    }
+
+    // Distinct sessions spread across buckets (not all in the same cohort).
+    let admitted: usize = (0..100)
+        .filter(|i| v1_migration_cohort_percent(&format!("session-{i}"), 10))
+        .count();
+    assert!(
+        admitted > 0 && admitted < 40,
+        "10% cohort should admit a small nonzero share, got {admitted}/100"
+    );
+}

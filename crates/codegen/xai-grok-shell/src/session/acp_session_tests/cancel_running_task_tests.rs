@@ -439,7 +439,9 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 )
                 .await
                 .expect("request should build");
-            assert!(matches!(request.items.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Persist this memory reminder.")));
+            // Memory is a dedicated marked item; the base head stays "sys".
+            assert!(matches!(request.items.first(), Some(ConversationItem::System(sys)) if sys.content.as_ref() == "sys"));
+            assert!(request.items.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Persist this memory reminder."))));
             let storage = crate::session::storage::JsonlStorageAdapter::with_explicit_session_dir(
                 session_dir.path().to_path_buf(),
             );
@@ -455,7 +457,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 .load_session_without_updates(&session_info)
                 .await
                 .unwrap();
-            assert!(matches!(loaded.chat_history.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Persist this memory reminder.")));
+            assert!(matches!(loaded.chat_history.first(), Some(ConversationItem::System(sys)) if sys.content.as_ref() == "sys"));
+            assert!(loaded.chat_history.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Persist this memory reminder."))));
         })
         .await;
 }

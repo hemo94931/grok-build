@@ -15,7 +15,7 @@ use super::{SamplingClient, extract_retry_after, extract_should_retry};
 pub const RESPONSES_COMPACT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RESPONSES_COMPACT_MAX_BYTES: usize = 52_428_800;
 pub const RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES: usize = 10_485_760;
-pub const USER_CONTEXT_DELIMITER: &str = "\n\n--- user-provided compaction context ---\n";
+pub use xai_grok_sampling_types::USER_CONTEXT_DELIMITER;
 const RESPONSES_COMPACT_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSES_COMPACT_MAX_ATTEMPTS: u8 = 2;
 const MIN_RETRY_BUDGET: Duration = Duration::from_secs(1);
@@ -32,25 +32,31 @@ pub struct CompactCorrelationHeaders {
     pub user_id: Option<String>,
 }
 
+/// Standalone `/responses/compact` request body.
+///
+/// Fields are private: the only way to build one is the typed
+/// [`ResponsesCompactRequest::from_final`] conversion (or future canonical
+/// constructors), so the compact POST point can trust that no caller
+/// injected arbitrary raw JSON.
 #[derive(Clone, Serialize)]
 pub struct ResponsesCompactRequest {
-    pub model: String,
-    pub input: Vec<Value>,
-    pub parallel_tool_calls: bool,
+    model: String,
+    input: Vec<Value>,
+    parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Value>,
+    tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Value>,
+    reasoning: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
+    prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<Value>,
+    text: Option<Value>,
     #[serde(skip)]
-    pub correlation: CompactCorrelationHeaders,
+    correlation: CompactCorrelationHeaders,
 }
 
 impl std::fmt::Debug for ResponsesCompactRequest {
@@ -146,9 +152,78 @@ impl ResponsesCompactRequest {
         })
     }
 
+    /// Build a compact request from a sealed [`ResolvedCompactRequest`]
+    /// (V2 contract: first compact via `try_normal`, continuous compact via
+    /// `from_validated_recompact`). The frozen body is reused verbatim so
+    /// sampler retries never re-read session state.
+    pub fn from_resolved(
+        resolved: &xai_grok_sampling_types::ResolvedCompactRequest,
+    ) -> Result<Self, ResponsesCompactError> {
+        let body = resolved.body();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?
+            .to_string();
+        let input = body
+            .get("input")
+            .and_then(Value::as_array)
+            .filter(|input| !input.is_empty())
+            .cloned()
+            .ok_or_else(|| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?;
+        let string_field = |name: &str| {
+            body.get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let optional_value = |name: &str| {
+            body.get(name)
+                .filter(|value| !value.is_null())
+                .filter(|value| !value.as_array().is_some_and(Vec::is_empty))
+                .cloned()
+        };
+        Ok(Self {
+            model,
+            input,
+            parallel_tool_calls: body
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            instructions: string_field("instructions"),
+            tools: optional_value("tools"),
+            reasoning: optional_value("reasoning"),
+            service_tier: string_field("service_tier"),
+            prompt_cache_key: string_field("prompt_cache_key"),
+            text: optional_value("text"),
+            correlation: CompactCorrelationHeaders {
+                conversation_id: resolved.correlation().x_grok_conv_id.clone(),
+                request_id: resolved.correlation().x_grok_req_id.clone(),
+                session_id: resolved.correlation().x_grok_session_id.clone(),
+                turn_index: resolved.correlation().x_grok_turn_idx.clone(),
+                agent_id: resolved.correlation().x_grok_agent_id.clone(),
+                deployment_id: resolved.correlation().x_grok_deployment_id.clone(),
+                user_id: resolved.correlation().x_grok_user_id.clone(),
+            },
+        })
+    }
+
     pub fn with_correlation(mut self, correlation: CompactCorrelationHeaders) -> Self {
         self.correlation = correlation;
         self
+    }
+
+    /// Replace the top-level instructions. Instructions are plain text, so
+    /// this cannot weaken the typed-input gate; it exists for callers (and
+    /// tests) that adjust the compaction directive.
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn to_bounded_bytes(&self) -> Result<Vec<u8>, ResponsesCompactError> {
