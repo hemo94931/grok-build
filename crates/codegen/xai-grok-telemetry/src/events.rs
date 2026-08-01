@@ -493,6 +493,37 @@ pub struct CheckpointRecoveryMigration {
     pub tokens_after: u64,
 }
 
+/// Metadata-only outcome of one per-session compaction-artifact GC pass
+/// (stage D4, best-effort detached after a committed server compaction).
+/// Records orphan classification and deletion sizes — never prompt content
+/// or provider output.
+#[derive(Serialize)]
+pub struct CompactionGcOutcome {
+    /// Total checkpoint bytes on disk (sidecars + segment staging).
+    pub session_checkpoint_bytes: u64,
+    /// Bytes referenced by nothing after the full scan (pre-CAS orphans).
+    pub orphan_bytes: u64,
+    /// Bytes actually deleted this pass.
+    pub deleted_bytes: u64,
+    /// Orphan bytes retained because their mtime is inside the grace period.
+    pub retained_orphan_bytes: u64,
+    pub files_scanned: u32,
+    pub files_deleted: u32,
+    /// Whether the session was over its checkpoint quota at GC time.
+    pub quota_exceeded: bool,
+    pub dry_run: bool,
+}
+
+/// Per-session checkpoint quota pressure (stage D4): exceeding the quota
+/// stops NEW remote checkpoints and falls back to builtin compaction —
+/// active recovery data is never deleted to make room. Rate-limited to once
+/// per session per hour.
+#[derive(Serialize)]
+pub struct CompactionQuotaPressure {
+    pub session_checkpoint_bytes: u64,
+    pub quota_bytes: u64,
+}
+
 /// Observed prompt-cache behavior per request kind (stage D3). Provider
 /// cache capability (`compact_seeds_prompt_cache`) has no reliable static
 /// signal, so it is recorded observationally per normalized
@@ -1778,6 +1809,8 @@ telemetry_event!(CompactionTriggered, "compaction_triggered");
 telemetry_event!(CompactionStrategyAttempt, "compaction_strategy_attempt");
 telemetry_event!(CheckpointRecoveryScan, "checkpoint_recovery_scan");
 telemetry_event!(CheckpointRecoveryMigration, "checkpoint_recovery_migration");
+telemetry_event!(CompactionGcOutcome, "compaction_gc_outcome");
+telemetry_event!(CompactionQuotaPressure, "compaction_quota_pressure");
 telemetry_event!(PromptCacheObservation, "prompt_cache_observation");
 telemetry_event!(
     CompactionCompleted,

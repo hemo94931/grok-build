@@ -5,9 +5,10 @@ use std::time::Duration;
 use sha2::Digest as _;
 use xai_grok_sampler::{ResponsesCompactFailure, ResponsesCompactResponse};
 use xai_grok_sampling_types::{
-    CheckpointIdentityV1, ConversationItem, FinalResponsesRequest,
-    RESPONSES_COMPACTION_CONTRACT_V1, ResponsesCompactionModeV1, ServerResponsesCheckpointV1,
-    TokenSeedSource,
+    CheckpointIdentityV1, CheckpointIdentityV2, ConversationItem, FinalResponsesRequest,
+    RESPONSES_CHECKPOINT_SCHEMA_V2, RESPONSES_COMPACTION_CONTRACT_V1,
+    ResponsesCompactionModeV1, ServerResponsesCheckpointV1,
+    ServerResponsesCheckpointV2, TokenSeedSource,
 };
 
 pub const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -34,6 +35,14 @@ pub struct ResponsesRequestSnapshot {
     pub semantic_envelope: serde_json::Value,
     pub semantic_envelope_tokens: u64,
     pub identity: CheckpointIdentityV1,
+    /// V2-contract writer identity (D4): contract v2, trusted prompt
+    /// envelope digests, prior checkpoint link and cache route fingerprint.
+    /// Always computed; consumed only when the V2 writer branch runs.
+    pub identity_v2: CheckpointIdentityV2,
+    /// V2 trusted prompt envelope resolved from the same request that fed
+    /// the gate (`current_trusted_envelope_v2`), so the writer's identity
+    /// matches the next turn's gate identity.
+    pub trusted_envelope_v2: xai_grok_sampling_types::TrustedPromptEnvelopeV2,
     pub request_bytes: Vec<u8>,
     pub trigger: xai_grok_telemetry::events::CompactionTrigger,
     pub mode: ResponsesCompactionModeV1,
@@ -96,6 +105,34 @@ pub fn v1_server_compaction_writers_enabled() -> bool {
     std::env::var("GROK_RESPONSES_V1_SERVER_COMPACTION")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Stage-D4 (plan 阶段 5b) kill switch: V2 server compaction writers.
+/// Default OFF — reader-first deployments keep write capability disabled
+/// until every binary that can host a session reads V2 wrappers. When both
+/// V1 and V2 writer flags are enabled, the V2 writer wins (V1 is legacy).
+pub fn v2_server_compaction_writers_enabled() -> bool {
+    std::env::var("GROK_RESPONSES_V2_SERVER_COMPACTION")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Stage-D4 writer rollout percent from `GROK_V2_WRITER_PERCENT`
+/// (1 → 10 → 50 → 100 during the canary; defaults to 0 = writers off).
+pub fn v2_writer_cohort_percent() -> u32 {
+    std::env::var("GROK_V2_WRITER_PERCENT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(100)
+}
+
+/// Deterministic V2-writer cohort check: stable session-hash bucket in
+/// `[0, 100)` against the current `GROK_V2_WRITER_PERCENT`. Mirrors the
+/// D1b migration cohort hash exactly, so a session admitted at p% stays
+/// admitted at every q >= p.
+pub fn v2_writer_cohort_allows(session_id: &str) -> bool {
+    v1_migration_cohort_percent(session_id, v2_writer_cohort_percent())
 }
 
 /// Stage-D1b migration cohort from `GROK_V1_MIGRATION_PERCENT`
@@ -297,6 +334,56 @@ pub fn server_checkpoint_token_seed(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Stage-D4 V2 successor: `[ResponsesCompactionCheckpointV2(wrapper)] ++ tail`.
+///
+/// The caller supplies the portable-history digest (computed over the same
+/// history that will be embedded in the V3 sidecar) and the previous live
+/// V2 checkpoint id (the recompact chain link); the sidecar constructor
+/// re-verifies both. `portable_history_bytes` is filled in by the sidecar
+/// construction, exactly like the V1 path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_server_successor_v2(
+    checkpoint_id: &str,
+    operation_id: &str,
+    prompt_index: usize,
+    auto_continue: bool,
+    mode: ResponsesCompactionModeV1,
+    branch_id: &str,
+    identity: CheckpointIdentityV2,
+    output: Vec<serde_json::Value>,
+    portable_history_path: &str,
+    portable_history_sha256: String,
+    token_seed: u64,
+    token_seed_source: TokenSeedSource,
+    prior_checkpoint_id: Option<String>,
+    tail: Vec<ConversationItem>,
+) -> Vec<ConversationItem> {
+    let server_output_item_count = output.len();
+    let wrapper = Box::new(ServerResponsesCheckpointV2 {
+        schema_version: RESPONSES_CHECKPOINT_SCHEMA_V2,
+        checkpoint_id: checkpoint_id.to_string(),
+        operation_id: operation_id.to_string(),
+        prompt_index,
+        created_at: chrono::Utc::now(),
+        auto_continue,
+        mode,
+        branch_id: branch_id.to_string(),
+        identity,
+        output,
+        portable_history_path: portable_history_path.to_string(),
+        portable_history_sha256,
+        portable_history_bytes: 0,
+        checkpoint_token_seed: token_seed,
+        token_seed_source,
+        server_output_item_count,
+        prior_checkpoint_id,
+        memory_revision: None,
+    });
+    std::iter::once(ConversationItem::ResponsesCompactionCheckpointV2(wrapper))
+        .chain(tail)
+        .collect()
+}
+
 pub fn build_server_successor(
     checkpoint_id: &str,
     operation_id: &str,

@@ -865,14 +865,12 @@ impl JsonlStorageAdapter {
                     )?)?,
                 )?;
                 if wrapper.mode.name == "segments" {
-                    // TODO(integration): V2 segment staging
-                    // (`ResponsesCompactionSegmentStagingV2`) has no publish
-                    // API yet; the V1 publish cannot consume V2 staging.
-                    tracing::warn!(
-                        checkpoint_id = %wrapper.checkpoint_id,
-                        "V2 checkpoint in segments mode: V2 staging publish not yet \
-                         available, skipping segment publish during recovery repair"
-                    );
+                    super::responses_compaction::publish_staged_compaction_segment_durable_v2(
+                        &self.session_dir(info),
+                        &wrapper.checkpoint_id,
+                        &wrapper.operation_id,
+                        &wrapper.wrapper_digest(),
+                    )?;
                 }
             }
         }
@@ -2377,6 +2375,25 @@ impl StorageAdapter for JsonlStorageAdapter {
         .await
         .map_err(io::Error::other)?
     }
+    async fn write_responses_compaction_checkpoint_v3(
+        &self,
+        info: &Info,
+        relative_path: &str,
+        checkpoint: &super::responses_compaction::CompactionCheckpointFileV3,
+    ) -> io::Result<()> {
+        let session_dir = self.session_dir(info);
+        let relative_path = relative_path.to_string();
+        let checkpoint = checkpoint.clone();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::write_checkpoint_v3_durable(
+                &session_dir,
+                &relative_path,
+                &checkpoint,
+            )
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     async fn stage_responses_compaction_segment(
         &self,
         info: &Info,
@@ -2386,6 +2403,19 @@ impl StorageAdapter for JsonlStorageAdapter {
         let staging = staging.clone();
         tokio::task::spawn_blocking(move || {
             super::responses_compaction::stage_compaction_segment_durable(&session_dir, &staging)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+    async fn stage_responses_compaction_segment_v2(
+        &self,
+        info: &Info,
+        staging: &super::responses_compaction::ResponsesCompactionSegmentStagingV2,
+    ) -> io::Result<()> {
+        let session_dir = self.session_dir(info);
+        let staging = staging.clone();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::stage_compaction_segment_v2_durable(&session_dir, &staging)
         })
         .await
         .map_err(io::Error::other)?
@@ -2401,6 +2431,28 @@ impl StorageAdapter for JsonlStorageAdapter {
             super::responses_compaction::publish_staged_compaction_segment_durable(
                 &session_dir,
                 &checkpoint_id,
+            )
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+    async fn publish_responses_compaction_segment_v2(
+        &self,
+        info: &Info,
+        checkpoint_id: &str,
+        operation_id: &str,
+        wrapper_digest: &str,
+    ) -> io::Result<super::responses_compaction::PublishedCompactionSegment> {
+        let session_dir = self.session_dir(info);
+        let checkpoint_id = checkpoint_id.to_string();
+        let operation_id = operation_id.to_string();
+        let wrapper_digest = wrapper_digest.to_string();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::publish_staged_compaction_segment_durable_v2(
+                &session_dir,
+                &checkpoint_id,
+                &operation_id,
+                &wrapper_digest,
             )
         })
         .await

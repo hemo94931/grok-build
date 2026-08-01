@@ -379,14 +379,37 @@ pub enum PersistenceMsg {
         checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV2,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    /// Durably persist a Responses schema-v3 (V2 contract) checkpoint
+    /// sidecar before history commit.
+    ResponsesCompactionCheckpointV3 {
+        relative_path: String,
+        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV3,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Stage a server Responses segment without allocating a formal index.
     ResponsesCompactionSegmentStage {
         staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV1,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    /// Stage a V2-contract server Responses segment (strong operation/branch/
+    /// wrapper-digest binding) without allocating a formal index.
+    ResponsesCompactionSegmentStageV2 {
+        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV2,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     /// Publish a committed staged server Responses segment idempotently.
     ResponsesCompactionSegmentPublish {
         checkpoint_id: String,
+        respond_to: tokio::sync::oneshot::Sender<
+            io::Result<crate::session::storage::responses_compaction::PublishedCompactionSegment>,
+        >,
+    },
+    /// Publish a committed staged V2-contract server Responses segment
+    /// idempotently, binding through the operation id and wrapper digest.
+    ResponsesCompactionSegmentPublishV2 {
+        checkpoint_id: String,
+        operation_id: String,
+        wrapper_digest: String,
         respond_to: tokio::sync::oneshot::Sender<
             io::Result<crate::session::storage::responses_compaction::PublishedCompactionSegment>,
         >,
@@ -2357,6 +2380,21 @@ impl SessionPersistence {
                         .await;
                     let _ = respond_to.send(result);
                 }
+                PersistenceMsg::ResponsesCompactionCheckpointV3 {
+                    relative_path,
+                    checkpoint,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .write_responses_compaction_checkpoint_v3(
+                            &self.info,
+                            &relative_path,
+                            &checkpoint,
+                        )
+                        .await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::ResponsesCompactionSegmentStage {
                     staging,
                     respond_to,
@@ -2367,6 +2405,16 @@ impl SessionPersistence {
                         .await;
                     let _ = respond_to.send(result);
                 }
+                PersistenceMsg::ResponsesCompactionSegmentStageV2 {
+                    staging,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .stage_responses_compaction_segment_v2(&self.info, &staging)
+                        .await;
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::ResponsesCompactionSegmentPublish {
                     checkpoint_id,
                     respond_to,
@@ -2374,6 +2422,23 @@ impl SessionPersistence {
                     let result = self
                         .storage
                         .publish_responses_compaction_segment(&self.info, &checkpoint_id)
+                        .await;
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::ResponsesCompactionSegmentPublishV2 {
+                    checkpoint_id,
+                    operation_id,
+                    wrapper_digest,
+                    respond_to,
+                } => {
+                    let result = self
+                        .storage
+                        .publish_responses_compaction_segment_v2(
+                            &self.info,
+                            &checkpoint_id,
+                            &operation_id,
+                            &wrapper_digest,
+                        )
                         .await;
                     let _ = respond_to.send(result);
                 }

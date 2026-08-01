@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -189,6 +190,10 @@ pub struct CompactionConfig {
     /// Auto-compaction suppression state (`SUPPRESS_*`) after a deterministic
     /// failure; the gates early-return unless `SUPPRESS_NONE`. Manual `/compact` ignores it.
     pub auto_compact_suppressed: AtomicU8,
+    /// Unix-seconds timestamp of the last per-session quota-pressure
+    /// notification (stage D4). Rate-limits `compaction_quota_pressure`
+    /// telemetry to once per hour per session; 0 = never notified.
+    pub quota_pressure_notified_at: AtomicI64,
     /// Locks the context window when `GROK_DEBUG_CONTEXT_WINDOW` is set.
     pub context_window_override: Option<std::num::NonZeroU64>,
     pub count: AtomicU64,

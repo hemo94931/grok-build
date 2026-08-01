@@ -277,6 +277,7 @@ pub(crate) async fn create_test_actor_ex(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,

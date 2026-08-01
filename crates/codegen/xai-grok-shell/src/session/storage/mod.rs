@@ -1684,6 +1684,19 @@ pub trait StorageAdapter: Send + Sync {
         ))
     }
 
+    /// Durably write a schema-v3 (V2 contract) Responses checkpoint sidecar.
+    async fn write_responses_compaction_checkpoint_v3(
+        &self,
+        _info: &Info,
+        _relative_path: &str,
+        _checkpoint: &responses_compaction::CompactionCheckpointFileV3,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses checkpoint v3 is unsupported",
+        ))
+    }
+
     /// Durably stage a checkpoint-keyed segment without allocating a formal index.
     async fn stage_responses_compaction_segment(
         &self,
@@ -1696,6 +1709,19 @@ pub trait StorageAdapter: Send + Sync {
         ))
     }
 
+    /// Durably stage a V2-contract checkpoint-keyed segment (operation id +
+    /// branch + wrapper digest binding) without allocating a formal index.
+    async fn stage_responses_compaction_segment_v2(
+        &self,
+        _info: &Info,
+        _staging: &responses_compaction::ResponsesCompactionSegmentStagingV2,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment v2 staging is unsupported",
+        ))
+    }
+
     /// Publish a committed staged segment, assigning its formal index idempotently.
     async fn publish_responses_compaction_segment(
         &self,
@@ -1705,6 +1731,21 @@ pub trait StorageAdapter: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Responses compaction segment publication is unsupported",
+        ))
+    }
+
+    /// Publish a committed staged V2-contract segment, assigning its formal
+    /// index idempotently and binding through operation id + wrapper digest.
+    async fn publish_responses_compaction_segment_v2(
+        &self,
+        _info: &Info,
+        _checkpoint_id: &str,
+        _operation_id: &str,
+        _wrapper_digest: &str,
+    ) -> io::Result<responses_compaction::PublishedCompactionSegment> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment v2 publication is unsupported",
         ))
     }
 

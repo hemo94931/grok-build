@@ -2,15 +2,87 @@ use std::time::Duration;
 
 use xai_grok_sampler::{ResponsesCompactFailure, ResponsesCompactResponse};
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, FinalResponsesRequest, ResponsesCompactionModeV1,
-    TokenSeedSource,
+    ConversationItem, ConversationRequest, FinalResponsesRequest, RESPONSES_CHECKPOINT_SCHEMA_V2,
+    RESPONSES_COMPACTION_CONTRACT_V2, ResponsesCompactionModeV1, TokenSeedSource,
 };
 use xai_grok_shell::session::responses_server_compaction::{
     CapabilityKey, NegativeCapabilityCache, ServerCompactionFailureReason,
-    build_checkpoint_identity, build_server_successor, classify_compact_failure,
-    resolve_compact_model_layers, resolve_server_compaction_layers, server_checkpoint_token_seed,
-    should_send_inline_compaction_headers,
+    build_checkpoint_identity, build_server_successor, build_server_successor_v2,
+    classify_compact_failure, resolve_compact_model_layers, resolve_server_compaction_layers,
+    server_checkpoint_token_seed, should_send_inline_compaction_headers,
+    v1_migration_cohort_percent, v2_server_compaction_writers_enabled, v2_writer_cohort_allows,
+    v2_writer_cohort_percent,
 };
+
+/// Serializes env-mutating tests: the harness runs tests in one process,
+/// and `GROK_V2_WRITER_PERCENT` / `GROK_RESPONSES_V2_SERVER_COMPACTION` are
+/// process-global.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn v2_writer_flags_default_off_and_cohort_is_deterministic() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Defaults: V2 writers off, 0% cohort.
+    unsafe {
+        std::env::remove_var("GROK_RESPONSES_V2_SERVER_COMPACTION");
+        std::env::remove_var("GROK_V2_WRITER_PERCENT");
+    }
+    assert!(!v2_server_compaction_writers_enabled());
+    assert_eq!(v2_writer_cohort_percent(), 0);
+    assert!(!v2_writer_cohort_allows("any-session"));
+    assert!(v1_migration_cohort_percent("any-session", 100));
+
+    // Flag accepts the same truthy spellings as the V1 kill switch.
+    for value in ["1", "true", "yes", "on", " 1 "] {
+        unsafe { std::env::set_var("GROK_RESPONSES_V2_SERVER_COMPACTION", value) };
+        assert!(v2_server_compaction_writers_enabled());
+    }
+    for value in ["0", "false", "no", "off", "", "garbage"] {
+        unsafe { std::env::set_var("GROK_RESPONSES_V2_SERVER_COMPACTION", value) };
+        assert!(!v2_server_compaction_writers_enabled());
+    }
+    unsafe { std::env::remove_var("GROK_RESPONSES_V2_SERVER_COMPACTION") };
+
+    // Percent is clamped to [0, 100] and 0% admits nobody, 100% everybody.
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "0") };
+    assert_eq!(v2_writer_cohort_percent(), 0);
+    assert!(!v2_writer_cohort_allows("session-a"));
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "100") };
+    assert_eq!(v2_writer_cohort_percent(), 100);
+    assert!(v2_writer_cohort_allows("session-a"));
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "250") };
+    assert_eq!(v2_writer_cohort_percent(), 100);
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "-5") };
+    assert_eq!(v2_writer_cohort_percent(), 0);
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "not-a-number") };
+    assert_eq!(v2_writer_cohort_percent(), 0);
+    unsafe { std::env::remove_var("GROK_V2_WRITER_PERCENT") };
+
+    // Deterministic + monotonic: same session lands in the same bucket and
+    // a session admitted at p% stays admitted at every q >= p.
+    unsafe { std::env::set_var("GROK_V2_WRITER_PERCENT", "50") };
+    let first = v2_writer_cohort_allows("session-b");
+    for _ in 0..8 {
+        assert_eq!(first, v2_writer_cohort_allows("session-b"));
+    }
+    for session in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"] {
+        let mut admitted_at = None;
+        for percent in 1..=100u32 {
+            if v1_migration_cohort_percent(session, percent) {
+                admitted_at = Some(percent);
+                break;
+            }
+        }
+        let admitted_at = admitted_at.expect("every session admits at 100%");
+        for percent in admitted_at..=100u32 {
+            assert!(
+                v1_migration_cohort_percent(session, percent),
+                "session {session} admitted at {admitted_at} must stay admitted at {percent}"
+            );
+        }
+    }
+    unsafe { std::env::remove_var("GROK_V2_WRITER_PERCENT") };
+}
 
 #[test]
 fn config_precedence_and_model_fallback_are_frozen() {
@@ -334,6 +406,93 @@ fn server_successor_preserves_opaque_output_and_counts_tail_once() {
     assert_eq!(wrapper.output, output);
     assert_eq!(successor[1..].len(), tail.len());
     assert_eq!(wrapper.checkpoint_token_seed, 25);
+}
+
+#[test]
+fn server_successor_v2_shape_and_digest_binding() {
+    use xai_grok_sampling_types::{wrapper_digest_v2, CheckpointIdentityV2};
+
+    let output = vec![serde_json::json!({
+        "type": "compaction",
+        "encrypted_content": "opaque",
+        "future": {"z": 1, "a": 2}
+    })];
+    let portable = vec![
+        ConversationItem::base_instructions("base prompt"),
+        ConversationItem::user("first"),
+        ConversationItem::assistant("answer"),
+    ];
+    let digest = xai_grok_shell::session::storage::responses_compaction::portable_history_digest(
+        &portable,
+    )
+    .unwrap();
+    let identity = CheckpointIdentityV2 {
+        provider_id: "xai".into(),
+        api: "responses".into(),
+        endpoint_fingerprint: "endpoint".into(),
+        model: "grok-test".into(),
+        auth_principal_fingerprint: "principal".into(),
+        contract_version: RESPONSES_COMPACTION_CONTRACT_V2.into(),
+        prompt_envelope_fingerprint: "envelope-fp".into(),
+        base_instructions_sha256: "base-hash".into(),
+        prior_checkpoint_id: Some("cp-prior".into()),
+        cache_route_fingerprint: Some("route-fp".into()),
+    };
+    let tail = vec![ConversationItem::system_reminder("transcript pointer")];
+    let successor = build_server_successor_v2(
+        "checkpoint",
+        "operation",
+        7,
+        true,
+        ResponsesCompactionModeV1 {
+            name: "segments".into(),
+            detail: Some(serde_json::Value::String("balanced".into())),
+        },
+        "branch",
+        identity.clone(),
+        output.clone(),
+        "compaction_checkpoints/checkpoint.json",
+        digest.clone(),
+        25,
+        TokenSeedSource::UsageOutputTokens,
+        Some("cp-prior".into()),
+        tail.clone(),
+    );
+
+    let ConversationItem::ResponsesCompactionCheckpointV2(wrapper) = &successor[0] else {
+        panic!("V2 wrapper must be index zero");
+    };
+    assert_eq!(wrapper.schema_version, RESPONSES_CHECKPOINT_SCHEMA_V2);
+    assert_eq!(wrapper.identity, identity);
+    assert_eq!(wrapper.output, output);
+    assert_eq!(wrapper.checkpoint_token_seed, 25);
+    assert_eq!(wrapper.prior_checkpoint_id.as_deref(), Some("cp-prior"));
+    assert_eq!(wrapper.portable_history_sha256, digest);
+    assert_eq!(successor[1..].len(), tail.len());
+    assert_eq!(wrapper.server_output_item_count, output.len());
+    assert!(wrapper.auto_continue);
+    // The wrapper digest binds the immutable fields the V3 sidecar and V2
+    // staging re-verify at read time.
+    assert_eq!(
+        wrapper.wrapper_digest(),
+        wrapper_digest_v2(
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+            wrapper.prompt_index,
+            &wrapper.branch_id,
+            &wrapper.identity,
+            &wrapper.portable_history_sha256,
+            wrapper.prior_checkpoint_id.as_deref(),
+        )
+    );
+    // A different portable digest must produce a different wrapper digest
+    // (the sidecar constructor rejects mismatches).
+    let mut other = successor.clone();
+    let ConversationItem::ResponsesCompactionCheckpointV2(other_wrapper) = &mut other[0] else {
+        unreachable!()
+    };
+    other_wrapper.portable_history_sha256 = "deadbeef".into();
+    assert_ne!(other_wrapper.wrapper_digest(), wrapper.wrapper_digest());
 }
 
 #[test]

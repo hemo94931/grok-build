@@ -82,19 +82,23 @@ impl CompactionCheckpointFileV3 {
     /// Build a V3 sidecar, computing the portable digest and proving that
     /// the wrapper, the replay material and the portable history all agree.
     pub fn new(
-        wrapper: ServerResponsesCheckpointV2,
+        mut wrapper: ServerResponsesCheckpointV2,
         replay_material: CheckpointReplayMaterialV2,
         portable_history: Vec<ConversationItem>,
         original_user_info: Option<String>,
         reread_file_paths: Vec<String>,
     ) -> io::Result<Self> {
         let digest = portable_history_digest(&portable_history)?;
+        let portable_bytes = portable_history_bytes(&portable_history)?.len() as u64;
         if wrapper.portable_history_sha256 != digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "wrapper portable history digest does not match sidecar history",
             ));
         }
+        // Informational mirror of the V2 sidecar: keep the wrapper's byte
+        // count truthful for checkpoint-bytes telemetry.
+        wrapper.portable_history_bytes = portable_bytes;
         if replay_material.portable_history_sha256() != digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1358,7 +1362,13 @@ pub fn publish_staged_compaction_segment_durable(
     if let Some((index, markdown)) = existing {
         if staging_path.exists() {
             let staging = read_segment_staging(&staging_path, checkpoint_id)?;
-            ensure_segment_index(&compaction_dir, index, &markdown, &staging)?;
+            ensure_segment_index(
+                &compaction_dir,
+                index,
+                &markdown,
+                &staging.summary,
+                staging.items.len(),
+            )?;
             remove_segment_staging(&staging_path)?;
         }
         return Ok(PublishedCompactionSegment {
@@ -1384,7 +1394,92 @@ pub fn publish_staged_compaction_segment_durable(
         xai_chat_state::compaction_transcript::segment_filename(index),
     );
     write_bytes_durable(&segment_path, markdown.as_bytes())?;
-    ensure_segment_index(&compaction_dir, index, &markdown, &staging)?;
+    ensure_segment_index(
+        &compaction_dir,
+        index,
+        &markdown,
+        &staging.summary,
+        staging.items.len(),
+    )?;
+    remove_segment_staging(&staging_path)?;
+    Ok(PublishedCompactionSegment {
+        index,
+        newly_published: true,
+    })
+}
+
+/// Publish a committed V2-contract staged segment idempotently, binding the
+/// staging to the live wrapper through the operation id and wrapper digest
+/// (the strong-binding upgrade over the V1 publish, which only knows the
+/// checkpoint id). Same segment layout and index semantics as the V1
+/// publish; a V2 staging file at the shared `compaction/staging/` path is
+/// consumed and removed exactly like V1 staging.
+pub fn publish_staged_compaction_segment_durable_v2(
+    session_dir: &Path,
+    checkpoint_id: &str,
+    operation_id: &str,
+    wrapper_digest: &str,
+) -> io::Result<PublishedCompactionSegment> {
+    validate_checkpoint_component(checkpoint_id)?;
+    let compaction_dir = session_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    std::fs::create_dir_all(&compaction_dir)?;
+    reject_symlink_components(session_dir, &compaction_dir)?;
+    let staging_path = segment_staging_path(session_dir, checkpoint_id)?;
+    let existing = find_published_segment(&compaction_dir, checkpoint_id)?;
+    if let Some((index, markdown)) = existing {
+        if staging_path.exists() {
+            let staging = read_segment_staging_v2_payload(&staging_path, checkpoint_id)?;
+            ensure_segment_index(
+                &compaction_dir,
+                index,
+                &markdown,
+                &staging.summary,
+                staging.items.len(),
+            )?;
+            remove_segment_staging(&staging_path)?;
+        }
+        return Ok(PublishedCompactionSegment {
+            index,
+            newly_published: false,
+        });
+    }
+
+    let staging = read_segment_staging_v2_payload(&staging_path, checkpoint_id)?;
+    if staging.operation_id != operation_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment staging operation mismatch",
+        ));
+    }
+    if staging.wrapper_digest != wrapper_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment staging wrapper digest mismatch",
+        ));
+    }
+    let detail = xai_chat_state::CompactionDetail::parse(&staging.detail).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid staged segment detail")
+    })?;
+    let index = next_compaction_segment_index(&compaction_dir)?;
+    let rendered = xai_chat_state::compaction_transcript::render_segment_md(
+        &staging.items,
+        &staging.summary,
+        index,
+        detail,
+        &staging.timestamp,
+    );
+    let markdown = format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{checkpoint_id} -->\n{rendered}");
+    let segment_path = compaction_dir.join(
+        xai_chat_state::compaction_transcript::segment_filename(index),
+    );
+    write_bytes_durable(&segment_path, markdown.as_bytes())?;
+    ensure_segment_index(
+        &compaction_dir,
+        index,
+        &markdown,
+        &staging.summary,
+        staging.items.len(),
+    )?;
     remove_segment_staging(&staging_path)?;
     Ok(PublishedCompactionSegment {
         index,
@@ -1507,7 +1602,8 @@ fn ensure_segment_index(
     compaction_dir: &Path,
     index: u64,
     markdown: &str,
-    staging: &ResponsesCompactionSegmentStagingV1,
+    summary: &str,
+    items_len: usize,
 ) -> io::Result<()> {
     let index_path = compaction_dir.join(xai_chat_state::compaction_transcript::INDEX_FILE);
     if !index_path.exists() {
@@ -1523,10 +1619,10 @@ fn ensure_segment_index(
             "compaction segment index is not a regular file",
         ));
     }
-    let keywords = xai_chat_state::compaction_transcript::extract_keywords(&staging.summary);
+    let keywords = xai_chat_state::compaction_transcript::extract_keywords(summary);
     let row = xai_chat_state::compaction_transcript::render_index_row(
         index,
-        staging.items.len(),
+        items_len,
         markdown.len(),
         &keywords,
     );
@@ -2053,5 +2149,110 @@ mod tests {
         stage_compaction_segment_durable(dir.path(), &v1).unwrap();
         let error = read_segment_staging_v2_for_wrapper(dir.path(), &wrapper).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn v3_sidecar_fills_portable_history_bytes() {
+        // The V3 sidecar construction keeps the wrapper's byte count
+        // truthful (mirror of the V2 sidecar), feeding checkpoint-bytes
+        // telemetry.
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture(&portable, None);
+        let material = material_fixture(&wrapper, &portable);
+        let sidecar = CompactionCheckpointFileV3::new(
+            wrapper.clone(),
+            material,
+            portable,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let expected = portable_history_bytes(&portable_fixture()).unwrap().len() as u64;
+        assert_eq!(sidecar.wrapper.portable_history_bytes, expected);
+        // An unsupported wrapper schema is still rejected by the sidecar
+        // constructor (material `try_new` only binds the portable digest,
+        // so this exercises the V3 schema guard).
+        let mut tampered = wrapper_fixture(&portable_fixture(), None);
+        tampered.schema_version = 99;
+        let material = material_fixture(&tampered, &portable_fixture());
+        assert!(CompactionCheckpointFileV3::new(
+            tampered,
+            material,
+            portable_fixture(),
+            None,
+            Vec::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn publish_v2_segment_consumes_staging_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture(&portable, None);
+        let staging = staging_fixture(&wrapper);
+        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
+
+        let published = publish_staged_compaction_segment_durable_v2(
+            dir.path(),
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+            &wrapper.wrapper_digest(),
+        )
+        .unwrap();
+        assert!(published.newly_published);
+        let compaction_dir = dir
+            .path()
+            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+        let segment = compaction_dir
+            .join(xai_chat_state::compaction_transcript::segment_filename(published.index));
+        let markdown = std::fs::read_to_string(&segment).unwrap();
+        assert!(
+            markdown.contains(&format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{}", wrapper.checkpoint_id)),
+            "published segment carries the checkpoint marker"
+        );
+        // Staging is consumed and the publish is idempotent.
+        assert!(!segment_staging_path(dir.path(), &wrapper.checkpoint_id)
+            .unwrap()
+            .exists());
+        let again = publish_staged_compaction_segment_durable_v2(
+            dir.path(),
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+            &wrapper.wrapper_digest(),
+        )
+        .unwrap();
+        assert!(!again.newly_published);
+        assert_eq!(again.index, published.index);
+    }
+
+    #[test]
+    fn publish_v2_rejects_operation_or_digest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture(&portable, None);
+        let staging = staging_fixture(&wrapper);
+        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
+
+        let wrong_operation = publish_staged_compaction_segment_durable_v2(
+            dir.path(),
+            &wrapper.checkpoint_id,
+            "op-forged",
+            &wrapper.wrapper_digest(),
+        )
+        .unwrap_err();
+        assert_eq!(wrong_operation.kind(), io::ErrorKind::InvalidData);
+        let wrong_digest = publish_staged_compaction_segment_durable_v2(
+            dir.path(),
+            &wrapper.checkpoint_id,
+            &wrapper.operation_id,
+            "deadbeef",
+        )
+        .unwrap_err();
+        assert_eq!(wrong_digest.kind(), io::ErrorKind::InvalidData);
+        // Staging survived both rejected publishes.
+        assert!(segment_staging_path(dir.path(), &wrapper.checkpoint_id)
+            .unwrap()
+            .exists());
     }
 }

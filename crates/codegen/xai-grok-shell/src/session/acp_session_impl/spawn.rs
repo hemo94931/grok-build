@@ -1606,6 +1606,7 @@ pub(crate) async fn spawn_session_actor(
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
