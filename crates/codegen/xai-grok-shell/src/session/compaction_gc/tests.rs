@@ -19,6 +19,78 @@ use crate::session::storage::responses_compaction::{
     write_history_v2_durable,
 };
 
+/// Write a fully valid V3 sidecar for `checkpoint_id` with an optional
+/// recompact `prior` link, returning the wrapper. Used to exercise the
+/// transitive prior-chain closure with real schema-3 data.
+fn write_v3_sidecar(
+    session_dir: &Path,
+    checkpoint_id: &str,
+    prior: Option<&str>,
+) -> xai_grok_sampling_types::ServerResponsesCheckpointV2 {
+    use xai_grok_sampling_types::{
+        CheckpointIdentityV2, CheckpointReplayMaterialV2, RESPONSES_COMPACTION_CONTRACT_V2,
+        TrustedPromptEnvelopeV2,
+    };
+    let portable = portable_fixture();
+    let digest = portable_history_digest(&portable).unwrap();
+    let wrapper = xai_grok_sampling_types::ServerResponsesCheckpointV2 {
+        schema_version: xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2,
+        checkpoint_id: checkpoint_id.into(),
+        operation_id: format!("op-{checkpoint_id}"),
+        prompt_index: 3,
+        created_at: chrono::Utc::now(),
+        auto_continue: false,
+        mode: ResponsesCompactionModeV1 {
+            name: "default".into(),
+            detail: None,
+        },
+        branch_id: "branch-1".into(),
+        identity: CheckpointIdentityV2 {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: RESPONSES_COMPACTION_CONTRACT_V2.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: prior.map(str::to_owned),
+            cache_route_fingerprint: None,
+        },
+        output: vec![serde_json::json!({"type": "compaction", "encrypted_content": "opaque"})],
+        portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
+        portable_history_sha256: digest,
+        portable_history_bytes: 128,
+        checkpoint_token_seed: 42,
+        token_seed_source: TokenSeedSource::UsageOutputTokens,
+        server_output_item_count: 1,
+        prior_checkpoint_id: prior.map(str::to_owned),
+        memory_revision: None,
+    };
+    let envelope = TrustedPromptEnvelopeV2 {
+        base_instructions_sha256: "base-hash".into(),
+        memory_revision: None,
+        envelope_fingerprint: "envelope-fp".into(),
+        wire_prompt_sha256: "wire-hash".into(),
+    };
+    let material = CheckpointReplayMaterialV2::try_new(&wrapper, envelope, &portable).unwrap();
+    let sidecar = crate::session::storage::responses_compaction::CompactionCheckpointFileV3::new(
+        wrapper.clone(),
+        material,
+        portable,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    crate::session::storage::responses_compaction::write_checkpoint_v3_durable(
+        session_dir,
+        &wrapper.portable_history_path,
+        &sidecar,
+    )
+    .unwrap();
+    wrapper
+}
+
 const SESSION_ID: &str = "gc-test";
 
 fn portable_fixture() -> Vec<ConversationItem> {
@@ -206,8 +278,9 @@ async fn sidecar_referenced_by_marker_is_retained() {
 #[tokio::test]
 async fn marker_prior_checkpoint_chain_is_retained() {
     let tmp = TempDir::new().unwrap();
-    write_orphan(tmp.path(), "cp-latest", b"{}");
-    write_orphan(tmp.path(), "cp-prior", b"{}");
+    // Referenced on-disk sidecars must be schema-valid (see above).
+    write_orphan(tmp.path(), "cp-latest", br#"{"schema_version":2}"#);
+    write_orphan(tmp.path(), "cp-prior", br#"{"schema_version":2}"#);
     // Marker for cp-latest links back to cp-prior (recompact chain).
     let mut marker = marker_for_wrapper(&wrapper_fixture("cp-latest"));
     marker.prior_checkpoint_id = Some("cp-prior".into());
@@ -219,6 +292,61 @@ async fn marker_prior_checkpoint_chain_is_retained() {
     assert!(tmp.path().join(CHECKPOINT_DIR).join("cp-latest.json").exists());
     assert!(tmp.path().join(CHECKPOINT_DIR).join("cp-prior.json").exists());
     assert_eq!(report.deleted_bytes, 0);
+}
+
+#[tokio::test]
+async fn prior_chain_transitive_closure_retains_grandparent() {
+    // Marker only references the head of the recompact chain; the
+    // grandparent sidecar is reachable ONLY by walking V3 sidecar prior
+    // links. Without the transitive closure, cp-c would be deleted.
+    let tmp = TempDir::new().unwrap();
+    write_v3_sidecar(tmp.path(), "cp-a", Some("cp-b"));
+    write_v3_sidecar(tmp.path(), "cp-b", Some("cp-c"));
+    write_v3_sidecar(tmp.path(), "cp-c", None);
+    write_orphan(tmp.path(), "cp-orphan", b"{}");
+    let mut marker = marker_for_wrapper(&wrapper_fixture("cp-a"));
+    marker.schema_version = 3;
+    write_updates(tmp.path(), &[xai(XaiSessionUpdate::CompactionCheckpoint(
+        Box::new(marker),
+    ))]);
+
+    let report = gc(tmp.path(), Duration::ZERO).await;
+    assert!(tmp.path().join(CHECKPOINT_DIR).join("cp-a.json").exists());
+    assert!(tmp.path().join(CHECKPOINT_DIR).join("cp-b.json").exists());
+    assert!(
+        tmp.path().join(CHECKPOINT_DIR).join("cp-c.json").exists(),
+        "grandparent sidecar must survive via the transitive prior chain"
+    );
+    assert!(!tmp.path().join(CHECKPOINT_DIR).join("cp-orphan.json").exists());
+    assert_eq!(report.files_deleted, 1);
+}
+
+#[tokio::test]
+async fn corrupt_v3_sidecar_aborts_gc() {
+    let tmp = TempDir::new().unwrap();
+    write_v3_sidecar(tmp.path(), "cp-a", Some("cp-b"));
+    let path = tmp.path().join(CHECKPOINT_DIR).join("cp-a.json");
+    std::fs::write(&path, b"{not json").unwrap();
+    write_orphan(tmp.path(), "cp-orphan", b"{}");
+    let mut marker = marker_for_wrapper(&wrapper_fixture("cp-a"));
+    marker.schema_version = 3;
+    write_updates(tmp.path(), &[xai(XaiSessionUpdate::CompactionCheckpoint(
+        Box::new(marker),
+    ))]);
+
+    let result = gc_session_compaction_artifacts(
+        tmp.path(),
+        GcOptions {
+            grace_period: Duration::ZERO,
+            dry_run: false,
+        },
+    )
+    .await;
+    assert!(result.is_err(), "corrupt chain sidecar must abort the GC");
+    assert!(
+        tmp.path().join(CHECKPOINT_DIR).join("cp-orphan.json").exists(),
+        "an aborted GC deletes nothing"
+    );
 }
 
 #[tokio::test]
@@ -395,7 +523,9 @@ async fn unknown_and_non_json_files_are_skipped_and_retained() {
 #[tokio::test]
 async fn published_segment_marker_retains_its_checkpoint() {
     let tmp = TempDir::new().unwrap();
-    write_orphan(tmp.path(), "cp-published", b"{}");
+    // Referenced on-disk sidecars must be schema-valid (the prior-chain
+    // walk aborts on unknown schema); genuine orphans are never walked.
+    write_orphan(tmp.path(), "cp-published", br#"{"schema_version":2}"#);
     write_orphan(tmp.path(), "cp-orphan", b"{}");
     let compaction_dir = tmp.path().join("compaction");
     std::fs::create_dir_all(&compaction_dir).unwrap();

@@ -256,6 +256,14 @@ impl ResponsesCheckpointRef<'_> {
         }
     }
 
+    /// Recompact chain link (V2 only; V1 has no chain concept).
+    pub fn prior_checkpoint_id(&self) -> Option<&str> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(wrapper) => wrapper.prior_checkpoint_id.as_deref(),
+        }
+    }
+
     pub fn schema_version(&self) -> u8 {
         match self {
             Self::V1(wrapper) => wrapper.schema_version,

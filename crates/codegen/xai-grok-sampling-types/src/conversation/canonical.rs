@@ -101,18 +101,24 @@ impl CanonicalResponsesContext {
 }
 
 /// Normalize a base URL for cache routing: lowercase scheme + authority,
-/// default ports elided, **no path** — `/responses` and
-/// `/responses/compact` on the same deployment MUST share a cache route.
+/// default ports elided, deployment/account path components preserved
+/// (path-addressed deployments on one host must NOT collapse onto one
+/// cache route), with only the concrete `/responses` and
+/// `/responses/compact` endpoint suffixes stripped so compact and
+/// post-compact share a route.
 pub fn normalize_base_url_for_routing(base_url: &str) -> String {
-    let trimmed = base_url.trim();
+    let trimmed = base_url.trim().trim_end_matches('/');
     let (scheme, rest) = match trimmed.split_once("://") {
         Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
         None => ("https".to_string(), trimmed),
     };
-    let authority = rest
-        .split(['/', '?', '#'])
+    let mut parts = rest.splitn(2, '/');
+    let authority = parts
         .next()
         .unwrap_or(rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
         .to_ascii_lowercase();
     let authority = authority
         .strip_suffix(":443")
@@ -120,7 +126,19 @@ pub fn normalize_base_url_for_routing(base_url: &str) -> String {
         .or_else(|| authority.strip_suffix(":80").filter(|_| scheme == "http"))
         .unwrap_or(&authority)
         .to_string();
-    format!("{scheme}://{authority}")
+    let path = parts.next().unwrap_or_default().trim_end_matches('/');
+    // Strip only the concrete endpoint suffixes; keep deployment/account
+    // prefixes (e.g. `/v1`, `/deployments/prod`) in the route.
+    let path = path
+        .strip_suffix("responses/compact")
+        .or_else(|| path.strip_suffix("responses"))
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    if path.is_empty() {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}/{path}")
+    }
 }
 
 /// The cache family a model belongs to. Providers route caches per model
@@ -233,9 +251,10 @@ mod tests {
 
     #[test]
     fn base_url_normalization_strips_paths_and_default_ports() {
+        // Concrete endpoint suffixes collapse onto the deployment route.
         assert_eq!(
             normalize_base_url_for_routing("https://api.x.ai/v1/responses"),
-            "https://api.x.ai"
+            "https://api.x.ai/v1"
         );
         assert_eq!(
             normalize_base_url_for_routing("HTTPS://API.X.AI:443/responses/compact"),
@@ -243,11 +262,16 @@ mod tests {
         );
         assert_eq!(
             normalize_base_url_for_routing("http://localhost:8080/v1"),
-            "http://localhost:8080"
+            "http://localhost:8080/v1"
         );
         assert_eq!(
             normalize_base_url_for_routing("api.example.com/"),
             "https://api.example.com"
+        );
+        // Path-addressed deployments stay distinct cache routes.
+        assert_ne!(
+            normalize_base_url_for_routing("https://proxy.example.com/accounts/a"),
+            normalize_base_url_for_routing("https://proxy.example.com/accounts/b")
         );
     }
 

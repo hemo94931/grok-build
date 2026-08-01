@@ -323,6 +323,11 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
                 storage::responses_compaction::PersistedChatEntry::Legacy(item) => {
                     if let Some(reference) = item.as_responses_checkpoint() {
                         ids.insert(reference.checkpoint_id().to_string());
+                        if let Some(prior) = reference.prior_checkpoint_id() {
+                            // The live wrapper's own recompact chain link:
+                            // its prior sidecar stays reachable.
+                            ids.insert(prior.to_string());
+                        }
                         if let Some(file_name) = Path::new(reference.portable_history_path())
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
@@ -345,7 +350,10 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
     let compaction_dir = session_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
     let entries = match std::fs::read_dir(&compaction_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((ids, files)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            walk_prior_chain_closure(session_dir, &mut ids)?;
+            return Ok((ids, files));
+        }
         Err(error) => return Err(error),
     };
     for entry in entries {
@@ -370,7 +378,65 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
             ids.insert(id.to_string());
         }
     }
+    // Transitive prior-chain closure: walk every reachable V3 sidecar's
+    // `prior_checkpoint_id` so the whole recompact ancestry of a reachable
+    // checkpoint stays retained.
+    walk_prior_chain_closure(session_dir, &mut ids)?;
     Ok((ids, files))
+}
+
+/// Transitive prior-chain closure over V3 sidecars. A missing sidecar ends
+/// that chain branch (already gone — nothing to retain); a corrupt V3
+/// sidecar or an unknown schema aborts the GC (an incomplete reference set
+/// must never authorize a deletion).
+fn walk_prior_chain_closure(session_dir: &Path, ids: &mut BTreeSet<String>) -> io::Result<()> {
+    let mut frontier: Vec<String> = ids.iter().cloned().collect();
+    let mut walked = BTreeSet::new();
+    while let Some(id) = frontier.pop() {
+        if !walked.insert(id.clone()) {
+            continue;
+        }
+        let path = session_dir
+            .join(CHECKPOINT_DIR)
+            .join(format!("{id}.json"));
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt checkpoint sidecar {}: {error}", path.display()),
+            )
+        })?;
+        match value.get("schema_version").and_then(serde_json::Value::as_u64) {
+            Some(3) => {
+                let v3: storage::responses_compaction::CompactionCheckpointFileV3 =
+                    serde_json::from_value(value).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("corrupt V3 checkpoint sidecar {}: {error}", path.display()),
+                        )
+                    })?;
+                if let Some(prior) = v3.wrapper.prior_checkpoint_id
+                    && ids.insert(prior.clone())
+                {
+                    frontier.push(prior);
+                }
+            }
+            // V2 sidecars predate the recompact chain: no prior links.
+            Some(2) => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unknown checkpoint sidecar schema {other:?} at {}; refusing to GC",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn first_line(path: &Path) -> io::Result<String> {

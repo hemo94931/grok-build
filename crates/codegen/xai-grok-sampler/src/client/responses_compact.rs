@@ -186,13 +186,17 @@ impl ResponsesCompactRequest {
                 .filter(|value| !value.as_array().is_some_and(Vec::is_empty))
                 .cloned()
         };
+        // `parallel_tool_calls` must be explicit on the resolved body
+        // (plan 阶段 6: never `unwrap_or(true)`); a missing or non-boolean
+        // value means the canonical context did not provide it — reject.
+        let parallel_tool_calls = body
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?;
         Ok(Self {
             model,
             input,
-            parallel_tool_calls: body
-                .get("parallel_tool_calls")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            parallel_tool_calls,
             instructions: string_field("instructions"),
             tools: optional_value("tools"),
             reasoning: optional_value("reasoning"),

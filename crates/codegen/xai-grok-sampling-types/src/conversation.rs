@@ -778,6 +778,12 @@ pub struct ConversationRequest {
     pub prompt_cache_retention: Option<String>,
     /// Provider service tier, passed through without inventing defaults.
     pub service_tier: Option<String>,
+    /// Explicit parallel-tool-calls flag for canonical-envelope request
+    /// kinds (compact/recompact per plan 阶段 6: "never `unwrap_or(true)`;
+    /// must be provided by the canonical context explicitly"). Absent on
+    /// ordinary requests so their wire shape is unchanged; compact-bound
+    /// requests set it explicitly and the compact constructors require it.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// A provider-visible request contains an invalid local checkpoint layout.

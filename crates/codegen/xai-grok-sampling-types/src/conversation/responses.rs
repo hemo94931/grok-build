@@ -297,6 +297,9 @@ impl FinalResponsesRequest {
         if let Some(value) = request.service_tier.clone() {
             body["service_tier"] = serde_json::Value::String(value);
         }
+        if let Some(value) = request.parallel_tool_calls {
+            body["parallel_tool_calls"] = serde_json::Value::Bool(value);
+        }
 
         let extra_tools = extra_tool_entries(&request.hosted_tools);
         if !extra_tools.is_empty() {

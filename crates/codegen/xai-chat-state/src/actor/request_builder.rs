@@ -181,6 +181,7 @@ impl ChatStateActor {
             prompt_cache_options: None,
             prompt_cache_retention: None,
             service_tier: None,
+            parallel_tool_calls: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }

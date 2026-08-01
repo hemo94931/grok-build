@@ -1482,7 +1482,7 @@ impl SessionActor {
         if sampling.api_backend != ApiBackend::Responses {
             return Ok(None);
         }
-        let request = match normal_request {
+        let mut request = match normal_request {
             Some(request) => request.clone(),
             None => {
                 let tool_definitions = self.prepare_tool_definitions().await;
@@ -1514,6 +1514,31 @@ impl SessionActor {
                 request
             }
         };
+
+        // Canonical-envelope explicit value (plan 阶段 6): compact-bound
+        // requests carry parallel_tool_calls explicitly; the compact
+        // constructors reject a missing value instead of inventing one.
+        request.parallel_tool_calls = Some(true);
+        // V2 recompact (plan RecompactV2): a live V2 wrapper must go
+        // through the gate-verified replay constructor
+        // (`ResolvedCompactRequest::from_validated_recompact`), never the
+        // V1 flattening body builder (which rejects V2 wrappers).
+        let v2_writer_active = crate::session::responses_server_compaction::
+            v2_server_compaction_writers_enabled()
+            && crate::session::responses_server_compaction::v2_writer_cohort_allows(
+                &self.session_info.id.to_string(),
+            )
+            && self.agent.borrow().compaction_policy().server_compaction;
+        if v2_writer_active
+            && matches!(
+                request.items.first(),
+                Some(ConversationItem::ResponsesCompactionCheckpointV2(_))
+            )
+        {
+            return self
+                .prepare_server_request_v2(user_context, request, trigger, cancellation)
+                .await;
+        }
 
         let request_history_revision = request.history_revision.ok_or_else(|| {
             acp::Error::internal_error().data("responses_compaction_missing_request_revision")
@@ -1560,7 +1585,10 @@ impl SessionActor {
         // fingerprint. The gate binds the same struct (fingerprint
         // included), so writer and gate identities agree on the next turn.
         let trusted_envelope_v2 = self.current_trusted_envelope_v2(&request)?;
-        let prior_checkpoint_id = match portable_history.first() {
+        // Recompact chain link: read the LIVE wrapper from the typed
+        // request items — `portable_history` has the checkpoint expanded
+        // away, so reading it there would always yield None.
+        let prior_checkpoint_id = match request.items.first() {
             Some(ConversationItem::ResponsesCompactionCheckpointV2(wrapper)) => {
                 Some(wrapper.checkpoint_id.clone())
             }
@@ -1577,20 +1605,21 @@ impl SessionActor {
             prompt_envelope_fingerprint: trusted_envelope_v2.envelope_fingerprint.clone(),
             base_instructions_sha256: trusted_envelope_v2.base_instructions_sha256.clone(),
             prior_checkpoint_id: prior_checkpoint_id.clone(),
-            cache_route_fingerprint: cache_routing
-                .as_ref()
-                .map(|routing| routing.route_fingerprint().to_string()),
+            cache_route_fingerprint: Some(
+                xai_grok_sampling_types::cache_route_fingerprint(
+                    &identity.provider_id,
+                    &xai_grok_sampling_types::normalize_base_url_for_routing(
+                        &full_config.base_url,
+                    ),
+                    &xai_grok_sampling_types::model_cache_family(&routing_model),
+                    &identity.auth_principal_fingerprint,
+                ),
+            ),
         };
         // Variant-aware binding: with the V2 writer active for a live V2
         // checkpoint, bind the V2 writer identity so the healthy session
         // stays `Replayable` (the V1 identity would classify it
         // `InvalidCheckpoint` and force a builtin migration).
-        let v2_writer_active = crate::session::responses_server_compaction::
-            v2_server_compaction_writers_enabled()
-            && crate::session::responses_server_compaction::v2_writer_cohort_allows(
-                &self.session_info.id.to_string(),
-            )
-            && self.agent.borrow().compaction_policy().server_compaction;
         let bound_identity = if v2_writer_active
             && matches!(
                 request.items.first(),
@@ -1638,29 +1667,43 @@ impl SessionActor {
         let compact_request = {
             // Stage-D3 canonical constructor: build the context from the
             // TYPED request items (source-aware), never by scanning the
-            // flattened body's system roles. BaseInstructions and legacy
-            // unclassified system items form the base; MemoryContext items
-            // go to the separate memory slot; Runtime system reminders are
-            // per-request ephemera and never enter compact instructions.
+            // flattened body's system roles. Base instructions come only
+            // from `BaseInstructions` items (plus a LEADING legacy
+            // unclassified system — the classic base position in pre-D1c
+            // histories); memory comes only from `MemoryContext` items.
+            // `Runtime` reminders are per-request ephemera and never enter
+            // compact instructions. Any other system item (e.g. a
+            // mid-conversation legacy system) is left in the compact input,
+            // where the constructor rejects it — failing closed to builtin
+            // compaction instead of silently promoting ambiguous content
+            // into top-level instructions.
             let mut base_instruction_parts = Vec::new();
             let mut memory_context_parts = Vec::new();
+            let mut leading_position = true;
             for item in &request.items {
                 let ConversationItem::System(system) = item else {
+                    leading_position = false;
                     continue;
                 };
+                let is_leading = leading_position;
+                leading_position = false;
                 let content = system.content.trim();
                 if content.is_empty() {
                     continue;
                 }
                 match system.source {
-                    xai_grok_sampling_types::SystemSource::BaseInstructions
-                    | xai_grok_sampling_types::SystemSource::LegacyUnclassified => {
+                    xai_grok_sampling_types::SystemSource::BaseInstructions => {
+                        base_instruction_parts.push(content.to_owned());
+                    }
+                    xai_grok_sampling_types::SystemSource::LegacyUnclassified
+                        if is_leading =>
+                    {
                         base_instruction_parts.push(content.to_owned());
                     }
                     xai_grok_sampling_types::SystemSource::MemoryContext => {
                         memory_context_parts.push(content.to_owned());
                     }
-                    xai_grok_sampling_types::SystemSource::Runtime => {}
+                    _ => {}
                 }
             }
             if let Some(instructions) = string_field("instructions") {
@@ -1763,6 +1806,219 @@ impl SessionActor {
                     .as_ref()
                     .map(|routing| routing.prompt_cache_key()),
                 prompt_cache_options: body.get("prompt_cache_options").cloned(),
+                prompt_cache_retention: string_field("prompt_cache_retention"),
+                service_tier: string_field("service_tier"),
+                semantic_envelope,
+                semantic_envelope_tokens,
+                identity,
+                identity_v2,
+                trusted_envelope_v2,
+                request_bytes,
+                trigger,
+                mode: self.responses_mode_metadata(),
+                user_context: user_context.map(str::to_owned),
+                cancellation,
+            },
+            client,
+            request: compact_request,
+            capability_key,
+            checkpoint_status: binding.checkpoint_status,
+        }))
+    }
+
+    /// V2 recompact preparation (plan RecompactV2): a live V2 wrapper goes
+    /// through the gate-verified replay constructor. The binding must be
+    /// `Replayable` and the V3 sidecar proof must verify before any compact
+    /// request is built; anything else returns `Ok(None)` so the caller
+    /// falls back to builtin compaction (the continuity migration).
+    async fn prepare_server_request_v2(
+        &self,
+        user_context: Option<&str>,
+        mut request: ConversationRequest,
+        trigger: xai_grok_telemetry::events::CompactionTrigger,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<PreparedServerRequest>, acp::Error> {
+        let Some(ConversationItem::ResponsesCompactionCheckpointV2(wrapper)) =
+            request.items.first().cloned()
+        else {
+            return Ok(None);
+        };
+        let request_history_revision = request.history_revision.ok_or_else(|| {
+            acp::Error::internal_error().data("responses_compaction_missing_request_revision")
+        })?;
+        let full_config = self.reconstruct_full_config().await;
+        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
+            .map_err(|error| self.to_acp_error(error))?;
+        let Some((credential, principal)) = self.compact_credential(&full_config) else {
+            return Ok(None);
+        };
+        let endpoint_fingerprint = client.responses_compact_endpoint_fingerprint();
+        let portable_history = self
+            .portable_history_for_request(&request.items)
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let routing_model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| full_config.model.clone());
+        let cache_routing = self.cache_routing_for_config(&full_config, &routing_model);
+        let trusted_envelope_v2 = self.current_trusted_envelope_v2(&request)?;
+        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
+            "xai".to_string()
+        } else {
+            "openai_compatible".to_string()
+        };
+        let identity_v2 = xai_grok_sampling_types::CheckpointIdentityV2 {
+            provider_id: provider_id.clone(),
+            api: "responses".into(),
+            endpoint_fingerprint: endpoint_fingerprint.clone(),
+            model: routing_model.clone(),
+            auth_principal_fingerprint: principal.clone(),
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2
+                .to_string(),
+            prompt_envelope_fingerprint: trusted_envelope_v2.envelope_fingerprint.clone(),
+            base_instructions_sha256: trusted_envelope_v2.base_instructions_sha256.clone(),
+            prior_checkpoint_id: Some(wrapper.checkpoint_id.clone()),
+            // Deterministic route fingerprint (no namespace-file I/O) — must
+            // agree byte-for-byte with the gate identity (full-struct compare).
+            cache_route_fingerprint: Some(
+                xai_grok_sampling_types::cache_route_fingerprint(
+                    &provider_id,
+                    &xai_grok_sampling_types::normalize_base_url_for_routing(
+                        &full_config.base_url,
+                    ),
+                    &xai_grok_sampling_types::model_cache_family(&routing_model),
+                    &principal,
+                ),
+            ),
+        };
+        let bound = self
+            .chat_state_handle
+            .bind_request_identity_at_revision(
+                xai_grok_sampling_types::CheckpointIdentity::V2(identity_v2.clone()),
+                request_history_revision,
+            )
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        let (binding, state) = match bound {
+            xai_chat_state::RequestIdentityBindResult::Bound {
+                binding,
+                compaction_snapshot,
+            } => (binding, *compaction_snapshot),
+            xai_chat_state::RequestIdentityBindResult::StaleHistory { .. } => {
+                return Err(acp::Error::internal_error().data("responses_compaction_stale_request"));
+            }
+        };
+        if !matches!(
+            binding.checkpoint_status,
+            xai_chat_state::CheckpointReplayStatus::Replayable
+        ) {
+            // Not replayable => the caller falls back to builtin compaction,
+            // which is the continuity migration for this checkpoint.
+            return Ok(None);
+        }
+        // Gate-grade proof: bind the V3 sidecar to the live wrapper and
+        // verify the full replay material before building any request.
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let sidecar = crate::session::storage::responses_compaction::read_checkpoint_for_wrapper_v2(
+            &session_dir,
+            &wrapper,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let replay = xai_grok_sampling_types::ValidatedResponsesReplayV2::verify(
+            &wrapper,
+            &sidecar.replay_material,
+            &sidecar.portable_history,
+            &trusted_envelope_v2,
+            &request.items[1..],
+            request_history_revision,
+            binding.request_identity_generation,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        // Wire instructions: base + separator + current memory (the replay
+        // constructor reads them from the request).
+        request.instructions = Some(self.current_wire_instructions_v2(&request).await);
+        let resolved = xai_grok_sampling_types::ResolvedCompactRequest::from_validated_recompact(
+            &replay,
+            &request,
+            user_context,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let final_body = resolved.body().clone();
+        let compact_request =
+            xai_grok_sampler::ResponsesCompactRequest::from_resolved(&resolved)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+                .with_correlation(xai_grok_sampler::CompactCorrelationHeaders {
+                    conversation_id: request.x_grok_conv_id.clone(),
+                    request_id: request.x_grok_req_id.clone(),
+                    session_id: request.x_grok_session_id.clone(),
+                    turn_index: request.x_grok_turn_idx.clone(),
+                    agent_id: request.x_grok_agent_id.clone(),
+                    deployment_id: request.x_grok_deployment_id.clone(),
+                    user_id: request.x_grok_user_id.clone(),
+                });
+        let request_bytes = compact_request.to_bounded_bytes().map_err(|error| {
+            let reason =
+                if error.failure() == xai_grok_sampler::ResponsesCompactFailure::RequestTooLarge {
+                    "responses_compaction_request_too_large"
+                } else {
+                    "responses_compaction_request_build_failed"
+                };
+            acp::Error::internal_error().data(reason)
+        })?;
+        // The V1-shaped identity is retained on the snapshot for capability
+        // caching and telemetry; the contract version marks it V2.
+        let mut identity =
+            crate::session::responses_server_compaction::build_checkpoint_identity_with_projection(
+                &provider_id,
+                &endpoint_fingerprint,
+                &principal,
+                &final_body,
+                None,
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        identity.contract_version =
+            xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2.to_string();
+        let (_, semantic_envelope) =
+            crate::session::responses_server_compaction::canonical_prompt_envelope(&final_body)
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let semantic_envelope_tokens = crate::session::responses_server_compaction::prompt_envelope_token_estimate_with_projection(
+            &final_body,
+            None,
+        )
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let input = final_body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let string_field = |name: &str| {
+            final_body
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let capability_key = crate::session::responses_server_compaction::CapabilityKey {
+            endpoint_fingerprint,
+            model: identity.model.clone(),
+            auth_principal_fingerprint: principal,
+            contract_version: identity.contract_version.clone(),
+        };
+        Ok(Some(PreparedServerRequest {
+            snapshot: crate::session::responses_server_compaction::ResponsesRequestSnapshot {
+                chat_revision: state.history_revision,
+                request_identity_generation: binding.request_identity_generation,
+                prompt_index: state.prompt_index,
+                pre_compaction_tokens: state.total_tokens,
+                final_request: final_body.clone(),
+                credential,
+                model: identity.model.clone(),
+                input,
+                portable_history,
+                instructions: string_field("instructions"),
+                prompt_cache_key: cache_routing
+                    .as_ref()
+                    .map(|routing| routing.prompt_cache_key()),
+                prompt_cache_options: final_body.get("prompt_cache_options").cloned(),
                 prompt_cache_retention: string_field("prompt_cache_retention"),
                 service_tier: string_field("service_tier"),
                 semantic_envelope,
@@ -2098,19 +2354,21 @@ impl SessionActor {
             return Ok(CheckpointGateOutcome::resubmit());
         };
         let current_envelope = self.current_trusted_envelope_v2(request)?;
+        let gate_model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| full_config.model.clone());
+        let gate_provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
+            "xai".to_string()
+        } else {
+            "openai_compatible".to_string()
+        };
         let identity = xai_grok_sampling_types::CheckpointIdentityV2 {
-            provider_id: if crate::util::is_xai_api_url(&full_config.base_url) {
-                "xai".to_string()
-            } else {
-                "openai_compatible".to_string()
-            },
+            provider_id: gate_provider_id.clone(),
             api: "responses".to_string(),
             endpoint_fingerprint: client.responses_compact_endpoint_fingerprint(),
-            model: request
-                .model
-                .clone()
-                .unwrap_or_else(|| full_config.model.clone()),
-            auth_principal_fingerprint: principal,
+            model: gate_model.clone(),
+            auth_principal_fingerprint: principal.clone(),
             contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2
                 .to_string(),
             prompt_envelope_fingerprint: current_envelope.envelope_fingerprint.clone(),
@@ -2118,20 +2376,22 @@ impl SessionActor {
             prior_checkpoint_id: wrapper.prior_checkpoint_id.clone(),
             // The chat-state binding compares the FULL `CheckpointIdentityV2`
             // struct, so the gate identity must reproduce the writer's value
-            // byte-for-byte: same model source
-            // (`request.model.unwrap_or_else(|| full_config.model)`) and the
-            // same best-effort routing acquisition (None when the credential
-            // or namespace file is unavailable — the writer degrades the
-            // same way, so both sides still agree).
-            cache_route_fingerprint: self
-                .cache_routing_for_config(
-                    full_config,
-                    &request
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| full_config.model.clone()),
-                )
-                .map(|routing| routing.route_fingerprint().to_string()),
+            // byte-for-byte. The fingerprint is derived deterministically
+            // from the captured route components (same model/provider/base
+            // URL/principal sources as the writer) — never through
+            // best-effort namespace-file I/O, whose transient failure would
+            // flip the identity between None and Some and invalidate the
+            // checkpoint.
+            cache_route_fingerprint: Some(
+                xai_grok_sampling_types::cache_route_fingerprint(
+                    &gate_provider_id,
+                    &xai_grok_sampling_types::normalize_base_url_for_routing(
+                        &full_config.base_url,
+                    ),
+                    &xai_grok_sampling_types::model_cache_family(&gate_model),
+                    &principal,
+                ),
+            ),
         };
         let binding = match self
             .chat_state_handle
@@ -3225,17 +3485,23 @@ impl SessionActor {
         // Stage D1b: V1 server compaction writers are disabled globally —
         // new unsafe checkpoints must not be produced. The server attempt
         // only proceeds for integration harnesses that opt in via
-        // `GROK_RESPONSES_V1_SERVER_COMPACTION`.
+        // `GROK_RESPONSES_V1_SERVER_COMPACTION`. When the global V2 writer
+        // flag is enabled, V1 is suppressed entirely: sessions outside the
+        // V2 cohort must fall back to builtin compaction rather than
+        // producing new unsafe V1 checkpoints.
+        let v2_writer_flag_on =
+            crate::session::responses_server_compaction::v2_server_compaction_writers_enabled();
         let server_enabled = matches!(strategy, CompactionStrategy::ServerFirst)
             && crate::session::responses_server_compaction::v1_server_compaction_writers_enabled()
+            && !v2_writer_flag_on
             && self.agent.borrow().compaction_policy().server_compaction
             && migration_reason.is_none();
         // Stage D4 (plan 阶段 5b): V2 server compaction writers, rollout
-        // gated by a session-hash cohort (`GROK_V2_WRITER_PERCENT`). When
-        // both V1 and V2 writer flags are enabled, the V2 branch below wins
-        // (V1 is legacy). Both default OFF => builtin-only, unchanged.
+        // gated by a session-hash cohort (`GROK_V2_WRITER_PERCENT`). With
+        // the V1-suppression rule above, V2 always wins when both flags
+        // are enabled. Both default OFF => builtin-only, unchanged.
         let v2_server_enabled = matches!(strategy, CompactionStrategy::ServerFirst)
-            && crate::session::responses_server_compaction::v2_server_compaction_writers_enabled()
+            && v2_writer_flag_on
             && crate::session::responses_server_compaction::v2_writer_cohort_allows(
                 &self.session_info.id.to_string(),
             )
