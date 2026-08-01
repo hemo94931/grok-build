@@ -493,6 +493,25 @@ pub struct CheckpointRecoveryMigration {
     pub tokens_after: u64,
 }
 
+/// Observed prompt-cache behavior per request kind (stage D3). Provider
+/// cache capability (`compact_seeds_prompt_cache`) has no reliable static
+/// signal, so it is recorded observationally per normalized
+/// deployment + model family: the first post-compact request is the
+/// hard-gate signal only once the capability is configured or stably
+/// observed.
+#[derive(Serialize)]
+pub struct PromptCacheObservation {
+    pub provider_id: String,
+    /// Normalized deployment fingerprint (base URL + principal, no path).
+    pub deployment_fingerprint: String,
+    pub model_cache_family: String,
+    /// `normal` | `post_compact_first` | `post_compact_subsequent` | `compact` | `aux`
+    pub request_kind: &'static str,
+    pub prompt_cache_key_present: bool,
+    pub cached_tokens: u64,
+    pub prompt_tokens: u64,
+}
+
 /// Metadata-only strategy attempt for standalone Responses compaction.
 /// Deliberately excludes endpoint/auth identity digests and all wire content.
 #[derive(Serialize)]
@@ -1759,6 +1778,7 @@ telemetry_event!(CompactionTriggered, "compaction_triggered");
 telemetry_event!(CompactionStrategyAttempt, "compaction_strategy_attempt");
 telemetry_event!(CheckpointRecoveryScan, "checkpoint_recovery_scan");
 telemetry_event!(CheckpointRecoveryMigration, "checkpoint_recovery_migration");
+telemetry_event!(PromptCacheObservation, "prompt_cache_observation");
 telemetry_event!(
     CompactionCompleted,
     "compaction_completed",

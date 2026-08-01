@@ -1162,7 +1162,7 @@ impl SessionActor {
         Ok(projection)
     }
 
-    fn compact_credential(
+    pub(crate) fn compact_credential(
         &self,
         config: &xai_grok_sampler::SamplerConfig,
     ) -> Option<(xai_grok_sampler::RequestCredentialSnapshot, String)> {
@@ -1585,18 +1585,101 @@ impl SessionActor {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         };
-        let compact_request =
-            xai_grok_sampler::ResponsesCompactRequest::from_final(&final_request, user_context)
-                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
-                .with_correlation(xai_grok_sampler::CompactCorrelationHeaders {
-                    conversation_id: request.x_grok_conv_id.clone(),
-                    request_id: request.x_grok_req_id.clone(),
-                    session_id: request.x_grok_session_id.clone(),
-                    turn_index: request.x_grok_turn_idx.clone(),
-                    agent_id: request.x_grok_agent_id.clone(),
-                    deployment_id: request.x_grok_deployment_id.clone(),
-                    user_id: request.x_grok_user_id.clone(),
-                });
+        let compact_request = {
+            // Stage-D3 canonical constructor: build the context from the
+            // TYPED request items (source-aware), never by scanning the
+            // flattened body's system roles. BaseInstructions and legacy
+            // unclassified system items form the base; MemoryContext items
+            // go to the separate memory slot; Runtime system reminders are
+            // per-request ephemera and never enter compact instructions.
+            let mut base_instruction_parts = Vec::new();
+            let mut memory_context_parts = Vec::new();
+            for item in &request.items {
+                let ConversationItem::System(system) = item else {
+                    continue;
+                };
+                let content = system.content.trim();
+                if content.is_empty() {
+                    continue;
+                }
+                match system.source {
+                    xai_grok_sampling_types::SystemSource::BaseInstructions
+                    | xai_grok_sampling_types::SystemSource::LegacyUnclassified => {
+                        base_instruction_parts.push(content.to_owned());
+                    }
+                    xai_grok_sampling_types::SystemSource::MemoryContext => {
+                        memory_context_parts.push(content.to_owned());
+                    }
+                    xai_grok_sampling_types::SystemSource::Runtime => {}
+                }
+            }
+            if let Some(instructions) = string_field("instructions") {
+                base_instruction_parts.push(instructions);
+            }
+            let mut compact_input = Vec::new();
+            for item in body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if item.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+                    compact_input.push(item.clone());
+                }
+            }
+            let canonical_context = xai_grok_sampling_types::CanonicalResponsesContext {
+                model: string_field("model").unwrap_or_default(),
+                base_instructions: base_instruction_parts.join(
+                    xai_grok_sampling_types::INSTRUCTIONS_MEMORY_SEPARATOR,
+                ),
+                memory_context: (!memory_context_parts.is_empty()).then(|| {
+                    memory_context_parts
+                        .join(xai_grok_sampling_types::INSTRUCTIONS_MEMORY_SEPARATOR)
+                }),
+                tools: body
+                    .get("tools")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                tool_choice: body
+                    .get("tool_choice")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+                reasoning: body
+                    .get("reasoning")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+                text: body
+                    .get("text")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+                // Canonical-context explicit value: the agent loop always
+                // allows parallel tool calls. Never derive via
+                // `unwrap_or(true)` from a body that may not carry it.
+                parallel_tool_calls: true,
+                prompt_cache_key: string_field("prompt_cache_key"),
+                prompt_cache_options: body
+                    .get("prompt_cache_options")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+                prompt_cache_retention: string_field("prompt_cache_retention"),
+                service_tier: string_field("service_tier"),
+            };
+            xai_grok_sampler::ResponsesCompactRequest::from_canonical(
+                &canonical_context,
+                compact_input,
+                user_context,
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
+        }
+        .with_correlation(xai_grok_sampler::CompactCorrelationHeaders {
+            conversation_id: request.x_grok_conv_id.clone(),
+            request_id: request.x_grok_req_id.clone(),
+            session_id: request.x_grok_session_id.clone(),
+            turn_index: request.x_grok_turn_idx.clone(),
+            agent_id: request.x_grok_agent_id.clone(),
+            deployment_id: request.x_grok_deployment_id.clone(),
+            user_id: request.x_grok_user_id.clone(),
+        });
         let request_bytes = compact_request.to_bounded_bytes().map_err(|error| {
             let reason =
                 if error.failure() == xai_grok_sampler::ResponsesCompactFailure::RequestTooLarge {
@@ -1977,6 +2060,16 @@ impl SessionActor {
             prompt_envelope_fingerprint: current_envelope.envelope_fingerprint.clone(),
             base_instructions_sha256: current_envelope.base_instructions_sha256.clone(),
             prior_checkpoint_id: wrapper.prior_checkpoint_id.clone(),
+            // Stage D3 (plan 阶段 7): `cache_route_fingerprint` is
+            // deliberately left `None` in the GATE identity. The chat-state
+            // binding (`bind_request_identity` in xai-chat-state
+            // mutations.rs) compares the FULL `CheckpointIdentityV2` struct
+            // (`checkpoint.identity == *identity`), so a None→Some flip
+            // here would flip every stored V2 checkpoint to
+            // `MigrationRequired`. The fingerprint is informational per the
+            // plan (prompt-cache routing never invalidates a checkpoint);
+            // it is populated only at writer time (stage D4), never in the
+            // gate identity.
             cache_route_fingerprint: None,
         };
         let binding = match self
@@ -2474,6 +2567,11 @@ impl SessionActor {
         replacement: Vec<ConversationItem>,
         committed_total_tokens: u64,
     ) -> Result<bool, acp::Error> {
+        // Stage-D3 observability: a commit that installs a Responses
+        // checkpoint marks the next usage record as `post_compact_first`.
+        let installs_checkpoint = replacement
+            .first()
+            .is_some_and(|item| item.is_responses_checkpoint());
         let result = self
             .chat_state_handle
             .commit_compaction(xai_chat_state::CommitCompaction {
@@ -2486,7 +2584,15 @@ impl SessionActor {
             .await
             .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
         match result {
-            xai_chat_state::CommitCompactionResult::Committed { .. } => Ok(true),
+            xai_chat_state::CommitCompactionResult::Committed { .. } => {
+                // 2 = first post-compact usage pending; 0 = the commit
+                // removed the checkpoint (builtin / migration).
+                self.post_compact_usage_state.store(
+                    if installs_checkpoint { 2 } else { 0 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(true)
+            }
             xai_chat_state::CommitCompactionResult::Superseded { .. } => Ok(false),
             xai_chat_state::CommitCompactionResult::PersistenceFailed(error) => {
                 Err(acp::Error::internal_error().data(error.to_string()))
@@ -5061,6 +5167,7 @@ mod inline_auto_compact_flow_tests {
                 crate::session::acp_session::StreamingTurnCapture::default(),
             ),
             turn_stream_drained: parking_lot::Mutex::new(None),
+            post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
             sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
             rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
             image_description_model: crate::test_support::TEST_MODEL.to_owned(),

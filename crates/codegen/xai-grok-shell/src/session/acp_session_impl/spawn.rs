@@ -558,11 +558,20 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
+    let mut resumed_checkpoint_active = false;
     if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
         || initial_last_compaction.is_some())
         && let Some(mut snap) = chat_state_handle.snapshot().await
     {
+        // Stage-D3 hint: a resumed session whose conversation already
+        // carries a checkpoint classifies subsequent usage as
+        // post_compact_subsequent (a checkpoint committed before any
+        // post-compact usage still reports post_compact_first).
+        resumed_checkpoint_active = snap
+            .conversation
+            .first()
+            .is_some_and(|item| item.is_responses_checkpoint());
         snap.prompt_index = initial_prompt_texts.len();
         snap.prompt_texts = initial_prompt_texts;
         if initial_total_tokens > 0 {
@@ -1766,6 +1775,9 @@ pub(crate) async fn spawn_session_actor(
         session_turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        post_compact_usage_state: std::sync::atomic::AtomicU8::new(u8::from(
+            resumed_checkpoint_active,
+        )),
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,

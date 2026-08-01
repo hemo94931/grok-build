@@ -4,12 +4,18 @@
 //! can switch between them by configuration. Each backend owns its own wire
 //! conversion in a sibling module.
 
+mod canonical;
 mod chat_completions;
 mod messages;
 mod resolved;
 mod responses;
 mod v2;
 
+pub use canonical::{
+    CanonicalResponsesContext, aux_cache_namespace, cache_route_fingerprint,
+    model_cache_family, new_logical_cache_namespace_id, normalize_base_url_for_routing,
+    prompt_cache_key_for_namespace,
+};
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
 pub(crate) use resolved::SealedResponsesBody;
@@ -21,8 +27,8 @@ pub use resolved::{
     compose_instructions_v2, replay_input_tail_v2,
 };
 pub use responses::{
-    FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes, extra_tool_entries,
-    patch_reasoning_text_types, portable_history_bytes, portable_history_digest,
+    FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes, canonical_value_digest,
+    extra_tool_entries, patch_reasoning_text_types, portable_history_bytes, portable_history_digest,
     response_to_conversation_items,
 };
 pub use v2::{

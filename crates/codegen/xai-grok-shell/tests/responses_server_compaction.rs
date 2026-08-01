@@ -180,33 +180,34 @@ fn prompt_identity_is_semantic_and_excludes_transcript_cache_and_tier() {
         "provider",
         "endpoint",
         "principal",
-        &final_request("system", "first transcript", "cache-a", "stable"),
+        final_request("system", "first transcript", "cache-a", "stable").body(),
     )
     .unwrap();
     let same_semantics = build_checkpoint_identity(
         "provider",
         "endpoint",
         "principal",
-        &final_request("system", "different transcript", "cache-b", "stable"),
+        final_request("system", "different transcript", "cache-b", "stable").body(),
     )
     .unwrap();
     let changed_system = build_checkpoint_identity(
         "provider",
         "endpoint",
         "principal",
-        &final_request(
+        final_request(
             "changed system",
             "different transcript",
             "cache-b",
             "stable",
-        ),
+        )
+        .body(),
     )
     .unwrap();
     let changed_instructions = build_checkpoint_identity(
         "provider",
         "endpoint",
         "principal",
-        &final_request("system", "different transcript", "cache-b", "changed"),
+        final_request("system", "different transcript", "cache-b", "changed").body(),
     )
     .unwrap();
 
@@ -308,7 +309,7 @@ fn server_successor_preserves_opaque_output_and_counts_tail_once() {
             "provider",
             "endpoint",
             "principal",
-            &FinalResponsesRequest::try_from(&ConversationRequest {
+            FinalResponsesRequest::try_from(&ConversationRequest {
                 items: vec![
                     ConversationItem::system("system"),
                     ConversationItem::user("u"),
@@ -316,7 +317,8 @@ fn server_successor_preserves_opaque_output_and_counts_tail_once() {
                 model: Some("grok".into()),
                 ..Default::default()
             })
-            .unwrap(),
+            .unwrap()
+            .body(),
         )
         .unwrap(),
         output.clone(),

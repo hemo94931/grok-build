@@ -225,6 +225,18 @@ pub fn portable_history_digest(
     ))
 }
 
+/// Hex SHA-256 over the canonical bytes of an arbitrary JSON value. Shared
+/// by the canonical-envelope and cache-routing fingerprints.
+pub fn canonical_value_digest(
+    value: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    use sha2::Digest as _;
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(canonical_json_bytes(value)?)
+    ))
+}
+
 /// Immutable normal Responses request immediately before transport defaults/headers.
 ///
 /// A checkpoint-bearing request is serialized by preserving the raw canonical

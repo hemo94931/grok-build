@@ -747,6 +747,53 @@ impl SessionActor {
         self.sampler_handle.update_config(sampler_config.clone());
         sampler_config
     }
+    /// Stage-D3 (plan 阶段 7) stable cache routing for `model` on
+    /// `full_config`'s route: provider + normalized base URL + model cache
+    /// family + auth principal (the exact principal source the compaction
+    /// gate uses, `compact_credential`), with the persisted logical cache
+    /// namespace for this session dir. `None` when no credential is
+    /// available or the namespace file is unreadable — a cache key is
+    /// best-effort and must never fail a turn.
+    pub(super) fn cache_routing_for_config(
+        &self,
+        full_config: &xai_grok_sampler::SamplerConfig,
+        model: &str,
+    ) -> Option<crate::session::cache_routing::SessionCacheRouting> {
+        let (_, principal) = self.compact_credential(full_config)?;
+        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
+            "xai"
+        } else {
+            "openai_compatible"
+        };
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        match crate::session::cache_routing::load_or_create(
+            &session_dir,
+            provider_id,
+            &full_config.base_url,
+            model,
+            &principal,
+        ) {
+            Ok(routing) => Some(routing),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    ?error,
+                    "cache routing unavailable; request proceeds without a prompt cache key"
+                );
+                None
+            }
+        }
+    }
+    /// Stage-D3 routing for an auxiliary request (recap / side question)
+    /// on the session model route. Rebuilds the full sampler config once
+    /// (same source as `prepare_chat_completion`).
+    pub(super) async fn cache_routing_for_model(
+        &self,
+        model: &str,
+    ) -> Option<crate::session::cache_routing::SessionCacheRouting> {
+        let full_config = self.reconstruct_full_config().await;
+        self.cache_routing_for_config(&full_config, model)
+    }
     fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
         let auth = self
             .auth_manager
@@ -1210,6 +1257,19 @@ impl SessionActor {
         if gate.resubmit {
             return Ok(SamplerTurnOutcome::CompactAndResubmit);
         }
+        // Stage D3 (plan 阶段 7): stable cache routing. Both the V2-replay
+        // frozen request and the normal path carry the routing-derived
+        // `prompt_cache_key`; the V1 legacy permit path deliberately stays
+        // byte-stable (no key — V1 writers are off). Best-effort: no
+        // credential or an unreadable namespace file ⇒ no key, never a turn
+        // failure. The dispatch is frozen, so sampler retries reuse the
+        // same key automatically.
+        let routing_key = self
+            .cache_routing_for_config(
+                &full_config,
+                request.model.as_deref().unwrap_or(&full_config.model),
+            )
+            .map(|routing| routing.prompt_cache_key());
         let has_checkpoint = request
             .items
             .first()
@@ -1224,6 +1284,7 @@ impl SessionActor {
             self.sampler_handle.update_config(request_config);
             let mut frozen = request.clone();
             frozen.instructions = Some(self.current_wire_instructions_v2(&request).await);
+            frozen.prompt_cache_key = routing_key.clone();
             full_config.apply_conversation_defaults_to(&mut frozen);
             let resolved = xai_grok_sampling_types::ResolvedResponsesRequest::from_validated_replay(
                 &replay, &frozen,
@@ -1262,7 +1323,9 @@ impl SessionActor {
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
             xai_grok_sampler::SamplingDispatch::LegacyV1(std::sync::Arc::new(permit))
         } else {
-            xai_grok_sampler::SamplingDispatch::Normal(Box::new(request.clone()))
+            let mut normal = request.clone();
+            normal.prompt_cache_key = routing_key;
+            xai_grok_sampler::SamplingDispatch::Normal(Box::new(normal))
         };
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1520,6 +1583,45 @@ impl SessionActor {
                 let _ = handle.mark_usage_incomplete(true, true).await;
             });
         }
+    }
+    /// Stage-D3 observability: record the provider-reported prompt-cache
+    /// behavior of a completed main turn, keyed by normalized
+    /// deployment + model family. Provider cache capability
+    /// (`compact_seeds_prompt_cache`) has no reliable static signal, so it
+    /// is accumulated observationally; the `post_compact_first` kind is the
+    /// hard-gate signal once capability is promised. Best-effort: no
+    /// routing (credential/namespace) ⇒ no event.
+    pub(super) async fn record_prompt_cache_observation(
+        &self,
+        usage: &xai_grok_sampling_types::TokenUsage,
+        model: &str,
+    ) {
+        let state = self.post_compact_usage_state.load(std::sync::atomic::Ordering::Relaxed);
+        let request_kind = match state {
+            2 => "post_compact_first",
+            1 => "post_compact_subsequent",
+            _ => "normal",
+        };
+        let Some(routing) = self.cache_routing_for_model(model).await else {
+            return;
+        };
+        if state != 0 {
+            self.post_compact_usage_state.store(
+                1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        xai_grok_telemetry::session_ctx::log_event(
+            xai_grok_telemetry::events::PromptCacheObservation {
+                provider_id: routing.provider_id().to_string(),
+                deployment_fingerprint: routing.route_fingerprint().to_string(),
+                model_cache_family: xai_grok_sampling_types::model_cache_family(model),
+                request_kind,
+                prompt_cache_key_present: true,
+                cached_tokens: u64::from(usage.cached_prompt_tokens),
+                prompt_tokens: u64::from(usage.prompt_tokens),
+            },
+        );
     }
     pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
         self.signals_handle().record_assistant_message();

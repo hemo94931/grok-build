@@ -35,9 +35,9 @@ pub struct CompactCorrelationHeaders {
 /// Standalone `/responses/compact` request body.
 ///
 /// Fields are private: the only way to build one is the typed
-/// [`ResponsesCompactRequest::from_final`] conversion (or future canonical
-/// constructors), so the compact POST point can trust that no caller
-/// injected arbitrary raw JSON.
+/// [`ResponsesCompactRequest::from_canonical`] (canonical envelope) or
+/// [`ResponsesCompactRequest::from_resolved`] (frozen V2 body), so the
+/// compact POST point can trust that no caller injected arbitrary raw JSON.
 #[derive(Clone, Serialize)]
 pub struct ResponsesCompactRequest {
     model: String,
@@ -53,6 +53,10 @@ pub struct ResponsesCompactRequest {
     service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<Value>,
     #[serde(skip)]
@@ -70,84 +74,82 @@ impl std::fmt::Debug for ResponsesCompactRequest {
             .field("has_reasoning", &self.reasoning.is_some())
             .field("has_service_tier", &self.service_tier.is_some())
             .field("has_prompt_cache_key", &self.prompt_cache_key.is_some())
+            .field("has_prompt_cache_options", &self.prompt_cache_options.is_some())
+            .field(
+                "has_prompt_cache_retention",
+                &self.prompt_cache_retention.is_some(),
+            )
             .field("has_text", &self.text.is_some())
             .finish()
     }
 }
 
 impl ResponsesCompactRequest {
-    pub fn from_final(
-        final_request: &xai_grok_sampling_types::FinalResponsesRequest,
-        user_context: Option<&str>,
+    /// Build the compact endpoint body from the canonical envelope (Plan
+    /// 阶段 6). Every allowlisted field is derived from the canonical
+    /// context — the compact body and the normal body are the same source:
+    ///
+    /// - `model`, `instructions` (`context.instructions()`, `None` when
+    ///   empty), `tools`, `reasoning`, `text`, `parallel_tool_calls`
+    ///   (explicit — never defaulted), `prompt_cache_key`, `service_tier`
+    ///   come straight from the context.
+    /// - `prompt_cache_options` / `prompt_cache_retention` are included
+    ///   only when the context carries them; the caller decides whether the
+    ///   provider supports them by setting/clearing the context fields.
+    /// - `tool_choice` is create-only and is NEVER sent to the compact
+    ///   endpoint, but it stays part of the canonical envelope's
+    ///   compatibility identity.
+    /// - `compact_user_context` is a compact-only suffix appended to
+    ///   `instructions` behind [`USER_CONTEXT_DELIMITER`] (plan priority 2:
+    ///   no separate provider field exists today). It only affects this
+    ///   request body's instructions — it never enters any stored identity;
+    ///   callers record [`compact_directive_hash`] instead.
+    ///
+    /// `input` must be non-empty; items with `role == "system"` are
+    /// rejected because canonical instructions already carry system
+    /// content, so a system item in compact input indicates a caller bug.
+    pub fn from_canonical(
+        context: &xai_grok_sampling_types::CanonicalResponsesContext,
+        input: Vec<Value>,
+        compact_user_context: Option<&str>,
     ) -> Result<Self, ResponsesCompactError> {
-        let body = final_request.body();
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?
-            .to_string();
-        let source_input = body
-            .get("input")
-            .and_then(Value::as_array)
-            .filter(|input| !input.is_empty())
-            .ok_or_else(|| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?;
-        let mut input = Vec::with_capacity(source_input.len());
-        let mut instruction_parts = Vec::new();
-        for item in source_input {
-            if item.get("role").and_then(Value::as_str) == Some("system") {
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse)
-                    })?;
-                instruction_parts.push(content.to_owned());
-            } else {
-                input.push(item.clone());
-            }
-        }
         if input.is_empty() {
             return Err(ResponsesCompactError::new(
                 ResponsesCompactFailure::InvalidResponse,
             ));
         }
-        let string_field = |name: &str| {
-            body.get(name)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        };
-        if let Some(normal) = string_field("instructions") {
-            instruction_parts.push(normal);
+        if input
+            .iter()
+            .any(|item| item.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            return Err(ResponsesCompactError::new(
+                ResponsesCompactFailure::InvalidResponse,
+            ));
         }
-        let mut instructions =
-            (!instruction_parts.is_empty()).then(|| instruction_parts.join("\n\n"));
-        if let Some(context) = user_context.filter(|context| !context.is_empty()) {
+        let mut instructions = {
+            let joined = context.instructions();
+            (!joined.trim().is_empty()).then_some(joined)
+        };
+        if let Some(user_context) = compact_user_context.filter(|context| !context.is_empty()) {
             let value = instructions.get_or_insert_with(String::new);
             value.push_str(USER_CONTEXT_DELIMITER);
-            value.push_str(context);
+            value.push_str(user_context);
         }
-        let optional_value = |name: &str| {
-            body.get(name)
-                .filter(|value| !value.is_null())
-                .filter(|value| !value.as_array().is_some_and(Vec::is_empty))
-                .cloned()
-        };
+        let tools = (!context.tools.is_null()
+            && !context.tools.as_array().is_some_and(Vec::is_empty))
+        .then(|| context.tools.clone());
         Ok(Self {
-            model,
+            model: context.model.clone(),
             input,
-            parallel_tool_calls: body
-                .get("parallel_tool_calls")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            parallel_tool_calls: context.parallel_tool_calls,
             instructions,
-            tools: optional_value("tools"),
-            reasoning: optional_value("reasoning"),
-            service_tier: string_field("service_tier"),
-            prompt_cache_key: string_field("prompt_cache_key"),
-            text: optional_value("text"),
+            tools,
+            reasoning: context.reasoning.clone(),
+            service_tier: context.service_tier.clone(),
+            prompt_cache_key: context.prompt_cache_key.clone(),
+            prompt_cache_options: context.prompt_cache_options.clone(),
+            prompt_cache_retention: context.prompt_cache_retention.clone(),
+            text: context.text.clone(),
             correlation: CompactCorrelationHeaders::default(),
         })
     }
@@ -196,6 +198,8 @@ impl ResponsesCompactRequest {
             reasoning: optional_value("reasoning"),
             service_tier: string_field("service_tier"),
             prompt_cache_key: string_field("prompt_cache_key"),
+            prompt_cache_options: optional_value("prompt_cache_options"),
+            prompt_cache_retention: string_field("prompt_cache_retention"),
             text: optional_value("text"),
             correlation: CompactCorrelationHeaders {
                 conversation_id: resolved.correlation().x_grok_conv_id.clone(),
@@ -213,7 +217,6 @@ impl ResponsesCompactRequest {
         self.correlation = correlation;
         self
     }
-
     /// Replace the top-level instructions. Instructions are plain text, so
     /// this cannot weaken the typed-input gate; it exists for callers (and
     /// tests) that adjust the compaction directive.
@@ -236,6 +239,21 @@ impl ResponsesCompactRequest {
         }
         Ok(bytes)
     }
+}
+
+/// Hex SHA-256 of the compact-only user-context suffix, for recording as
+/// `compact_directive_hash` (Plan 阶段 6, priority 3). `None` when no
+/// suffix is present (absent or empty).
+///
+/// Byte-identical to `xai_grok_sampling_types::canonical_value_digest`
+/// applied to `Value::String`: for a string scalar the canonical JSON
+/// bytes are just the serde encoding, so this is hex SHA-256 over
+/// `serde_json::to_vec(&Value::String(suffix))`. (The sampling-types
+/// helper is not re-exported at its crate root, hence the local
+/// equivalent.)
+pub fn compact_directive_hash(compact_user_context: Option<&str>) -> Option<String> {
+    let suffix = compact_user_context.filter(|context| !context.is_empty())?;
+    xai_grok_sampling_types::canonical_value_digest(&Value::String(suffix.to_owned())).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -822,10 +822,6 @@ impl ResolvedCompactRequest {
         &self.body
     }
 
-    pub(crate) fn into_body(self) -> serde_json::Value {
-        self.body
-    }
-
     pub fn model(&self) -> &str {
         &self.model
     }

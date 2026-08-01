@@ -2414,6 +2414,10 @@ impl SessionActor {
                 );
             }
             self.record_response_token_usage(&response, Some(model_duration_ms));
+            if let Some(usage) = response.usage.as_ref() {
+                let model_id = self.current_model_id().await;
+                self.record_prompt_cache_observation(usage, &model_id).await;
+            }
             let response_completed = self.response_completed_update(&response);
             if let Some(pt) = prompt_timing.take() {
                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;

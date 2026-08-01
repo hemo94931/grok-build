@@ -124,6 +124,16 @@ impl SessionActor {
             .map(|c| c.model)
             .unwrap_or_default();
 
+        // Stage-D3 stable cache routing: auxiliary requests get a stable
+        // but isolated cache namespace — side-question tokens must never
+        // share or pollute the main session's prompt-cache route (or its
+        // cache-affinity metrics). Best-effort: no key when routing is
+        // unavailable.
+        let prompt_cache_key = self
+            .cache_routing_for_model(&model)
+            .await
+            .map(|routing| routing.aux_prompt_cache_key("side_question"));
+
         let persist = |answer: String, success: bool, error: Option<String>, attempts: u32| {
             let _ = self.notifications.persistence_tx.send(PersistenceMsg::Btw(
                 crate::session::persistence::BtwEntry {
@@ -156,6 +166,7 @@ impl SessionActor {
             x_grok_conv_id: Some(btw_session_id.clone()),
             x_grok_session_id: Some(parent_session_id.clone()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+            prompt_cache_key,
             ..Default::default()
         };
 
@@ -333,15 +344,15 @@ impl SessionActor {
             x_grok_req_id: Some(x_grok_req_id.clone()),
             x_grok_session_id: Some(self.session_info.id.to_string()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            // Auxiliary requests get a stable but isolated cache namespace:
-            // recap tokens must never share or pollute the main session's
-            // prompt-cache route (or its cache-affinity metrics).
-            prompt_cache_key: Some(
-                crate::session::responses_server_compaction::aux_prompt_cache_key(
-                    &self.session_info.id.to_string(),
-                    "recap",
-                ),
-            ),
+            // Stage-D3 stable cache routing: recap is an auxiliary request
+            // and gets a stable but isolated cache namespace — recap tokens
+            // must never share or pollute the main session's prompt-cache
+            // route (or its cache-affinity metrics). Best-effort: no key
+            // when routing is unavailable.
+            prompt_cache_key: self
+                .cache_routing_for_model(&model)
+                .await
+                .map(|routing| routing.aux_prompt_cache_key("recap")),
             ..Default::default()
         };
 

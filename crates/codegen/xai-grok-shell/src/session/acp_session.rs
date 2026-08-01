@@ -1015,6 +1015,14 @@ pub(crate) struct SessionActor {
     /// terminal `SamplingEvent::Completed` (every text/thought chunk has been
     /// `send_update`d by then). `None` between turns.
     pub(crate) turn_stream_drained: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Stage-D3 observability hint for `PromptCacheObservation.request_kind`:
+    /// 0 = no active checkpoint, 1 = checkpoint active (post-compact
+    /// subsequent), 2 = checkpoint committed, first post-compact usage not
+    /// yet recorded. Set to 2 when a checkpoint commits, to 0 when a
+    /// builtin/migration commit or rewind removes the checkpoint. A rewind
+    /// that bypasses the shell hooks could leave a stale `1` — acceptable
+    /// for an observability hint; the hard signal is `post_compact_first`.
+    pub(crate) post_compact_usage_state: std::sync::atomic::AtomicU8,
     /// Handle to the per-session `xai-grok-sampler` actor.
     ///
     /// Live sessions get a real handle from `spawn_session_actor`;

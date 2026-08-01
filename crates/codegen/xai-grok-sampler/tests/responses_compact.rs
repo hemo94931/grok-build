@@ -26,10 +26,10 @@ use xai_grok_sampler::{
     RESPONSES_COMPACT_CONNECT_TIMEOUT, RESPONSES_COMPACT_MAX_BYTES,
     RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES, RequestCredentialSnapshot, ResponsesCompactFailure,
     ResponsesCompactRequest, SamplerConfig, SamplingClient, USER_CONTEXT_DELIMITER,
-    validate_responses_compact_response,
+    compact_directive_hash, validate_responses_compact_response,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, FinalResponsesRequest, ReasoningEffort, ToolSpec,
+    CanonicalResponsesContext, INSTRUCTIONS_MEMORY_SEPARATOR,
 };
 
 #[derive(Clone, Debug)]
@@ -66,20 +66,29 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
-fn final_request() -> FinalResponsesRequest {
-    let request = ConversationRequest {
-        model: Some("grok-test".into()),
-        items: vec![ConversationItem::user("hello")],
-        instructions: Some("normal instructions".into()),
+fn canonical_context() -> CanonicalResponsesContext {
+    CanonicalResponsesContext {
+        model: "grok-test".into(),
+        base_instructions: "normal instructions".into(),
+        memory_context: None,
+        tools: json!([]),
+        tool_choice: None,
+        reasoning: Some(json!({ "effort": "medium" })),
+        text: None,
+        parallel_tool_calls: true,
         prompt_cache_key: Some("cache-key".into()),
-        prompt_cache_options: Some(json!({"scope": "session"})),
-        prompt_cache_retention: Some("24h".into()),
+        prompt_cache_options: None,
+        prompt_cache_retention: None,
         service_tier: Some("priority".into()),
-        temperature: Some(0.2),
-        max_output_tokens: Some(123),
-        ..Default::default()
-    };
-    FinalResponsesRequest::try_from(&request).unwrap()
+    }
+}
+
+fn canonical_input() -> Vec<Value> {
+    vec![json!({ "role": "user", "content": "hello" })]
+}
+
+fn compact_request() -> ResponsesCompactRequest {
+    ResponsesCompactRequest::from_canonical(&canonical_context(), canonical_input(), None).unwrap()
 }
 
 fn valid_response() -> Value {
@@ -97,44 +106,170 @@ fn valid_response() -> Value {
 }
 
 #[test]
-fn codex_v1_request_moves_system_to_instructions_and_keeps_codex_fields() {
-    let final_request = FinalResponsesRequest::try_from(&ConversationRequest {
-        model: Some("gpt-test".into()),
-        items: vec![
-            ConversationItem::system("system prompt"),
-            ConversationItem::user("hello"),
-        ],
-        tools: vec![ToolSpec {
-            name: "read_file".into(),
-            description: Some("Read a file".into()),
-            parameters: json!({"type": "object"}),
-        }],
-        reasoning_effort: Some(ReasoningEffort::Medium),
-        json_schema: Some(json!({"type": "object"})),
-        instructions: Some("normal instructions".into()),
+fn from_canonical_sends_full_allowlist_and_never_tool_choice() {
+    let context = CanonicalResponsesContext {
+        model: "grok-test".into(),
+        base_instructions: "base instructions".into(),
+        memory_context: Some("memory".into()),
+        tools: json!([{ "type": "function", "name": "read_file" }]),
+        tool_choice: Some(json!({ "type": "auto" })),
+        reasoning: Some(json!({ "effort": "high" })),
+        text: Some(json!({ "format": { "type": "text" } })),
+        parallel_tool_calls: false,
         prompt_cache_key: Some("cache-key".into()),
-        prompt_cache_options: Some(json!({"scope": "session"})),
+        prompt_cache_options: Some(json!({ "scope": "session" })),
         prompt_cache_retention: Some("24h".into()),
         service_tier: Some("priority".into()),
-        ..Default::default()
-    })
+    };
+    let body = serde_json::to_value(
+        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some("directive"))
+            .unwrap(),
+    )
     .unwrap();
-
-    let body =
-        serde_json::to_value(ResponsesCompactRequest::from_final(&final_request, None).unwrap())
-            .unwrap();
-
-    assert_eq!(body["instructions"], "system prompt\n\nnormal instructions");
-    assert_eq!(body["parallel_tool_calls"], true);
-    assert!(body.get("tools").is_some());
-    assert!(body.get("reasoning").is_some());
-    assert!(body.get("text").is_some());
+    assert_eq!(
+        body["instructions"],
+        format!(
+            "base instructions{INSTRUCTIONS_MEMORY_SEPARATOR}memory{USER_CONTEXT_DELIMITER}directive"
+        )
+    );
+    assert_eq!(body["model"], "grok-test");
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["tools"], context.tools);
+    assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+    assert_eq!(body["text"], json!({ "format": { "type": "text" } }));
     assert_eq!(body["prompt_cache_key"], "cache-key");
+    assert_eq!(body["prompt_cache_options"], json!({ "scope": "session" }));
+    assert_eq!(body["prompt_cache_retention"], "24h");
     assert_eq!(body["service_tier"], "priority");
-    assert!(body.get("prompt_cache_options").is_none());
-    assert!(body.get("prompt_cache_retention").is_none());
-    assert_eq!(body["input"].as_array().unwrap().len(), 1);
-    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"], json!(canonical_input()));
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice is create-only and must never reach the compact endpoint"
+    );
+}
+
+#[test]
+fn from_canonical_omits_fields_the_compact_endpoint_does_not_support() {
+    let context = CanonicalResponsesContext {
+        model: "grok-test".into(),
+        base_instructions: String::new(),
+        memory_context: None,
+        tools: json!([]),
+        tool_choice: Some(json!({ "type": "auto" })),
+        reasoning: None,
+        text: None,
+        parallel_tool_calls: true,
+        prompt_cache_key: None,
+        prompt_cache_options: None,
+        prompt_cache_retention: None,
+        service_tier: None,
+    };
+    let body = serde_json::to_value(
+        ResponsesCompactRequest::from_canonical(&context, canonical_input(), None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        vec!["model", "input", "parallel_tool_calls"]
+    );
+    for absent in [
+        "instructions",
+        "tools",
+        "reasoning",
+        "text",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "service_tier",
+        "tool_choice",
+    ] {
+        assert!(body.get(absent).is_none(), "unexpected field {absent}");
+    }
+}
+
+#[test]
+fn from_canonical_preserves_explicit_false_parallel_tool_calls() {
+    let context = CanonicalResponsesContext {
+        parallel_tool_calls: false,
+        ..canonical_context()
+    };
+    let body = serde_json::to_value(
+        ResponsesCompactRequest::from_canonical(&context, canonical_input(), None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(body.get("parallel_tool_calls").is_some());
+}
+
+#[test]
+fn from_canonical_rejects_empty_input_and_system_items() {
+    let context = canonical_context();
+    let empty = ResponsesCompactRequest::from_canonical(&context, Vec::new(), None);
+    assert_eq!(
+        empty.unwrap_err().failure(),
+        ResponsesCompactFailure::InvalidResponse
+    );
+    let with_system = vec![
+        json!({ "role": "system", "content": "system prompt" }),
+        json!({ "role": "user", "content": "hello" }),
+    ];
+    let rejected =
+        ResponsesCompactRequest::from_canonical(&context, with_system, None);
+    assert_eq!(
+        rejected.unwrap_err().failure(),
+        ResponsesCompactFailure::InvalidResponse
+    );
+    // The user item alone (no system) is accepted.
+    assert!(ResponsesCompactRequest::from_canonical(
+        &context,
+        canonical_input(),
+        None
+    )
+    .is_ok());
+}
+
+#[test]
+fn from_canonical_appends_compact_only_user_context_suffix() {
+    let context = canonical_context();
+    let body = serde_json::to_value(
+        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some("preserve this"))
+            .unwrap(),
+    )
+    .unwrap();
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(instructions.contains(USER_CONTEXT_DELIMITER));
+    assert!(instructions.ends_with("preserve this"));
+    // An empty suffix is treated as absent: no delimiter, plain canonical instructions.
+    let body = serde_json::to_value(
+        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some(""))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["instructions"], "normal instructions");
+}
+
+#[test]
+fn compact_directive_hash_is_stable_and_absent_without_context() {
+    assert_eq!(compact_directive_hash(None), None);
+    assert_eq!(compact_directive_hash(Some("")), None);
+    let a = compact_directive_hash(Some("preserve this")).unwrap();
+    let b = compact_directive_hash(Some("preserve this")).unwrap();
+    assert_eq!(a, b, "hash must be stable for identical directives");
+    assert_eq!(a.len(), 64);
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(
+        a,
+        compact_directive_hash(Some("preserve this!")).unwrap(),
+        "different directives must hash differently"
+    );
+    // Digest of the canonical JSON bytes of the string literal (matches
+    // xai_grok_sampling_types::canonical_value_digest(Value::String)).
+    use sha2::Digest as _;
+    let expected = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&json!("preserve this")).unwrap())
+    );
+    assert_eq!(a, expected);
 }
 
 async fn spawn_server(app: Router) -> String {
@@ -213,7 +348,7 @@ async fn compact_uses_real_endpoint_exact_body_and_metadata_only_auth() {
     config.header_injector = Some(Arc::new(TestHeaderInjector));
 
     let client = SamplingClient::new(config).unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), Some("preserve this"))
+    let request = ResponsesCompactRequest::from_canonical(&canonical_context(), canonical_input(), Some("preserve this"))
         .unwrap()
         .with_correlation(CompactCorrelationHeaders {
             conversation_id: Some("conv".into()),
@@ -346,7 +481,7 @@ async fn retries_408_and_5xx_but_never_429_or_should_retry_false() {
             ..Default::default()
         })
         .unwrap();
-        let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+        let request = compact_request();
         let result = client
             .compact_responses(
                 &request,
@@ -395,7 +530,7 @@ async fn credential_refresh_keeps_principal_and_rotation_fails_before_replay() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
     let credential = RequestCredentialSnapshot::bearer("stale", "principal-a").with_resolver(
         Arc::new(CredentialSequence(Mutex::new(VecDeque::from([
             Some(CompactCredential::bearer("token-1", "principal-a")),
@@ -456,7 +591,7 @@ async fn x_api_key_is_the_only_wire_auth_header() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
     client
         .compact_responses(
             &request,
@@ -565,8 +700,7 @@ async fn compact_logs_never_expose_prompt_blob_query_or_credentials() {
             ..Default::default()
         })
         .unwrap();
-        let request = ResponsesCompactRequest::from_final(&final_request(), None)
-            .unwrap()
+        let request = compact_request()
             .with_instructions(Some(PROMPT.into()));
         let error = client
             .compact_responses(
@@ -596,8 +730,7 @@ async fn oversized_request_is_rejected_before_transport() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None)
-        .unwrap()
+    let request = compact_request()
         .with_instructions(Some("x".repeat(RESPONSES_COMPACT_MAX_BYTES)));
 
     let error = client
@@ -638,7 +771,7 @@ async fn oversized_content_length_is_rejected_before_body_read() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
 
     let error = client
         .compact_responses(
@@ -687,7 +820,7 @@ async fn cancellation_interrupts_a_stalled_response_body() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
@@ -735,7 +868,7 @@ async fn cancellation_interrupts_retry_after_backoff() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
@@ -773,7 +906,7 @@ async fn pre_cancelled_request_does_not_reach_transport() {
         ..Default::default()
     })
     .unwrap();
-    let request = ResponsesCompactRequest::from_final(&final_request(), None).unwrap();
+    let request = compact_request();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 

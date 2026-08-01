@@ -501,7 +501,18 @@ impl SessionActor {
                 let new_marker =
                     replay_compaction_marker.unwrap_or(snap.last_compaction_prompt_index);
                 snap.last_compaction_prompt_index = new_marker;
+                // Stage-D3 hint: rewind changes checkpoint presence, so the
+                // post-compact classification must follow the restored
+                // conversation (checkpoint present ⇒ subsequent, else none).
+                let checkpoint_active = snap
+                    .conversation
+                    .first()
+                    .is_some_and(|item| item.is_responses_checkpoint());
                 self.chat_state_handle.restore_snapshot(snap);
+                self.post_compact_usage_state.store(
+                    u8::from(checkpoint_active),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             // Conversation shrank — clear budget-based (size/schema) and stale

@@ -88,19 +88,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
-/// Derive a stable, isolated prompt-cache namespace for auxiliary requests
-/// (recap and other side queries) so they never share the main session's
-/// cache route or pollute its cache-affinity metrics.
-///
-/// `aux_cache_namespace = hash(session_namespace + auxiliary_kind)`, capped
-/// to the provider's 64-character key budget. Stage D3 will re-base
-/// `session_namespace` onto the persisted `logical_cache_namespace_id`.
-pub fn aux_prompt_cache_key(session_namespace: &str, auxiliary_kind: &str) -> String {
-    let digest =
-        sha256_hex(format!("grok-aux-cache-v1:{auxiliary_kind}:{session_namespace}").as_bytes());
-    format!("aux:{:.60}", digest)
-}
-
 /// Stage D1b kill switch: new V1 server checkpoints are disabled globally
 /// and compaction falls back to builtin, so no new unsafe checkpoints are
 /// produced. V2 writers (stage D4) supersede this switch; the env var

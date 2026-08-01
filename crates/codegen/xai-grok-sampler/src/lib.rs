@@ -41,7 +41,7 @@ pub use client::responses_compact::{
     RESPONSES_COMPACT_CONNECT_TIMEOUT, RESPONSES_COMPACT_MAX_BYTES,
     RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES, RequestCredentialSnapshot, ResponsesCompactError,
     ResponsesCompactFailure, ResponsesCompactRequest, ResponsesCompactResponse,
-    USER_CONTEXT_DELIMITER, validate_responses_compact_response,
+    USER_CONTEXT_DELIMITER, compact_directive_hash, validate_responses_compact_response,
 };
 pub use client::{ApiBackend, EndpointTemplate, SamplingClient, user_agent_string_for};
 pub use config::{
