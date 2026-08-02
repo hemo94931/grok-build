@@ -765,19 +765,19 @@ fn checkpoint_record(id: &str) -> SessionUpdate {
 /// A `compaction_checkpoint` record with an arbitrary `checkpoint_file` path.
 fn checkpoint_record_with_path(id: &str, checkpoint_file: &str) -> SessionUpdate {
     use crate::extensions::notification::{
-        CompactionCheckpointInfo, SessionNotification as XaiSessionNotification,
-        SessionUpdate as XaiSessionUpdateType,
+        CompactionCheckpointInfo, CompactionCheckpointKind,
+        SessionNotification as XaiSessionNotification, SessionUpdate as XaiSessionUpdateType,
     };
     SessionUpdate::Xai(
         Box::new(XaiSessionNotification {
             session_id: acp::SessionId::new("ckpt-src"),
             update: XaiSessionUpdateType::CompactionCheckpoint(
                 Box::new(CompactionCheckpointInfo {
+                    kind: CompactionCheckpointKind::Builtin,
                     checkpoint_id: id.to_string(),
                     prompt_index_at_compaction: 1,
                     checkpoint_file: checkpoint_file.to_string(),
                     auto_continue: None,
-                    schema_version: 1,
                     operation_id: None,
                     branch_id: None,
                     portable_history_sha256: None,
@@ -816,15 +816,17 @@ fn prompt_user_chunk(text: &str, prompt_index: usize) -> SessionUpdate {
     )
 }
 async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &str) {
-    use crate::extensions::notification::CompactionCheckpointFile;
+    use crate::extensions::notification::{
+        CompactionCheckpointFile, CompactionCheckpointKind,
+    };
     adapter
         .write_compaction_checkpoint(
             info,
             &CompactionCheckpointFile {
+                kind: CompactionCheckpointKind::Builtin,
                 checkpoint_id: id.to_string(),
                 prompt_index_at_compaction: 1,
                 compacted_history: vec![],
-                schema_version: 1,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 original_user_info: None,
                 reread_file_paths: vec![],
@@ -860,15 +862,93 @@ async fn copy_session_data_copies_referenced_compaction_checkpoints() {
     assert_eq!(copied, original, "checkpoint file must be copied verbatim");
 }
 
-/// V2/V3 fork semantics: a V2 wrapper (schema-3 marker + V3 sidecar) is
-/// preserved like the V1 wrapper — the live wrapper's V3 sidecar file is
-/// copied verbatim to the target session and the target chat history keeps
-/// the V2 wrapper at index 0.
 #[tokio::test]
-async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
+async fn recovery_does_not_upgrade_an_unknown_checkpoint_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = Info {
+        id: acp::SessionId::new("unknown-recovery"),
+        cwd: "/workspace".to_string(),
+    };
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let mut unknown = checkpoint_record("unknown-checkpoint");
+    let SessionUpdate::Xai(notification) = &mut unknown else {
+        unreachable!();
+    };
+    let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+        &mut notification.update
+    else {
+        unreachable!();
+    };
+    marker.kind = crate::extensions::notification::CompactionCheckpointKind::Unknown;
+    adapter.append_update(&info, &unknown).await.unwrap();
+
+    let error = adapter
+        .repair_responses_marker_sync(
+            &info,
+            |_| false,
+            || panic!("unknown marker must not be upgraded"),
+            super::super::responses_compaction::RecoveredHistory {
+                conversation: Vec::new(),
+                prepared_repairs: Vec::new(),
+                committed_repairs: Vec::new(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn fork_filter_cannot_hide_an_unknown_checkpoint_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("unknown-marker-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    let mut unknown = checkpoint_record("unknown-checkpoint");
+    let SessionUpdate::Xai(notification) = &mut unknown else {
+        unreachable!();
+    };
+    let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+        &mut notification.update
+    else {
+        unreachable!();
+    };
+    marker.kind = crate::extensions::notification::CompactionCheckpointKind::Unknown;
+    adapter.append_update(&source_info, &unknown).await.unwrap();
+
+    let target_info = Info {
+        id: acp::SessionId::new("unknown-marker-dst"),
+        cwd: "/target/workspace".to_string(),
+    };
+    let error = adapter
+        .copy_session_data(
+            &source_info,
+            &target_info,
+            CopySessionOptions {
+                fork_filter: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// Responses fork semantics: the strongly bound sidecar is copied
+/// verbatim and the target chat history keeps the generic checkpoint wrapper
+/// at index zero.
+#[tokio::test]
+async fn copy_session_data_copies_current_responses_sidecar() {
     use xai_grok_sampling_types::{
-        CheckpointIdentityV2, CheckpointReplayMaterialV2, ServerResponsesCheckpointV2,
-        TokenSeedSource, TrustedPromptEnvelopeV2,
+        CheckpointIdentity, CheckpointReplayMaterial, RESPONSES_COMPACTION_CONTRACT,
+        ResponsesCompactionMode, ServerResponsesCheckpoint, TokenSeedSource,
+        TrustedPromptEnvelope,
     };
 
     let portable = vec![
@@ -877,27 +957,25 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
         ConversationItem::assistant("first answer"),
     ];
     let digest = xai_grok_sampling_types::portable_history_digest(&portable).unwrap();
-    let bytes =
-        super::super::responses_compaction::portable_history_bytes(&portable).unwrap();
-    let wrapper = ServerResponsesCheckpointV2 {
-        schema_version: xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2,
-        checkpoint_id: "ckpt-v2".into(),
-        operation_id: "op-v2".into(),
+    let bytes = super::super::responses_compaction::portable_history_bytes(&portable).unwrap();
+    let wrapper = ServerResponsesCheckpoint {
+        checkpoint_id: "checkpoint-current".into(),
+        operation_id: "operation-current".into(),
         prompt_index: 2,
         created_at: chrono::Utc::now(),
         auto_continue: false,
-        mode: xai_grok_sampling_types::ResponsesCompactionModeV1 {
-            name: "default".into(),
+        mode: ResponsesCompactionMode {
+            name: "segments".into(),
             detail: None,
         },
-        branch_id: "branch-1".into(),
-        identity: CheckpointIdentityV2 {
+        branch_id: "branch-current".into(),
+        identity: CheckpointIdentity {
             provider_id: "xai".into(),
             api: "responses".into(),
             endpoint_fingerprint: "endpoint".into(),
             model: "grok-test".into(),
             auth_principal_fingerprint: "principal".into(),
-            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT_V2.into(),
+            contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
             prompt_envelope_fingerprint: "envelope-fp".into(),
             base_instructions_sha256: "base-hash".into(),
             prior_checkpoint_id: None,
@@ -907,7 +985,7 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
             "type": "compaction",
             "encrypted_content": "opaque"
         })],
-        portable_history_path: "compaction_checkpoints/ckpt-v2.json".into(),
+        portable_history_path: "compaction_checkpoints/checkpoint-current.json".into(),
         portable_history_sha256: digest,
         portable_history_bytes: bytes.len() as u64,
         checkpoint_token_seed: 42,
@@ -916,9 +994,9 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
         prior_checkpoint_id: None,
         memory_revision: Some(3),
     };
-    let material = CheckpointReplayMaterialV2::try_new(
+    let material = CheckpointReplayMaterial::try_new(
         &wrapper,
-        TrustedPromptEnvelopeV2 {
+        TrustedPromptEnvelope {
             base_instructions_sha256: "base-hash".into(),
             memory_revision: Some(3),
             envelope_fingerprint: "envelope-fp".into(),
@@ -927,7 +1005,7 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
         &portable,
     )
     .unwrap();
-    let sidecar = super::super::responses_compaction::CompactionCheckpointFileV3::new(
+    let sidecar = super::super::responses_compaction::CompactionCheckpointFile::new(
         wrapper.clone(),
         material,
         portable,
@@ -939,33 +1017,41 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
     let temp_dir = TempDir::new().unwrap();
     let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
     let source_info = Info {
-        id: acp::SessionId::new("ckpt-v2-src"),
+        id: acp::SessionId::new("checkpoint-current-src"),
         cwd: "/source/workspace".to_string(),
     };
     adapter.init_session(&source_info, default_model_id()).await.unwrap();
-    super::super::responses_compaction::write_checkpoint_v3_durable(
+    super::super::responses_compaction::write_checkpoint_durable(
         &adapter.session_dir(&source_info),
         &wrapper.portable_history_path,
         &sidecar,
     )
     .unwrap();
-    // Durable chat history head: the live V2 wrapper.
-    let mut head = serde_json::to_vec(&ConversationItem::ResponsesCompactionCheckpointV2(
-        Box::new(wrapper.clone()),
-    ))
+    let source_chat = vec![
+        ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone())),
+        ConversationItem::runtime_system("segment hint"),
+    ];
+    let source_entries =
+        super::super::responses_compaction::persisted_entries_for_replacement(
+            "source-replacement",
+            &source_chat,
+        )
+        .unwrap();
+    super::super::responses_compaction::write_history_durable(
+        &adapter.chat_file(&source_info),
+        &source_entries,
+    )
     .unwrap();
-    head.push(b'\n');
-    std::fs::write(adapter.chat_file(&source_info), head).unwrap();
     adapter
         .append_update(
             &source_info,
             &SessionUpdate::Xai(Box::new(
                 crate::extensions::notification::SessionNotification {
-                    session_id: acp::SessionId::new("ckpt-v2-src"),
+                    session_id: acp::SessionId::new("checkpoint-current-src"),
                     update: crate::extensions::notification::SessionUpdate::CompactionCheckpoint(
-                        Box::new(
-                            super::super::responses_compaction::marker_for_wrapper_v3(&wrapper),
-                        ),
+                        Box::new(super::super::responses_compaction::marker_for_wrapper(
+                            &wrapper,
+                        )),
                     ),
                     meta: None,
                 },
@@ -974,7 +1060,7 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
         .await
         .unwrap();
     let target_info = Info {
-        id: acp::SessionId::new("ckpt-v2-dst"),
+        id: acp::SessionId::new("checkpoint-current-dst"),
         cwd: "/target/workspace".to_string(),
     };
     let result = adapter
@@ -982,17 +1068,196 @@ async fn copy_session_data_copies_v3_sidecar_for_v2_wrapper() {
         .await
         .unwrap();
     assert_eq!(result.compaction_checkpoints_copied, 1);
-    assert_eq!(result.updates_copied, 1, "schema-3 marker must be copied");
-    let rel = "compaction_checkpoints/ckpt-v2.json";
+    assert_eq!(
+        result.updates_copied, 6,
+        "the copied source journal is followed by a fresh target marker and typed-tail baseline"
+    );
+    let rel = "compaction_checkpoints/checkpoint-current.json";
     let copied = std::fs::read(adapter.session_dir(&target_info).join(rel)).unwrap();
     let original = std::fs::read(adapter.session_dir(&source_info).join(rel)).unwrap();
-    assert_eq!(copied, original, "V3 sidecar must be copied verbatim on fork");
+    assert_eq!(copied, original, "sidecar must be copied verbatim on fork");
     let target_chat = std::fs::read_to_string(adapter.chat_file(&target_info)).unwrap();
     let first: ConversationItem = serde_json::from_str(target_chat.lines().next().unwrap()).unwrap();
     assert!(
-        matches!(first, ConversationItem::ResponsesCompactionCheckpointV2(_)),
-        "target chat history must keep the V2 wrapper at index 0"
+        matches!(first, ConversationItem::ResponsesCompactionCheckpoint(_)),
+        "target chat history must keep the checkpoint wrapper at index 0"
     );
+    let target_history = super::super::responses_compaction::read_history(
+        &adapter.chat_file(&target_info),
+    )
+    .unwrap();
+    let target_wrapper = target_history.conversation[0]
+        .as_responses_checkpoint()
+        .unwrap()
+        .clone();
+    let target_updates = adapter
+        .read_updates_jsonl(adapter.updates_file(&target_info))
+        .unwrap();
+    let target_marker_index = target_updates
+        .iter()
+        .rposition(|update| {
+            matches!(
+                update,
+                SessionUpdate::Xai(notification)
+                    if matches!(
+                        notification.update,
+                        crate::extensions::notification::SessionUpdate::CompactionCheckpoint(_)
+                    )
+            )
+        })
+        .unwrap();
+    let target_records = target_updates[target_marker_index + 1..]
+        .iter()
+        .filter_map(|update| {
+            let SessionUpdate::Xai(notification) = update else {
+                return None;
+            };
+            match &notification.update {
+                crate::extensions::notification::SessionUpdate::ConversationAppendPrepared(
+                    prepared,
+                ) => Some(
+                    super::super::responses_compaction::TailJournalRecord::Prepared(
+                        (**prepared).clone(),
+                    ),
+                ),
+                crate::extensions::notification::SessionUpdate::ConversationAppendCommitted(
+                    committed,
+                ) => Some(
+                    super::super::responses_compaction::TailJournalRecord::Committed(
+                        committed.clone(),
+                    ),
+                ),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(target_records.len(), 2);
+    assert_eq!(
+        super::super::responses_compaction::rebuild_updates_only(
+            target_wrapper,
+            &target_records,
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    adapter.load_session(&target_info).await.unwrap();
+    assert_eq!(
+        adapter
+            .read_updates_jsonl(adapter.updates_file(&target_info))
+            .unwrap()
+            .len(),
+        target_updates.len(),
+        "target resume must not append a duplicate baseline"
+    );
+
+    // A filtered fork clears the source update stream and rotates the live
+    // branch. The copy itself must install a fresh marker and full tail
+    // baseline so immediate child bootstrap does not depend on resume repair.
+    let filtered_target = Info {
+        id: acp::SessionId::new("checkpoint-current-filtered"),
+        cwd: "/target/workspace".to_string(),
+    };
+    let filtered = adapter
+        .copy_session_data(
+            &source_info,
+            &filtered_target,
+            CopySessionOptions {
+                fork_filter: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.compaction_checkpoints_copied, 1);
+    assert_eq!(filtered.updates_copied, 3);
+    let filtered_history = super::super::responses_compaction::read_history(
+        &adapter.chat_file(&filtered_target),
+    )
+    .unwrap();
+    assert_eq!(filtered_history.conversation.len(), 2);
+    let filtered_wrapper = filtered_history.conversation[0]
+        .as_responses_checkpoint()
+        .unwrap();
+    assert_ne!(filtered_wrapper.branch_id, wrapper.branch_id);
+    let filtered_updates = adapter
+        .read_updates_jsonl(adapter.updates_file(&filtered_target))
+        .unwrap();
+    let marker = filtered_updates.iter().find_map(|update| {
+        let SessionUpdate::Xai(notification) = update else {
+            return None;
+        };
+        let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+            &notification.update
+        else {
+            return None;
+        };
+        Some(marker.as_ref())
+    })
+    .unwrap();
+    assert_eq!(marker.branch_id.as_deref(), Some(filtered_wrapper.branch_id.as_str()));
+    super::super::responses_compaction::validate_marker_for_wrapper(marker, &sidecar.wrapper)
+        .unwrap();
+
+    // Simulate CAS + tail journal succeeding while the marker append itself
+    // failed. Resume must append the marker first, then repeat the complete
+    // authoritative baseline after it; records that predate the repaired
+    // marker cannot satisfy replay.
+    let records_without_marker = filtered_updates
+        .iter()
+        .filter(|update| {
+            !matches!(
+                update,
+                SessionUpdate::Xai(notification)
+                    if matches!(
+                        notification.update,
+                        crate::extensions::notification::SessionUpdate::CompactionCheckpoint(_)
+                    )
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut updates_bytes = Vec::new();
+    for update in &records_without_marker {
+        let envelope = SessionUpdateEnvelope::from_update(update).unwrap();
+        serde_json::to_writer(&mut updates_bytes, &envelope).unwrap();
+        updates_bytes.push(b'\n');
+    }
+    std::fs::write(adapter.updates_file(&filtered_target), updates_bytes).unwrap();
+    adapter.load_session(&filtered_target).await.unwrap();
+    let repaired_updates = adapter
+        .read_updates_jsonl(adapter.updates_file(&filtered_target))
+        .unwrap();
+    let repaired_marker_index = repaired_updates
+        .iter()
+        .rposition(|update| {
+            matches!(
+                update,
+                SessionUpdate::Xai(notification)
+                    if matches!(
+                        notification.update,
+                        crate::extensions::notification::SessionUpdate::CompactionCheckpoint(_)
+                    )
+            )
+        })
+        .unwrap();
+    assert_eq!(repaired_updates.len() - repaired_marker_index - 1, 2);
+    assert!(matches!(
+        &repaired_updates[repaired_marker_index + 1],
+        SessionUpdate::Xai(notification)
+            if matches!(
+                notification.update,
+                crate::extensions::notification::SessionUpdate::ConversationAppendPrepared(_)
+            )
+    ));
+    assert!(matches!(
+        &repaired_updates[repaired_marker_index + 2],
+        SessionUpdate::Xai(notification)
+            if matches!(
+                notification.update,
+                crate::extensions::notification::SessionUpdate::ConversationAppendCommitted(_)
+            )
+    ));
 }
 
 #[tokio::test]
@@ -3296,7 +3561,6 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
-            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3359,7 +3623,6 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
-            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(
@@ -3436,7 +3699,6 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
             ConversationItem::Reasoning(_) => "reasoning",
             ConversationItem::ResponsesCompactionCheckpoint(_) => "checkpoint",
-            ConversationItem::ResponsesCompactionCheckpointV2(_) => "checkpoint",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);

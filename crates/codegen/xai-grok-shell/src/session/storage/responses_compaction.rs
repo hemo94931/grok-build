@@ -1,74 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
-use sha2::Digest as _;
 use xai_grok_sampling_types::{
-    CheckpointReplayMaterialV2, ConversationItem, RESPONSES_CHECKPOINT_SCHEMA_V2,
-    ServerResponsesCheckpointV1, ServerResponsesCheckpointV2, wrapper_digest_v2,
+    CheckpointReplayMaterial, ConversationItem, RESPONSES_COMPACTION_CONTRACT,
+    ServerResponsesCheckpoint,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactionCheckpointFileV2 {
-    pub schema_version: u32,
-    pub kind: String,
-    pub checkpoint_id: String,
-    pub prompt_index_at_compaction: usize,
-    pub wrapper: ServerResponsesCheckpointV1,
-    pub portable_history: Vec<ConversationItem>,
-    pub portable_history_sha256: String,
-    pub mode_repair: xai_grok_sampling_types::ResponsesCompactionModeV1,
-    pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_user_info: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reread_file_paths: Vec<String>,
-}
+use crate::extensions::notification::CompactionCheckpointKind;
 
-impl CompactionCheckpointFileV2 {
-    pub fn new(
-        mut wrapper: ServerResponsesCheckpointV1,
-        portable_history: Vec<ConversationItem>,
-        original_user_info: Option<String>,
-        reread_file_paths: Vec<String>,
-    ) -> io::Result<Self> {
-        let digest = portable_history_digest(&portable_history)?;
-        let portable_bytes = portable_history_bytes(&portable_history)?;
-        wrapper.portable_history_sha256 = digest.clone();
-        wrapper.portable_history_bytes = portable_bytes.len() as u64;
-        Ok(Self {
-            schema_version: 2,
-            kind: "responses_server".into(),
-            checkpoint_id: wrapper.checkpoint_id.clone(),
-            prompt_index_at_compaction: wrapper.prompt_index,
-            mode_repair: wrapper.mode.clone(),
-            created_at: wrapper.created_at.to_rfc3339(),
-            wrapper,
-            portable_history,
-            portable_history_sha256: digest,
-            original_user_info,
-            reread_file_paths,
-        })
-    }
-}
-
-/// V3 Responses server-compaction sidecar file (V2 wrapper contract).
+/// Responses server-compaction sidecar.
 ///
-/// V3 pairs the [`ServerResponsesCheckpointV2`] wrapper with its
-/// [`CheckpointReplayMaterialV2`] so replay verification recomputes every
-/// digest from actual data instead of trusting the sidecar wholesale. All
-/// three views of the portable history (sidecar digest, wrapper digest,
-/// replay-material digest) must agree at construction and at every read.
+/// Replay verification recomputes every digest from persisted data instead of
+/// trusting the sidecar wholesale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactionCheckpointFileV3 {
-    pub schema_version: u32,
-    pub kind: String,
+#[serde(deny_unknown_fields)]
+pub struct CompactionCheckpointFile {
+    pub kind: CompactionCheckpointKind,
     pub checkpoint_id: String,
     pub operation_id: String,
     pub prompt_index_at_compaction: usize,
-    pub wrapper: ServerResponsesCheckpointV2,
-    pub replay_material: CheckpointReplayMaterialV2,
+    pub wrapper: ServerResponsesCheckpoint,
+    pub replay_material: CheckpointReplayMaterial,
     pub portable_history: Vec<ConversationItem>,
     pub portable_history_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,12 +33,10 @@ pub struct CompactionCheckpointFileV3 {
     pub created_at: String,
 }
 
-impl CompactionCheckpointFileV3 {
-    /// Build a V3 sidecar, computing the portable digest and proving that
-    /// the wrapper, the replay material and the portable history all agree.
+impl CompactionCheckpointFile {
     pub fn new(
-        mut wrapper: ServerResponsesCheckpointV2,
-        replay_material: CheckpointReplayMaterialV2,
+        mut wrapper: ServerResponsesCheckpoint,
+        replay_material: CheckpointReplayMaterial,
         portable_history: Vec<ConversationItem>,
         original_user_info: Option<String>,
         reread_file_paths: Vec<String>,
@@ -96,8 +49,6 @@ impl CompactionCheckpointFileV3 {
                 "wrapper portable history digest does not match sidecar history",
             ));
         }
-        // Informational mirror of the V2 sidecar: keep the wrapper's byte
-        // count truthful for checkpoint-bytes telemetry.
         wrapper.portable_history_bytes = portable_bytes;
         if replay_material.portable_history_sha256() != digest {
             return Err(io::Error::new(
@@ -119,15 +70,8 @@ impl CompactionCheckpointFileV3 {
                 "replay material branch or prior checkpoint does not match the wrapper",
             ));
         }
-        if wrapper.schema_version != RESPONSES_CHECKPOINT_SCHEMA_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported responses checkpoint wrapper schema",
-            ));
-        }
         Ok(Self {
-            schema_version: 3,
-            kind: "responses_server_v2".into(),
+            kind: CompactionCheckpointKind::ResponsesServer,
             checkpoint_id: wrapper.checkpoint_id.clone(),
             operation_id: wrapper.operation_id.clone(),
             prompt_index_at_compaction: wrapper.prompt_index,
@@ -142,48 +86,14 @@ impl CompactionCheckpointFileV3 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsesCompactionSegmentStagingV1 {
-    pub schema_version: u32,
-    pub checkpoint_id: String,
-    pub items: Vec<ConversationItem>,
-    pub summary: String,
-    pub detail: String,
-    pub timestamp: String,
-}
-
-impl ResponsesCompactionSegmentStagingV1 {
-    pub fn new(
-        checkpoint_id: impl Into<String>,
-        items: Vec<ConversationItem>,
-        summary: impl Into<String>,
-        detail: xai_chat_state::CompactionDetail,
-        timestamp: impl Into<String>,
-    ) -> io::Result<Self> {
-        let staging = Self {
-            schema_version: 1,
-            checkpoint_id: checkpoint_id.into(),
-            items,
-            summary: summary.into(),
-            detail: detail.to_string(),
-            timestamp: timestamp.into(),
-        };
-        validate_segment_staging(&staging)?;
-        Ok(staging)
-    }
-}
-
-/// V2 staged (unpublished) compaction segment for the V2/V3 server
-/// contract. Unlike V1 it carries the operation id, branch and wrapper
-/// digest so crash recovery can bind the staging to a live V2 wrapper
-/// strongly instead of by checkpoint id and portable digest alone.
+/// Staged (unpublished) Responses compaction segment.
 ///
-/// The file lives at the same `compaction/staging/{checkpoint_id}.json`
-/// path as V1 staging so crash recovery discovers it regardless of which
-/// schema version wrote it.
+/// The payload binds through the checkpoint operation, branch, and wrapper
+/// digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsesCompactionSegmentStagingV2 {
-    pub schema_version: u32,
+#[serde(deny_unknown_fields)]
+pub struct ResponsesCompactionSegmentStaging {
+    pub kind: CompactionCheckpointKind,
     pub checkpoint_id: String,
     pub operation_id: String,
     pub branch_id: String,
@@ -194,7 +104,8 @@ pub struct ResponsesCompactionSegmentStagingV2 {
     pub timestamp: String,
 }
 
-impl ResponsesCompactionSegmentStagingV2 {
+impl ResponsesCompactionSegmentStaging {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         checkpoint_id: impl Into<String>,
         operation_id: impl Into<String>,
@@ -206,7 +117,7 @@ impl ResponsesCompactionSegmentStagingV2 {
         timestamp: impl Into<String>,
     ) -> io::Result<Self> {
         let staging = Self {
-            schema_version: 2,
+            kind: CompactionCheckpointKind::ResponsesServer,
             checkpoint_id: checkpoint_id.into(),
             operation_id: operation_id.into(),
             branch_id: branch_id.into(),
@@ -216,7 +127,7 @@ impl ResponsesCompactionSegmentStagingV2 {
             detail: detail.to_string(),
             timestamp: timestamp.into(),
         };
-        validate_segment_staging_v2(&staging)?;
+        validate_segment_staging(&staging)?;
         Ok(staging)
     }
 }
@@ -228,7 +139,7 @@ pub struct PublishedCompactionSegment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TailV2 {
+pub struct PersistedTail {
     pub operation_id: String,
     pub checkpoint_id: String,
     pub branch_id: String,
@@ -239,8 +150,8 @@ pub struct TailV2 {
 
 #[derive(Debug, Clone)]
 pub enum PersistedChatEntry {
-    Legacy(ConversationItem),
-    TailV2(TailV2),
+    Item(ConversationItem),
+    Tail(PersistedTail),
 }
 
 impl Serialize for PersistedChatEntry {
@@ -249,15 +160,15 @@ impl Serialize for PersistedChatEntry {
         S: serde::Serializer,
     {
         match self {
-            Self::Legacy(item) => item.serialize(serializer),
-            Self::TailV2(tail) => {
+            Self::Item(item) => item.serialize(serializer),
+            Self::Tail(tail) => {
                 let mut value = serde_json::to_value(tail).map_err(serde::ser::Error::custom)?;
                 value
                     .as_object_mut()
-                    .expect("TailV2 serializes as an object")
+                    .expect("PersistedTail serializes as an object")
                     .insert(
                         "persisted_entry".into(),
-                        serde_json::Value::String("tail_v2".into()),
+                        serde_json::Value::String("tail".into()),
                     );
                 value.serialize(serializer)
             }
@@ -274,24 +185,24 @@ impl<'de> Deserialize<'de> for PersistedChatEntry {
         if value
             .get("persisted_entry")
             .and_then(serde_json::Value::as_str)
-            == Some("tail_v2")
+            == Some("tail")
         {
             value
                 .as_object_mut()
                 .expect("tagged tail is an object")
                 .remove("persisted_entry");
             return serde_json::from_value(value)
-                .map(Self::TailV2)
+                .map(Self::Tail)
                 .map_err(serde::de::Error::custom);
         }
         serde_json::from_value(value)
-            .map(Self::Legacy)
+            .map(Self::Item)
             .map_err(serde::de::Error::custom)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationAppendPreparedV2 {
+pub struct ConversationAppendPrepared {
     pub operation_id: String,
     pub checkpoint_id: String,
     pub branch_id: String,
@@ -300,7 +211,7 @@ pub struct ConversationAppendPreparedV2 {
     pub item: ConversationItem,
 }
 
-impl PartialEq for ConversationAppendPreparedV2 {
+impl PartialEq for ConversationAppendPrepared {
     fn eq(&self, other: &Self) -> bool {
         self.operation_id == other.operation_id
             && self.checkpoint_id == other.checkpoint_id
@@ -312,7 +223,7 @@ impl PartialEq for ConversationAppendPreparedV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConversationAppendCommittedV2 {
+pub struct ConversationAppendCommitted {
     pub operation_id: String,
     pub checkpoint_id: String,
     pub branch_id: String,
@@ -320,8 +231,8 @@ pub struct ConversationAppendCommittedV2 {
     pub prompt_index: usize,
 }
 
-impl From<&ConversationAppendPreparedV2> for ConversationAppendCommittedV2 {
-    fn from(prepared: &ConversationAppendPreparedV2) -> Self {
+impl From<&ConversationAppendPrepared> for ConversationAppendCommitted {
+    fn from(prepared: &ConversationAppendPrepared) -> Self {
         Self {
             operation_id: prepared.operation_id.clone(),
             checkpoint_id: prepared.checkpoint_id.clone(),
@@ -334,15 +245,15 @@ impl From<&ConversationAppendPreparedV2> for ConversationAppendCommittedV2 {
 
 #[derive(Debug, Clone)]
 pub enum TailJournalRecord {
-    Prepared(ConversationAppendPreparedV2),
-    Committed(ConversationAppendCommittedV2),
+    Prepared(ConversationAppendPrepared),
+    Committed(ConversationAppendCommitted),
 }
 
 #[derive(Debug, Clone)]
-pub struct RecoveredHistoryV2 {
+pub struct RecoveredHistory {
     pub conversation: Vec<ConversationItem>,
-    pub prepared_repairs: Vec<ConversationAppendPreparedV2>,
-    pub committed_repairs: Vec<ConversationAppendCommittedV2>,
+    pub prepared_repairs: Vec<ConversationAppendPrepared>,
+    pub committed_repairs: Vec<ConversationAppendCommitted>,
 }
 
 pub fn portable_history_bytes(history: &[ConversationItem]) -> io::Result<Vec<u8>> {
@@ -355,16 +266,16 @@ pub fn portable_history_digest(history: &[ConversationItem]) -> io::Result<Strin
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub fn write_checkpoint_v2_durable(
+pub fn write_checkpoint_durable(
     session_dir: &Path,
     relative_path: &str,
-    checkpoint: &CompactionCheckpointFileV2,
+    checkpoint: &CompactionCheckpointFile,
 ) -> io::Result<()> {
     validate_relative_checkpoint_path(relative_path)?;
-    if checkpoint.schema_version != 2 || checkpoint.kind != "responses_server" {
+    if checkpoint.kind != CompactionCheckpointKind::ResponsesServer {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid responses checkpoint schema",
+            "invalid Responses checkpoint kind",
         ));
     }
     validate_checkpoint(checkpoint, None, None, None)?;
@@ -374,16 +285,16 @@ pub fn write_checkpoint_v2_durable(
     write_bytes_durable(&path, &bytes)
 }
 
-pub fn read_checkpoint_v2(
+pub fn read_checkpoint(
     session_dir: &Path,
     relative_path: &str,
     expected_checkpoint_id: &str,
     expected_prompt_index: usize,
     expected_digest: &str,
-) -> io::Result<CompactionCheckpointFileV2> {
+) -> io::Result<CompactionCheckpointFile> {
     let path = safe_join_for_read(session_dir, relative_path)?;
     let bytes = std::fs::read(path)?;
-    let checkpoint: CompactionCheckpointFileV2 = serde_json::from_slice(&bytes)
+    let checkpoint: CompactionCheckpointFile = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     validate_checkpoint(
         &checkpoint,
@@ -400,125 +311,27 @@ pub fn read_checkpoint_v2(
     Ok(checkpoint)
 }
 
+/// Read and strongly bind the current sidecar to a live wrapper.
+///
+/// Rewind and fork may rotate only the active branch. Replacing the stored
+/// branch with the live branch must reconcile the wrapper digest; every other
+/// immutable binding field must match.
 pub fn read_checkpoint_for_wrapper(
     session_dir: &Path,
-    wrapper: &ServerResponsesCheckpointV1,
-) -> io::Result<CompactionCheckpointFileV2> {
-    if wrapper.schema_version != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported responses checkpoint wrapper schema",
-        ));
-    }
-    let checkpoint = read_checkpoint_v2(
+    wrapper: &ServerResponsesCheckpoint,
+) -> io::Result<CompactionCheckpointFile> {
+    let checkpoint = read_checkpoint(
         session_dir,
         &wrapper.portable_history_path,
         &wrapper.checkpoint_id,
         wrapper.prompt_index,
         &wrapper.portable_history_sha256,
     )?;
-    // Rewind/fork may rotate only the active branch. Every immutable replay
-    // field must still match the sidecar's wrapper copy.
-    let mut stored = checkpoint.wrapper.clone();
-    stored.branch_id = wrapper.branch_id.clone();
-    let expected = serde_json::to_value(wrapper)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let actual = serde_json::to_value(stored)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "active wrapper does not match checkpoint sidecar",
-        ));
-    }
-    Ok(checkpoint)
-}
-
-pub fn write_checkpoint_v3_durable(
-    session_dir: &Path,
-    relative_path: &str,
-    checkpoint: &CompactionCheckpointFileV3,
-) -> io::Result<()> {
-    validate_relative_checkpoint_path(relative_path)?;
-    if checkpoint.schema_version != 3 || checkpoint.kind != "responses_server_v2" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid responses checkpoint schema",
-        ));
-    }
-    validate_checkpoint_v3(checkpoint, None, None, None)?;
-    let path = safe_join_for_write(session_dir, relative_path)?;
-    let bytes = serde_json::to_vec(checkpoint)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    write_bytes_durable(&path, &bytes)
-}
-
-pub fn read_checkpoint_v3(
-    session_dir: &Path,
-    relative_path: &str,
-    expected_checkpoint_id: &str,
-    expected_prompt_index: usize,
-    expected_digest: &str,
-) -> io::Result<CompactionCheckpointFileV3> {
-    let path = safe_join_for_read(session_dir, relative_path)?;
-    let bytes = std::fs::read(path)?;
-    let checkpoint: CompactionCheckpointFileV3 = serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    validate_checkpoint_v3(
-        &checkpoint,
-        Some(expected_checkpoint_id),
-        Some(expected_prompt_index),
-        Some(expected_digest),
-    )?;
-    if checkpoint.wrapper.portable_history_path != relative_path {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "wrapper checkpoint path mismatch",
-        ));
-    }
-    Ok(checkpoint)
-}
-
-/// Read and bind the V3 sidecar for a live V2 wrapper.
-///
-/// Security rationale: the sidecar's wrapper copy is not trusted wholesale.
-/// Every immutable binding field (checkpoint/operation id, prompt index,
-/// portable digest, prior checkpoint, identity) must equal the live wrapper,
-/// and the wrapper digest must hold. Rewind/fork may rotate only the active
-/// branch, so a branch-only difference is accepted when replacing the stored
-/// branch with the live one makes the digests agree.
-pub fn read_checkpoint_for_wrapper_v2(
-    session_dir: &Path,
-    wrapper: &ServerResponsesCheckpointV2,
-) -> io::Result<CompactionCheckpointFileV3> {
-    if wrapper.schema_version != RESPONSES_CHECKPOINT_SCHEMA_V2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported responses checkpoint wrapper schema",
-        ));
-    }
-    let checkpoint = read_checkpoint_v3(
-        session_dir,
-        &wrapper.portable_history_path,
-        &wrapper.checkpoint_id,
-        wrapper.prompt_index,
-        &wrapper.portable_history_sha256,
-    )?;
-    // Rotation-aware wrapper binding: only the branch may differ, and only
-    // when substituting the live branch reconciles the wrapper digest.
     let stored = &checkpoint.wrapper;
     let rotated = stored.branch_id != wrapper.branch_id;
     let mut rebound = stored.clone();
     rebound.branch_id = wrapper.branch_id.clone();
-    let digest_ok = rebound.wrapper_digest() == wrapper.wrapper_digest();
-    if !digest_ok
-        || stored.checkpoint_id != wrapper.checkpoint_id
-        || stored.operation_id != wrapper.operation_id
-        || stored.prompt_index != wrapper.prompt_index
-        || stored.portable_history_sha256 != wrapper.portable_history_sha256
-        || stored.prior_checkpoint_id != wrapper.prior_checkpoint_id
-        || stored.identity != wrapper.identity
-    {
+    if &rebound != wrapper {
         let detail = if rotated {
             "rotated branch does not reconcile the wrapper digest"
         } else {
@@ -529,18 +342,16 @@ pub fn read_checkpoint_for_wrapper_v2(
     Ok(checkpoint)
 }
 
-/// Full validation of a V3 sidecar: schema/kind, internal id consistency,
-/// expected id/index/digest, and every digest recomputed from the data.
-fn validate_checkpoint_v3(
-    checkpoint: &CompactionCheckpointFileV3,
+fn validate_checkpoint(
+    checkpoint: &CompactionCheckpointFile,
     expected_checkpoint_id: Option<&str>,
     expected_prompt_index: Option<usize>,
     expected_digest: Option<&str>,
 ) -> io::Result<()> {
-    if checkpoint.schema_version != 3 || checkpoint.kind != "responses_server_v2" {
+    if checkpoint.kind != CompactionCheckpointKind::ResponsesServer {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported checkpoint schema",
+            "invalid Responses checkpoint kind",
         ));
     }
     if expected_checkpoint_id.is_some_and(|id| checkpoint.checkpoint_id != id)
@@ -576,63 +387,70 @@ fn validate_checkpoint_v3(
             "portable history digest mismatch",
         ));
     }
+    if checkpoint.wrapper.portable_history_bytes
+        != portable_history_bytes(&checkpoint.portable_history)?.len() as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "portable history byte count mismatch",
+        ));
+    }
     if checkpoint.wrapper.wrapper_digest() != checkpoint.replay_material.wrapper_digest() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "wrapper digest mismatch",
         ));
     }
-    Ok(())
-}
-
-pub fn marker_for_wrapper(
-    wrapper: &ServerResponsesCheckpointV1,
-) -> crate::extensions::notification::CompactionCheckpointInfo {
-    crate::extensions::notification::CompactionCheckpointInfo {
-        checkpoint_id: wrapper.checkpoint_id.clone(),
-        prompt_index_at_compaction: wrapper.prompt_index,
-        checkpoint_file: wrapper.portable_history_path.clone(),
-        auto_continue: None,
-        schema_version: 2,
-        operation_id: Some(wrapper.operation_id.clone()),
-        branch_id: Some(wrapper.branch_id.clone()),
-        portable_history_sha256: Some(wrapper.portable_history_sha256.clone()),
-        responses_mode: Some(wrapper.mode.clone()),
-        responses_auto_continue: Some(wrapper.auto_continue),
-        wrapper_digest: None,
-        prior_checkpoint_id: None,
-        created_at: wrapper.created_at.to_rfc3339(),
-    }
-}
-
-pub fn validate_marker_for_wrapper(
-    marker: &crate::extensions::notification::CompactionCheckpointInfo,
-    wrapper: &ServerResponsesCheckpointV1,
-) -> io::Result<()> {
-    let expected = marker_for_wrapper(wrapper);
-    if marker != &expected {
+    if checkpoint.wrapper.output.is_empty()
+        || checkpoint.wrapper.server_output_item_count != checkpoint.wrapper.output.len()
+        || checkpoint.wrapper.checkpoint_token_seed == 0
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "responses checkpoint marker does not match active wrapper",
+            "invalid checkpoint output or token seed",
+        ));
+    }
+    if checkpoint.replay_material.branch_id() != checkpoint.wrapper.branch_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay material branch mismatch",
+        ));
+    }
+    if checkpoint.replay_material.prior_checkpoint_id()
+        != checkpoint.wrapper.prior_checkpoint_id.as_deref()
+        || checkpoint.wrapper.identity.prior_checkpoint_id != checkpoint.wrapper.prior_checkpoint_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint prior chain mismatch",
+        ));
+    }
+    if checkpoint.replay_material.contract_version() != RESPONSES_COMPACTION_CONTRACT
+        || checkpoint.wrapper.identity.contract_version != RESPONSES_COMPACTION_CONTRACT
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint contract mismatch",
+        ));
+    }
+    if checkpoint.replay_material.memory_revision() != checkpoint.wrapper.memory_revision {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint memory revision mismatch",
         ));
     }
     Ok(())
 }
 
-/// Build the schema-3 marker for a live V2 wrapper.
-///
-/// Unlike schema 2, the marker binds through stable identifiers and the
-/// wrapper digest instead of relying on whole-JSON equality: branch rotation
-/// and marker repair must not invalidate an otherwise identical checkpoint.
-pub fn marker_for_wrapper_v3(
-    wrapper: &ServerResponsesCheckpointV2,
+pub fn marker_for_wrapper(
+    wrapper: &ServerResponsesCheckpoint,
 ) -> crate::extensions::notification::CompactionCheckpointInfo {
     crate::extensions::notification::CompactionCheckpointInfo {
         checkpoint_id: wrapper.checkpoint_id.clone(),
         prompt_index_at_compaction: wrapper.prompt_index,
+        kind: CompactionCheckpointKind::ResponsesServer,
         checkpoint_file: wrapper.portable_history_path.clone(),
         auto_continue: None,
-        schema_version: 3,
         operation_id: Some(wrapper.operation_id.clone()),
         branch_id: Some(wrapper.branch_id.clone()),
         portable_history_sha256: Some(wrapper.portable_history_sha256.clone()),
@@ -644,23 +462,17 @@ pub fn marker_for_wrapper_v3(
     }
 }
 
-/// Validate a schema-3 marker against a live V2 wrapper by comparing only
-/// stable binding fields: schema, checkpoint id, prompt index, checkpoint
-/// file, operation id, portable digest, wrapper digest, prior checkpoint,
-/// mode and auto-continue flag.
-///
-/// Deliberately **not** compared: `branch_id` (rewind/fork may rotate the
-/// active branch) and `created_at` (repair tolerance). A mismatch means the
-/// marker references a different checkpoint than the live wrapper and must
-/// fail closed.
-pub fn validate_marker_for_wrapper_v3(
+/// Validate stable marker bindings. Creation time is diagnostic. A rotated
+/// branch is accepted only when the marker digest recomputes from that exact
+/// branch and every other wrapper field remains unchanged.
+pub fn validate_marker_for_wrapper(
     marker: &crate::extensions::notification::CompactionCheckpointInfo,
-    wrapper: &ServerResponsesCheckpointV2,
+    wrapper: &ServerResponsesCheckpoint,
 ) -> io::Result<()> {
-    if marker.schema_version != 3 {
+    if marker.kind != CompactionCheckpointKind::ResponsesServer {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported responses marker schema",
+            "invalid Responses marker kind",
         ));
     }
     if marker.checkpoint_id != wrapper.checkpoint_id {
@@ -681,19 +493,26 @@ pub fn validate_marker_for_wrapper_v3(
             "responses marker checkpoint file mismatch",
         ));
     }
-    if marker.operation_id != Some(wrapper.operation_id.clone()) {
+    if marker.operation_id.as_deref() != Some(wrapper.operation_id.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "responses marker operation id mismatch",
         ));
     }
-    if marker.portable_history_sha256 != Some(wrapper.portable_history_sha256.clone()) {
+    if marker.portable_history_sha256.as_deref() != Some(wrapper.portable_history_sha256.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "responses marker portable history digest mismatch",
         ));
     }
-    if marker.wrapper_digest != Some(wrapper.wrapper_digest()) {
+    let marker_branch = marker.branch_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "responses marker branch is missing",
+        )
+    })?;
+    let wrapper_digest = wrapper.wrapper_digest_for_branch(marker_branch);
+    if marker.wrapper_digest.as_deref() != Some(wrapper_digest.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "responses marker wrapper digest mismatch",
@@ -711,59 +530,10 @@ pub fn validate_marker_for_wrapper_v3(
             "responses marker auto-continue mismatch",
         ));
     }
-    if marker.responses_mode != Some(wrapper.mode.clone()) {
+    if marker.responses_mode.as_ref() != Some(&wrapper.mode) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "responses marker mode mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_checkpoint(
-    checkpoint: &CompactionCheckpointFileV2,
-    expected_checkpoint_id: Option<&str>,
-    expected_prompt_index: Option<usize>,
-    expected_digest: Option<&str>,
-) -> io::Result<()> {
-    if checkpoint.schema_version != 2 || checkpoint.kind != "responses_server" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported checkpoint schema",
-        ));
-    }
-    if expected_checkpoint_id.is_some_and(|id| checkpoint.checkpoint_id != id)
-        || checkpoint.wrapper.checkpoint_id != checkpoint.checkpoint_id
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "checkpoint id mismatch",
-        ));
-    }
-    if expected_prompt_index.is_some_and(|index| checkpoint.prompt_index_at_compaction != index)
-        || checkpoint.wrapper.prompt_index != checkpoint.prompt_index_at_compaction
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "checkpoint prompt index mismatch",
-        ));
-    }
-    let digest = portable_history_digest(&checkpoint.portable_history)?;
-    if digest != checkpoint.portable_history_sha256
-        || digest != checkpoint.wrapper.portable_history_sha256
-        || expected_digest.is_some_and(|expected| digest != expected)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "portable history digest mismatch",
-        ));
-    }
-    if checkpoint.wrapper.portable_history_bytes
-        != portable_history_bytes(&checkpoint.portable_history)?.len() as u64
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "portable history byte count mismatch",
         ));
     }
     Ok(())
@@ -777,7 +547,7 @@ pub fn persisted_entries_for_replacement(
         return Ok(messages
             .iter()
             .cloned()
-            .map(PersistedChatEntry::Legacy)
+            .map(PersistedChatEntry::Item)
             .collect());
     };
     let request = xai_grok_sampling_types::ConversationRequest {
@@ -787,14 +557,14 @@ pub fn persisted_entries_for_replacement(
     request
         .validate_for_backend(&xai_grok_sampling_types::ApiBackend::Responses)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut entries = vec![PersistedChatEntry::Legacy(messages[0].clone())];
+    let mut entries = vec![PersistedChatEntry::Item(messages[0].clone())];
     let mut prompt_index = checkpoint.prompt_index;
     for (index, item) in messages.iter().skip(1).cloned().enumerate() {
         if matches!(item, ConversationItem::User(_)) {
             prompt_index = prompt_index.saturating_add(1);
         }
         let sequence = (index + 1) as u64;
-        entries.push(PersistedChatEntry::TailV2(TailV2 {
+        entries.push(PersistedChatEntry::Tail(PersistedTail {
             operation_id: format!("{operation_id}-{sequence}"),
             checkpoint_id: checkpoint.checkpoint_id.clone(),
             branch_id: checkpoint.branch_id.clone(),
@@ -806,7 +576,35 @@ pub fn persisted_entries_for_replacement(
     Ok(entries)
 }
 
-pub fn write_history_v2_durable(path: &Path, entries: &[PersistedChatEntry]) -> io::Result<()> {
+/// Derive the Prepared/Committed baseline that must follow the active marker
+/// for every typed tail item installed by a full history replacement.
+pub fn tail_journal_repairs_for_replacement(
+    operation_id: &str,
+    messages: &[ConversationItem],
+) -> io::Result<Vec<(ConversationAppendPrepared, ConversationAppendCommitted)>> {
+    persisted_entries_for_replacement(operation_id, messages).map(|entries| {
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                let PersistedChatEntry::Tail(tail) = entry else {
+                    return None;
+                };
+                let prepared = ConversationAppendPrepared {
+                    operation_id: tail.operation_id,
+                    checkpoint_id: tail.checkpoint_id,
+                    branch_id: tail.branch_id,
+                    sequence: tail.sequence,
+                    prompt_index: tail.prompt_index,
+                    item: tail.item,
+                };
+                let committed = ConversationAppendCommitted::from(&prepared);
+                Some((prepared, committed))
+            })
+            .collect()
+    })
+}
+
+pub fn write_history_durable(path: &Path, entries: &[PersistedChatEntry]) -> io::Result<()> {
     let mut bytes = Vec::new();
     for entry in entries {
         serde_json::to_writer(&mut bytes, entry)
@@ -816,101 +614,163 @@ pub fn write_history_v2_durable(path: &Path, entries: &[PersistedChatEntry]) -> 
     write_bytes_durable(path, &bytes)
 }
 
-pub fn read_history_v2(path: &Path) -> io::Result<RecoveredHistoryV2> {
+pub fn read_history(path: &Path) -> io::Result<RecoveredHistory> {
     recover_history_entries(read_persisted_entries(path)?)
 }
 
 fn read_persisted_entries(path: &Path) -> io::Result<Vec<PersistedChatEntry>> {
     let bytes = std::fs::read(path)?;
+    let final_part = bytes.split(|byte| *byte == b'\n').count().saturating_sub(1);
+    let has_terminated_tail = bytes.last().is_none_or(|byte| *byte == b'\n');
     let mut entries = Vec::new();
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        entries.push(
-            serde_json::from_slice::<PersistedChatEntry>(line).map_err(|error| {
-                io::Error::new(
+        match serde_json::from_slice::<PersistedChatEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(error) if index == final_part && !has_terminated_tail => {
+                // A process kill/ENOSPC may leave only the final append torn.
+                // Prepared without Committed is not authoritative, so ignore
+                // this one unterminated fragment; the next append truncates it
+                // under the append lock before writing.
+                tracing::warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    %error,
+                    "ignoring torn final typed-history record"
+                );
+            }
+            Err(error) => {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid chat history line {}: {error}", index + 1),
-                )
-            })?,
-        );
+                ));
+            }
+        }
     }
     Ok(entries)
 }
 
-/// Append one typed tail line and fsync it before returning. Repeating the
-/// exact operation is idempotent; conflicting or non-contiguous sequences fail closed.
-pub fn append_history_tail_v2_durable(path: &Path, tail: &TailV2) -> io::Result<bool> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "chat history is not a regular file",
-        ));
-    }
-    let entries = read_persisted_entries(path)?;
-    recover_history_entries(entries.clone())?;
-    let Some(PersistedChatEntry::Legacy(ConversationItem::ResponsesCompactionCheckpoint(
-        checkpoint,
-    ))) = entries.first()
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "typed tail requires an active checkpoint wrapper",
-        ));
-    };
-    if tail.checkpoint_id != checkpoint.checkpoint_id || tail.branch_id != checkpoint.branch_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "typed tail checkpoint boundary mismatch",
-        ));
-    }
-    let existing_tail_count = entries.len().saturating_sub(1) as u64;
-    if tail.sequence <= existing_tail_count {
-        let existing = entries
-            .get(tail.sequence as usize)
-            .and_then(|entry| match entry {
-                PersistedChatEntry::TailV2(existing) => Some(existing),
-                PersistedChatEntry::Legacy(_) => None,
-            });
-        return if existing.is_some_and(|existing| {
-            existing.operation_id == tail.operation_id
-                && existing.checkpoint_id == tail.checkpoint_id
-                && existing.branch_id == tail.branch_id
-                && existing.sequence == tail.sequence
-                && existing.prompt_index == tail.prompt_index
-                && serde_json::to_value(&existing.item).ok()
-                    == serde_json::to_value(&tail.item).ok()
-        }) {
-            Ok(false)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "typed tail sequence conflicts with authoritative history",
-            ))
-        };
-    }
-    if tail.sequence != existing_tail_count.saturating_add(1) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "typed tail sequence is not contiguous",
-        ));
-    }
-
-    let mut line = serde_json::to_vec(&PersistedChatEntry::TailV2(tail.clone()))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    line.push(b'\n');
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-    file.write_all(&line)?;
-    file.flush()?;
-    super::sync_file_durable(&file)?;
-    Ok(true)
+fn lock_history_append(path: &Path) -> io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("jsonl.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
-pub fn recover_history_entries(entries: Vec<PersistedChatEntry>) -> io::Result<RecoveredHistoryV2> {
+/// Repair only an unterminated final append. A complete JSON value merely
+/// receives its missing newline; an incomplete fragment is truncated back to
+/// the last durable record. Corruption in any terminated line still fails
+/// closed in `read_persisted_entries`.
+fn heal_torn_history_tail(path: &Path) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    if bytes.last().is_none_or(|byte| *byte == b'\n') {
+        return Ok(());
+    }
+    let start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if serde_json::from_slice::<PersistedChatEntry>(&bytes[start..]).is_ok() {
+        file.seek(io::SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+    } else {
+        file.set_len(start as u64)?;
+    }
+    file.flush()?;
+    super::sync_file_durable(&file)
+}
+
+/// Append one typed tail line and fsync it before returning. Repeating the
+/// exact operation is idempotent; conflicts and sequence gaps fail closed.
+pub fn append_history_tail_durable(path: &Path, tail: &PersistedTail) -> io::Result<bool> {
+    let lock = lock_history_append(path)?;
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chat history is not a regular file",
+            ));
+        }
+        heal_torn_history_tail(path)?;
+        let entries = read_persisted_entries(path)?;
+        recover_history_entries(entries.clone())?;
+        let Some(PersistedChatEntry::Item(ConversationItem::ResponsesCompactionCheckpoint(
+            checkpoint,
+        ))) = entries.first()
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed tail requires an active checkpoint wrapper",
+            ));
+        };
+        if tail.checkpoint_id != checkpoint.checkpoint_id || tail.branch_id != checkpoint.branch_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed tail checkpoint boundary mismatch",
+            ));
+        }
+        let existing_tail_count = entries.len().saturating_sub(1) as u64;
+        if tail.sequence <= existing_tail_count {
+            let existing = entries
+                .get(tail.sequence as usize)
+                .and_then(|entry| match entry {
+                    PersistedChatEntry::Tail(existing) => Some(existing),
+                    PersistedChatEntry::Item(_) => None,
+                });
+            return if existing.is_some_and(|existing| {
+                existing.operation_id == tail.operation_id
+                    && existing.checkpoint_id == tail.checkpoint_id
+                    && existing.branch_id == tail.branch_id
+                    && existing.sequence == tail.sequence
+                    && existing.prompt_index == tail.prompt_index
+                    && serde_json::to_value(&existing.item).ok()
+                        == serde_json::to_value(&tail.item).ok()
+            }) {
+                Ok(false)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "typed tail sequence conflicts with authoritative history",
+                ))
+            };
+        }
+        if tail.sequence != existing_tail_count.saturating_add(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed tail sequence is not contiguous",
+            ));
+        }
+
+        let mut line = serde_json::to_vec(&PersistedChatEntry::Tail(tail.clone()))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(&line)?;
+        file.flush()?;
+        super::sync_file_durable(&file)?;
+        Ok(true)
+    })();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
+}
+
+pub fn recover_history_entries(
+    mut entries: Vec<PersistedChatEntry>,
+) -> io::Result<RecoveredHistory> {
     let checkpoint = entries.first().and_then(|entry| match entry {
-        PersistedChatEntry::Legacy(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) => {
+        PersistedChatEntry::Item(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) => {
             Some(checkpoint.clone())
         }
         _ => None,
@@ -920,7 +780,7 @@ pub fn recover_history_entries(entries: Vec<PersistedChatEntry>) -> io::Result<R
         .filter(|entry| {
             matches!(
                 entry,
-                PersistedChatEntry::Legacy(ConversationItem::ResponsesCompactionCheckpoint(_))
+                PersistedChatEntry::Item(ConversationItem::ResponsesCompactionCheckpoint(_))
             )
         })
         .count();
@@ -934,8 +794,8 @@ pub fn recover_history_entries(entries: Vec<PersistedChatEntry>) -> io::Result<R
         let mut conversation = Vec::with_capacity(entries.len());
         for entry in entries {
             match entry {
-                PersistedChatEntry::Legacy(item) => conversation.push(item),
-                PersistedChatEntry::TailV2(_) => {
+                PersistedChatEntry::Item(item) => conversation.push(item),
+                PersistedChatEntry::Tail(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "typed tail has no checkpoint wrapper",
@@ -943,57 +803,62 @@ pub fn recover_history_entries(entries: Vec<PersistedChatEntry>) -> io::Result<R
                 }
             }
         }
-        return Ok(RecoveredHistoryV2 {
+        return Ok(RecoveredHistory {
             conversation,
             prepared_repairs: Vec::new(),
             committed_repairs: Vec::new(),
         });
     };
 
+    entries.remove(0);
     let mut conversation = vec![ConversationItem::ResponsesCompactionCheckpoint(
         checkpoint.clone(),
     )];
     let mut prepared_repairs = Vec::new();
     let mut committed_repairs = Vec::new();
     let mut expected_sequence = 1;
-    for entry in entries.into_iter().skip(1) {
-        let PersistedChatEntry::TailV2(tail) = entry else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "legacy tail after v2 checkpoint",
-            ));
-        };
-        if tail.checkpoint_id != checkpoint.checkpoint_id
-            || tail.branch_id != checkpoint.branch_id
-            || tail.sequence != expected_sequence
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "typed tail boundary mismatch",
-            ));
+    for entry in entries {
+        match entry {
+            PersistedChatEntry::Tail(tail) => {
+                if tail.checkpoint_id != checkpoint.checkpoint_id
+                    || tail.branch_id != checkpoint.branch_id
+                    || tail.sequence != expected_sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "typed tail boundary mismatch",
+                    ));
+                }
+                expected_sequence += 1;
+                let prepared = ConversationAppendPrepared {
+                    operation_id: tail.operation_id,
+                    checkpoint_id: tail.checkpoint_id,
+                    branch_id: tail.branch_id,
+                    sequence: tail.sequence,
+                    prompt_index: tail.prompt_index,
+                    item: tail.item,
+                };
+                committed_repairs.push(ConversationAppendCommitted::from(&prepared));
+                conversation.push(prepared.item.clone());
+                prepared_repairs.push(prepared);
+            }
+            PersistedChatEntry::Item(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "untyped item after checkpoint wrapper",
+                ));
+            }
         }
-        expected_sequence += 1;
-        let prepared = ConversationAppendPreparedV2 {
-            operation_id: tail.operation_id,
-            checkpoint_id: tail.checkpoint_id,
-            branch_id: tail.branch_id,
-            sequence: tail.sequence,
-            prompt_index: tail.prompt_index,
-            item: tail.item,
-        };
-        committed_repairs.push(ConversationAppendCommittedV2::from(&prepared));
-        conversation.push(prepared.item.clone());
-        prepared_repairs.push(prepared);
     }
-    Ok(RecoveredHistoryV2 {
+    Ok(RecoveredHistory {
         conversation,
         prepared_repairs,
         committed_repairs,
     })
 }
 
-pub fn rebuild_updates_only_entries_v2(
-    checkpoint: ServerResponsesCheckpointV1,
+pub fn rebuild_updates_only_entries(
+    checkpoint: ServerResponsesCheckpoint,
     records: &[TailJournalRecord],
 ) -> io::Result<Vec<PersistedChatEntry>> {
     let mut prepared = BTreeMap::new();
@@ -1037,7 +902,7 @@ pub fn rebuild_updates_only_entries_v2(
     let mut complete_by_sequence = BTreeMap::new();
     for (key, item) in prepared {
         if committed.contains(&key) {
-            let tail = TailV2 {
+            let tail = PersistedTail {
                 operation_id: key.0,
                 checkpoint_id: key.1,
                 branch_id: key.2,
@@ -1053,7 +918,7 @@ pub fn rebuild_updates_only_entries_v2(
             }
         }
     }
-    let mut entries = vec![PersistedChatEntry::Legacy(
+    let mut entries = vec![PersistedChatEntry::Item(
         ConversationItem::ResponsesCompactionCheckpoint(Box::new(checkpoint)),
     )];
     let mut expected = 1;
@@ -1064,24 +929,24 @@ pub fn rebuild_updates_only_entries_v2(
                 "committed tail sequence gap",
             ));
         }
-        entries.push(PersistedChatEntry::TailV2(tail));
+        entries.push(PersistedChatEntry::Tail(tail));
         expected += 1;
     }
     Ok(entries)
 }
 
-pub fn rebuild_updates_only_v2(
-    checkpoint: ServerResponsesCheckpointV1,
+pub fn rebuild_updates_only(
+    checkpoint: ServerResponsesCheckpoint,
     records: &[TailJournalRecord],
 ) -> io::Result<Vec<ConversationItem>> {
-    recover_history_entries(rebuild_updates_only_entries_v2(checkpoint, records)?)
+    recover_history_entries(rebuild_updates_only_entries(checkpoint, records)?)
         .map(|history| history.conversation)
 }
 
-/// Build the authoritative history for a rewind and rotate the active branch
-/// so records from the abandoned future can never replay into it.
-pub fn rewind_history_entries_v2(
-    checkpoint_file: &CompactionCheckpointFileV2,
+/// Build authoritative history for a rewind and rotate the active branch so
+/// records from the abandoned future can never replay into it.
+pub fn rewind_history_entries(
+    checkpoint_file: &CompactionCheckpointFile,
     active_entries: Vec<PersistedChatEntry>,
     target_prompt_index: usize,
     new_branch_id: &str,
@@ -1115,22 +980,19 @@ pub fn rewind_history_entries_v2(
             target_prompt_index,
         );
         portable.truncate(keep);
-        return Ok(portable
-            .into_iter()
-            .map(PersistedChatEntry::Legacy)
-            .collect());
+        return Ok(portable.into_iter().map(PersistedChatEntry::Item).collect());
     }
 
     let mut wrapper = active_wrapper.clone();
     wrapper.branch_id = new_branch_id.to_string();
-    let mut result = vec![PersistedChatEntry::Legacy(
+    let mut result = vec![PersistedChatEntry::Item(
         ConversationItem::ResponsesCompactionCheckpoint(wrapper),
     )];
     for entry in active_entries.into_iter().skip(1) {
-        let PersistedChatEntry::TailV2(mut tail) = entry else {
+        let PersistedChatEntry::Tail(mut tail) = entry else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "legacy tail after active checkpoint",
+                "plain item after active checkpoint",
             ));
         };
         if tail.prompt_index > target_prompt_index {
@@ -1140,7 +1002,7 @@ pub fn rewind_history_entries_v2(
         tail.operation_id = format!("rewind-{new_branch_id}-{sequence}");
         tail.branch_id = new_branch_id.to_string();
         tail.sequence = sequence;
-        result.push(PersistedChatEntry::TailV2(tail));
+        result.push(PersistedChatEntry::Tail(tail));
     }
     recover_history_entries(result.clone())?;
     Ok(result)
@@ -1148,29 +1010,9 @@ pub fn rewind_history_entries_v2(
 
 const RESPONSES_SEGMENT_MARKER_PREFIX: &str = "responses-compaction-checkpoint:";
 
-/// Read a staged (unpublished) V1 compaction segment for checkpoint recovery.
-///
-/// Returns `Ok(None)` when no staging payload exists for `checkpoint_id`.
-/// Callers must anchor the result on a live wrapper: the V1 staging schema
-/// carries no operation ID, so only the checkpoint ID and a recomputed
-/// portable digest bind it to a checkpoint. Orphan staging left behind by a
-/// cancelled/failed/superseded operation must be ignored by matching the
-/// live wrapper's checkpoint ID and portable digest before use.
-pub fn read_segment_staging_for_recovery(
-    session_dir: &Path,
-    checkpoint_id: &str,
-) -> io::Result<Option<ResponsesCompactionSegmentStagingV1>> {
-    let path = segment_staging_path(session_dir, checkpoint_id)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => read_segment_staging(&path, checkpoint_id).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 pub fn stage_compaction_segment_durable(
     session_dir: &Path,
-    staging: &ResponsesCompactionSegmentStagingV1,
+    staging: &ResponsesCompactionSegmentStaging,
 ) -> io::Result<()> {
     validate_segment_staging(staging)?;
     let path = segment_staging_path(session_dir, &staging.checkpoint_id)?;
@@ -1194,61 +1036,18 @@ pub fn stage_compaction_segment_durable(
     write_bytes_durable(&path, &bytes)
 }
 
-/// Durable-write a V2 staged segment to the same `compaction/staging/`
-/// location V1 uses, so crash recovery sees it regardless of schema.
-pub fn stage_compaction_segment_v2_durable(
-    session_dir: &Path,
-    staging: &ResponsesCompactionSegmentStagingV2,
-) -> io::Result<()> {
-    validate_segment_staging_v2(staging)?;
-    let path = segment_staging_path(session_dir, &staging.checkpoint_id)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    reject_symlink_components(session_dir, parent)?;
-    let bytes = serde_json::to_vec(staging)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if let Ok(existing) = std::fs::read(&path) {
-        return if existing == bytes {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "conflicting Responses segment staging payload",
-            ))
-        };
-    }
-    write_bytes_durable(&path, &bytes)
-}
-
-/// Read the V2 staging payload for a checkpoint by its strong binding keys.
-///
-/// Returns `Ok(None)` when no staging file exists. An existing file that
-/// fails the schema/checkpoint/operation/digest binding is corruption or
-/// tampering and fails closed.
-pub fn read_segment_staging_v2(
+/// Read staging by its strong binding keys. Missing staging is not an error.
+pub fn read_segment_staging(
     session_dir: &Path,
     checkpoint_id: &str,
     operation_id: &str,
     wrapper_digest: &str,
-) -> io::Result<Option<ResponsesCompactionSegmentStagingV2>> {
+) -> io::Result<Option<ResponsesCompactionSegmentStaging>> {
     let path = segment_staging_path(session_dir, checkpoint_id)?;
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {
-            let staging = read_segment_staging_v2_payload(&path, checkpoint_id)?;
-            if staging.operation_id != operation_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "segment staging operation mismatch",
-                ));
-            }
-            if staging.wrapper_digest != wrapper_digest {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "segment staging wrapper digest mismatch",
-                ));
-            }
+            let staging = read_segment_staging_payload(&path, checkpoint_id)?;
+            validate_staging_binding(&staging, operation_id, wrapper_digest)?;
             Ok(Some(staging))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1256,22 +1055,16 @@ pub fn read_segment_staging_v2(
     }
 }
 
-/// Read and strongly bind the V2 staging payload for a live V2 wrapper.
-///
-/// Returns `Ok(None)` when no staging file exists. When one exists, the
-/// checkpoint id, operation id and wrapper digest must all match the live
-/// wrapper. Rewind/fork may rotate only the active branch after staging was
-/// written, so a branch-only difference is accepted when the stored wrapper
-/// digest (computed over the stored branch) reconciles with the live
-/// wrapper's other binding fields.
-pub fn read_segment_staging_v2_for_wrapper(
+/// Read staging for a live wrapper. Branch-only rotation is accepted when the
+/// staging digest reconciles against the stored branch.
+pub fn read_segment_staging_for_wrapper(
     session_dir: &Path,
-    wrapper: &ServerResponsesCheckpointV2,
-) -> io::Result<Option<ResponsesCompactionSegmentStagingV2>> {
+    wrapper: &ServerResponsesCheckpoint,
+) -> io::Result<Option<ResponsesCompactionSegmentStaging>> {
     let path = segment_staging_path(session_dir, &wrapper.checkpoint_id)?;
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {
-            let staging = read_segment_staging_v2_payload(&path, &wrapper.checkpoint_id)?;
+            let staging = read_segment_staging_payload(&path, &wrapper.checkpoint_id)?;
             if staging.operation_id != wrapper.operation_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1281,15 +1074,7 @@ pub fn read_segment_staging_v2_for_wrapper(
             let digest_matches = staging.wrapper_digest == wrapper.wrapper_digest();
             let rotation_ok = !digest_matches
                 && staging.branch_id != wrapper.branch_id
-                && wrapper_digest_v2(
-                    &wrapper.checkpoint_id,
-                    &wrapper.operation_id,
-                    wrapper.prompt_index,
-                    &staging.branch_id,
-                    &wrapper.identity,
-                    &wrapper.portable_history_sha256,
-                    wrapper.prior_checkpoint_id.as_deref(),
-                ) == staging.wrapper_digest;
+                && wrapper.wrapper_digest_for_branch(&staging.branch_id) == staging.wrapper_digest;
             if !digest_matches && !rotation_ok {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1303,8 +1088,8 @@ pub fn read_segment_staging_v2_for_wrapper(
     }
 }
 
-fn validate_segment_staging_v2(staging: &ResponsesCompactionSegmentStagingV2) -> io::Result<()> {
-    if staging.schema_version != 2
+fn validate_segment_staging(staging: &ResponsesCompactionSegmentStaging) -> io::Result<()> {
+    if staging.kind != CompactionCheckpointKind::ResponsesServer
         || staging.items.is_empty()
         || staging.operation_id.is_empty()
         || staging.branch_id.is_empty()
@@ -1325,10 +1110,10 @@ fn validate_segment_staging_v2(staging: &ResponsesCompactionSegmentStagingV2) ->
     Ok(())
 }
 
-fn read_segment_staging_v2_payload(
+fn read_segment_staging_payload(
     path: &Path,
     expected_checkpoint_id: &str,
-) -> io::Result<ResponsesCompactionSegmentStagingV2> {
+) -> io::Result<ResponsesCompactionSegmentStaging> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(io::Error::new(
@@ -1336,10 +1121,9 @@ fn read_segment_staging_v2_payload(
             "segment staging payload is not a regular file",
         ));
     }
-    let staging: ResponsesCompactionSegmentStagingV2 =
-        serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    validate_segment_staging_v2(&staging)?;
+    let staging: ResponsesCompactionSegmentStaging = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    validate_segment_staging(&staging)?;
     if staging.checkpoint_id != expected_checkpoint_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1349,72 +1133,29 @@ fn read_segment_staging_v2_payload(
     Ok(staging)
 }
 
-pub fn publish_staged_compaction_segment_durable(
-    session_dir: &Path,
-    checkpoint_id: &str,
-) -> io::Result<PublishedCompactionSegment> {
-    validate_checkpoint_component(checkpoint_id)?;
-    let compaction_dir = session_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
-    std::fs::create_dir_all(&compaction_dir)?;
-    reject_symlink_components(session_dir, &compaction_dir)?;
-    let staging_path = segment_staging_path(session_dir, checkpoint_id)?;
-    let existing = find_published_segment(&compaction_dir, checkpoint_id)?;
-    if let Some((index, markdown)) = existing {
-        if staging_path.exists() {
-            let staging = read_segment_staging(&staging_path, checkpoint_id)?;
-            ensure_segment_index(
-                &compaction_dir,
-                index,
-                &markdown,
-                &staging.summary,
-                staging.items.len(),
-            )?;
-            remove_segment_staging(&staging_path)?;
-        }
-        return Ok(PublishedCompactionSegment {
-            index,
-            newly_published: false,
-        });
+fn validate_staging_binding(
+    staging: &ResponsesCompactionSegmentStaging,
+    operation_id: &str,
+    wrapper_digest: &str,
+) -> io::Result<()> {
+    if staging.operation_id != operation_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment staging operation mismatch",
+        ));
     }
-
-    let staging = read_segment_staging(&staging_path, checkpoint_id)?;
-    let detail = xai_chat_state::CompactionDetail::parse(&staging.detail).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "invalid staged segment detail")
-    })?;
-    let index = next_compaction_segment_index(&compaction_dir)?;
-    let rendered = xai_chat_state::compaction_transcript::render_segment_md(
-        &staging.items,
-        &staging.summary,
-        index,
-        detail,
-        &staging.timestamp,
-    );
-    let markdown = format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{checkpoint_id} -->\n{rendered}");
-    let segment_path = compaction_dir.join(
-        xai_chat_state::compaction_transcript::segment_filename(index),
-    );
-    write_bytes_durable(&segment_path, markdown.as_bytes())?;
-    ensure_segment_index(
-        &compaction_dir,
-        index,
-        &markdown,
-        &staging.summary,
-        staging.items.len(),
-    )?;
-    remove_segment_staging(&staging_path)?;
-    Ok(PublishedCompactionSegment {
-        index,
-        newly_published: true,
-    })
+    if staging.wrapper_digest != wrapper_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment staging wrapper digest mismatch",
+        ));
+    }
+    Ok(())
 }
 
-/// Publish a committed V2-contract staged segment idempotently, binding the
-/// staging to the live wrapper through the operation id and wrapper digest
-/// (the strong-binding upgrade over the V1 publish, which only knows the
-/// checkpoint id). Same segment layout and index semantics as the V1
-/// publish; a V2 staging file at the shared `compaction/staging/` path is
-/// consumed and removed exactly like V1 staging.
-pub fn publish_staged_compaction_segment_durable_v2(
+/// Publish committed staging idempotently after validating its operation and
+/// wrapper digest.
+pub fn publish_staged_compaction_segment_durable(
     session_dir: &Path,
     checkpoint_id: &str,
     operation_id: &str,
@@ -1428,7 +1169,8 @@ pub fn publish_staged_compaction_segment_durable_v2(
     let existing = find_published_segment(&compaction_dir, checkpoint_id)?;
     if let Some((index, markdown)) = existing {
         if staging_path.exists() {
-            let staging = read_segment_staging_v2_payload(&staging_path, checkpoint_id)?;
+            let staging = read_segment_staging_payload(&staging_path, checkpoint_id)?;
+            validate_staging_binding(&staging, operation_id, wrapper_digest)?;
             ensure_segment_index(
                 &compaction_dir,
                 index,
@@ -1444,19 +1186,8 @@ pub fn publish_staged_compaction_segment_durable_v2(
         });
     }
 
-    let staging = read_segment_staging_v2_payload(&staging_path, checkpoint_id)?;
-    if staging.operation_id != operation_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "segment staging operation mismatch",
-        ));
-    }
-    if staging.wrapper_digest != wrapper_digest {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "segment staging wrapper digest mismatch",
-        ));
-    }
+    let staging = read_segment_staging_payload(&staging_path, checkpoint_id)?;
+    validate_staging_binding(&staging, operation_id, wrapper_digest)?;
     let detail = xai_chat_state::CompactionDetail::parse(&staging.detail).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "invalid staged segment detail")
     })?;
@@ -1485,23 +1216,6 @@ pub fn publish_staged_compaction_segment_durable_v2(
         index,
         newly_published: true,
     })
-}
-
-fn validate_segment_staging(staging: &ResponsesCompactionSegmentStagingV1) -> io::Result<()> {
-    if staging.schema_version != 1 || staging.items.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Responses segment staging payload",
-        ));
-    }
-    validate_checkpoint_component(&staging.checkpoint_id)?;
-    if xai_chat_state::CompactionDetail::parse(&staging.detail).is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Responses segment staging detail",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_checkpoint_component(checkpoint_id: &str) -> io::Result<()> {
@@ -1524,30 +1238,6 @@ fn segment_staging_path(session_dir: &Path, checkpoint_id: &str) -> io::Result<P
         .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
         .join("staging")
         .join(format!("{checkpoint_id}.json")))
-}
-
-fn read_segment_staging(
-    path: &Path,
-    expected_checkpoint_id: &str,
-) -> io::Result<ResponsesCompactionSegmentStagingV1> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "segment staging payload is not a regular file",
-        ));
-    }
-    let staging: ResponsesCompactionSegmentStagingV1 =
-        serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    validate_segment_staging(&staging)?;
-    if staging.checkpoint_id != expected_checkpoint_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "segment staging checkpoint mismatch",
-        ));
-    }
-    Ok(staging)
 }
 
 fn find_published_segment(
@@ -1773,33 +1463,11 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use xai_grok_sampling_types::{
-        CheckpointIdentityV2, CheckpointReplayMaterialV2, RESPONSES_COMPACTION_CONTRACT_V2,
-        ResponsesCompactionModeV1, TrustedPromptEnvelopeV2,
+        CheckpointIdentity, CheckpointReplayMaterial, ResponsesCompactionMode, TokenSeedSource,
+        TrustedPromptEnvelope,
     };
 
-    fn envelope_fixture() -> TrustedPromptEnvelopeV2 {
-        TrustedPromptEnvelopeV2 {
-            base_instructions_sha256: "base-hash".into(),
-            memory_revision: Some(3),
-            envelope_fingerprint: "envelope-fp".into(),
-            wire_prompt_sha256: "wire-hash".into(),
-        }
-    }
-
-    fn identity_fixture(prior: Option<&str>) -> CheckpointIdentityV2 {
-        CheckpointIdentityV2 {
-            provider_id: "xai".into(),
-            api: "responses".into(),
-            endpoint_fingerprint: "endpoint".into(),
-            model: "grok-test".into(),
-            auth_principal_fingerprint: "principal".into(),
-            contract_version: RESPONSES_COMPACTION_CONTRACT_V2.into(),
-            prompt_envelope_fingerprint: "envelope-fp".into(),
-            base_instructions_sha256: "base-hash".into(),
-            prior_checkpoint_id: prior.map(str::to_owned),
-            cache_route_fingerprint: None,
-        }
-    }
+    const RELATIVE_PATH: &str = "compaction_checkpoints/checkpoint-current.json";
 
     fn portable_fixture() -> Vec<ConversationItem> {
         vec![
@@ -1809,19 +1477,42 @@ mod tests {
         ]
     }
 
+    fn identity_fixture(prior: Option<&str>) -> CheckpointIdentity {
+        CheckpointIdentity {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: prior.map(str::to_owned),
+            cache_route_fingerprint: None,
+        }
+    }
+
+    fn envelope_fixture() -> TrustedPromptEnvelope {
+        TrustedPromptEnvelope {
+            base_instructions_sha256: "base-hash".into(),
+            memory_revision: Some(3),
+            envelope_fingerprint: "envelope-fp".into(),
+            wire_prompt_sha256: "wire-hash".into(),
+        }
+    }
+
     fn wrapper_fixture(
         portable: &[ConversationItem],
         prior: Option<&str>,
-    ) -> ServerResponsesCheckpointV2 {
+    ) -> ServerResponsesCheckpoint {
         let digest = portable_history_digest(portable).unwrap();
-        ServerResponsesCheckpointV2 {
-            schema_version: RESPONSES_CHECKPOINT_SCHEMA_V2,
-            checkpoint_id: "cp-v2".into(),
-            operation_id: "op-v2".into(),
+        ServerResponsesCheckpoint {
+            checkpoint_id: "checkpoint-current".into(),
+            operation_id: "operation-current".into(),
             prompt_index: 5,
             created_at: chrono::Utc::now(),
             auto_continue: false,
-            mode: ResponsesCompactionModeV1 {
+            mode: ResponsesCompactionMode {
                 name: "default".into(),
                 detail: None,
             },
@@ -1831,202 +1522,295 @@ mod tests {
                 "type": "compaction",
                 "encrypted_content": "opaque"
             })],
-            portable_history_path: "compaction_checkpoints/cp-v2.json".into(),
+            portable_history_path: RELATIVE_PATH.into(),
             portable_history_sha256: digest,
             portable_history_bytes: 128,
             checkpoint_token_seed: 42,
-            token_seed_source: xai_grok_sampling_types::TokenSeedSource::UsageOutputTokens,
+            token_seed_source: TokenSeedSource::UsageOutputTokens,
             server_output_item_count: 1,
             prior_checkpoint_id: prior.map(str::to_owned),
             memory_revision: Some(3),
         }
     }
 
-    fn material_fixture(
-        wrapper: &ServerResponsesCheckpointV2,
-        portable: &[ConversationItem],
-    ) -> CheckpointReplayMaterialV2 {
-        CheckpointReplayMaterialV2::try_new(wrapper, envelope_fixture(), portable).unwrap()
-    }
-
-    const RELATIVE_PATH: &str = "compaction_checkpoints/cp-v2.json";
-
-    fn write_fixture_sidecar(
-        session_dir: &Path,
-    ) -> (CompactionCheckpointFileV3, ServerResponsesCheckpointV2) {
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let material = material_fixture(&wrapper, &portable);
-        let sidecar = CompactionCheckpointFileV3::new(
-            wrapper.clone(),
+    fn sidecar_fixture(
+        portable: Vec<ConversationItem>,
+        prior: Option<&str>,
+    ) -> (CompactionCheckpointFile, ServerResponsesCheckpoint) {
+        let wrapper = wrapper_fixture(&portable, prior);
+        let material =
+            CheckpointReplayMaterial::try_new(&wrapper, envelope_fixture(), &portable).unwrap();
+        let sidecar = CompactionCheckpointFile::new(
+            wrapper,
             material,
             portable,
             Some("original user".into()),
             vec!["rel/readme.md".into()],
         )
         .unwrap();
-        write_checkpoint_v3_durable(session_dir, RELATIVE_PATH, &sidecar).unwrap();
+        let authoritative_wrapper = sidecar.wrapper.clone();
+        (sidecar, authoritative_wrapper)
+    }
+
+    fn write_fixture_sidecar(
+        session_dir: &Path,
+    ) -> (CompactionCheckpointFile, ServerResponsesCheckpoint) {
+        let (sidecar, wrapper) = sidecar_fixture(portable_fixture(), None);
+        write_checkpoint_durable(session_dir, RELATIVE_PATH, &sidecar).unwrap();
         (sidecar, wrapper)
     }
 
     fn rewrite_sidecar_on_disk(session_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
         let path = session_dir.join(RELATIVE_PATH);
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("sidecar parses as json");
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         mutate(&mut value);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
     #[test]
-    fn v3_write_read_roundtrip() {
+    fn current_checkpoint_round_trip_and_rotation_binding() {
         let dir = tempfile::tempdir().unwrap();
         let (sidecar, wrapper) = write_fixture_sidecar(dir.path());
-        assert_eq!(sidecar.schema_version, 3);
-        assert_eq!(sidecar.kind, "responses_server_v2");
-        assert_eq!(sidecar.original_user_info.as_deref(), Some("original user"));
-        assert_eq!(sidecar.reread_file_paths, vec!["rel/readme.md"]);
+        assert_eq!(sidecar.kind, CompactionCheckpointKind::ResponsesServer);
+        let serialized = serde_json::to_value(&sidecar).unwrap();
+        assert!(serialized.get("schema_version").is_none());
+        assert!(serialized["wrapper"].get("schema_version").is_none());
 
-        let read = read_checkpoint_v3(
+        let read = read_checkpoint(
             dir.path(),
             RELATIVE_PATH,
-            "cp-v2",
+            &wrapper.checkpoint_id,
             5,
             &wrapper.portable_history_sha256,
         )
         .unwrap();
-        assert_eq!(read.checkpoint_id, "cp-v2");
-        assert_eq!(read.operation_id, "op-v2");
-        assert_eq!(read.prompt_index_at_compaction, 5);
-        assert_eq!(
-            read.portable_history_sha256,
-            wrapper.portable_history_sha256
-        );
+        assert_eq!(read.operation_id, wrapper.operation_id);
         assert_eq!(
             read.replay_material.wrapper_digest(),
             wrapper.wrapper_digest()
         );
-        assert_eq!(read.wrapper.wrapper_digest(), wrapper.wrapper_digest());
 
-        let bound = read_checkpoint_for_wrapper_v2(dir.path(), &wrapper).unwrap();
-        assert_eq!(bound.checkpoint_id, wrapper.checkpoint_id);
+        let mut rotated = wrapper.clone();
+        rotated.branch_id = "branch-rotated".into();
+        assert!(read_checkpoint_for_wrapper(dir.path(), &rotated).is_ok());
+        let rotated_marker = marker_for_wrapper(&rotated);
+        validate_marker_for_wrapper(&rotated_marker, &sidecar.wrapper).unwrap();
+
+        let mut forged_output = rotated.clone();
+        forged_output.output = vec![serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "forged"
+        })];
+        assert!(read_checkpoint_for_wrapper(dir.path(), &forged_output).is_err());
+        let mut forged_seed = rotated.clone();
+        forged_seed.checkpoint_token_seed += 1;
+        assert!(read_checkpoint_for_wrapper(dir.path(), &forged_seed).is_err());
+        rotated.operation_id = "operation-forged".into();
+        assert!(read_checkpoint_for_wrapper(dir.path(), &rotated).is_err());
     }
 
     #[test]
-    fn v3_rejects_wrong_expected_digest() {
+    fn current_checkpoint_rejects_tampered_data_and_chain() {
         let dir = tempfile::tempdir().unwrap();
         let (_, wrapper) = write_fixture_sidecar(dir.path());
-        let error =
-            read_checkpoint_v3(dir.path(), RELATIVE_PATH, "cp-v2", 5, "deadbeef").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let _ = wrapper;
-    }
-
-    #[test]
-    fn v3_new_rejects_mismatched_replay_material() {
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let mut other = wrapper.clone();
-        other.operation_id = "op-forged".into();
-        let forged =
-            CheckpointReplayMaterialV2::try_new(&other, envelope_fixture(), &portable).unwrap();
-        assert!(CompactionCheckpointFileV3::new(wrapper, forged, portable, None, vec![],).is_err());
-    }
-
-    #[test]
-    fn v3_tampered_portable_history_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture_sidecar(dir.path());
         rewrite_sidecar_on_disk(dir.path(), |value| {
             value["portable_history"] = serde_json::json!([
                 {"type": "user", "content": [{"type": "text", "text": "tampered"}]}
             ]);
         });
-        let error = read_checkpoint_v3(dir.path(), RELATIVE_PATH, "cp-v2", 5, "x").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn v3_tampered_wrapper_digest_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, wrapper) = write_fixture_sidecar(dir.path());
-        rewrite_sidecar_on_disk(dir.path(), |value| {
-            value["replay_material"]["wrapper_digest"] = serde_json::json!("deadbeef");
-        });
-        let error = read_checkpoint_v3(
-            dir.path(),
-            RELATIVE_PATH,
-            "cp-v2",
-            5,
-            &wrapper.portable_history_sha256,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn v3_rotation_tolerant_read() {
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture_sidecar(dir.path());
-        // Rewind/fork rotated only the live branch.
-        let mut rotated = wrapper_fixture(&portable_fixture(), None);
-        rotated.branch_id = "branch-rotated".into();
-        let bound = read_checkpoint_for_wrapper_v2(dir.path(), &rotated).unwrap();
-        assert_eq!(bound.wrapper.branch_id, "branch-1");
-
-        // Any other live-field difference still fails closed.
-        let mut tampered = rotated;
-        tampered.checkpoint_id = "cp-forged".into();
-        let error = read_checkpoint_for_wrapper_v2(dir.path(), &tampered).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn marker_v3_validates_stable_fields_only() {
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, Some("cp-prior"));
-        let marker = marker_for_wrapper_v3(&wrapper);
-        assert_eq!(marker.schema_version, 3);
-        assert_eq!(
-            marker.wrapper_digest.as_deref(),
-            Some(wrapper.wrapper_digest().as_str())
+        assert!(
+            read_checkpoint(
+                dir.path(),
+                RELATIVE_PATH,
+                &wrapper.checkpoint_id,
+                5,
+                &wrapper.portable_history_sha256,
+            )
+            .is_err()
         );
-        assert_eq!(marker.prior_checkpoint_id.as_deref(), Some("cp-prior"));
-        validate_marker_for_wrapper_v3(&marker, &wrapper).unwrap();
 
-        // Branch rotation and repair timestamps are deliberately ignored.
-        let mut rotated_marker = marker.clone();
-        rotated_marker.branch_id = Some("branch-rotated".into());
-        rotated_marker.created_at = "2000-01-01T00:00:00Z".into();
-        validate_marker_for_wrapper_v3(&rotated_marker, &wrapper).unwrap();
+        write_fixture_sidecar(dir.path());
+        rewrite_sidecar_on_disk(dir.path(), |value| {
+            value["replay_material"]["prior_checkpoint_id"] = serde_json::json!("forged");
+        });
+        assert!(
+            read_checkpoint(
+                dir.path(),
+                RELATIVE_PATH,
+                &wrapper.checkpoint_id,
+                5,
+                &wrapper.portable_history_sha256,
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn marker_v3_rejects_mismatches() {
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let marker = marker_for_wrapper_v3(&wrapper);
+    fn responses_marker_validates_kind_and_stable_fields() {
+        let wrapper = wrapper_fixture(&portable_fixture(), Some("checkpoint-prior"));
+        let marker = marker_for_wrapper(&wrapper);
+        assert_eq!(marker.kind, CompactionCheckpointKind::ResponsesServer);
+        assert!(
+            serde_json::to_value(&marker)
+                .unwrap()
+                .get("schema_version")
+                .is_none()
+        );
+        validate_marker_for_wrapper(&marker, &wrapper).unwrap();
 
-        let mut wrong_digest = marker.clone();
-        wrong_digest.wrapper_digest = Some("deadbeef".into());
-        assert!(validate_marker_for_wrapper_v3(&wrong_digest, &wrapper).is_err());
+        let mut versioned = serde_json::to_value(&marker).unwrap();
+        versioned["schema_version"] = serde_json::json!(3);
+        let versioned: crate::extensions::notification::CompactionCheckpointInfo =
+            serde_json::from_value(versioned).unwrap();
+        assert_eq!(
+            versioned.kind,
+            crate::extensions::notification::CompactionCheckpointKind::Unknown
+        );
+        assert!(validate_marker_for_wrapper(&versioned, &wrapper).is_err());
 
-        let mut wrong_schema = marker.clone();
-        wrong_schema.schema_version = 2;
-        assert!(validate_marker_for_wrapper_v3(&wrong_schema, &wrapper).is_err());
+        let mut repaired = marker.clone();
+        repaired.branch_id = Some("branch-rotated".into());
+        repaired.wrapper_digest = Some(wrapper.wrapper_digest_for_branch("branch-rotated"));
+        repaired.created_at = "2000-01-01T00:00:00Z".into();
+        validate_marker_for_wrapper(&repaired, &wrapper).unwrap();
 
-        let mut wrong_operation = marker.clone();
-        wrong_operation.operation_id = Some("op-forged".into());
-        assert!(validate_marker_for_wrapper_v3(&wrong_operation, &wrapper).is_err());
-
-        let mut wrong_prior = marker.clone();
-        wrong_prior.prior_checkpoint_id = Some("cp-forged".into());
-        assert!(validate_marker_for_wrapper_v3(&wrong_prior, &wrapper).is_err());
+        let mut wrong_kind = marker;
+        wrong_kind.kind = CompactionCheckpointKind::Builtin;
+        assert!(validate_marker_for_wrapper(&wrong_kind, &wrapper).is_err());
     }
 
-    fn staging_fixture(
-        wrapper: &ServerResponsesCheckpointV2,
-    ) -> ResponsesCompactionSegmentStagingV2 {
-        ResponsesCompactionSegmentStagingV2::new(
+    #[test]
+    fn persisted_tail_uses_only_current_serde_tag() {
+        let wrapper = wrapper_fixture(&portable_fixture(), None);
+        let tail = PersistedTail {
+            operation_id: "tail-1".into(),
+            checkpoint_id: wrapper.checkpoint_id,
+            branch_id: wrapper.branch_id,
+            sequence: 1,
+            prompt_index: 6,
+            item: ConversationItem::user("next"),
+        };
+        let value = serde_json::to_value(PersistedChatEntry::Tail(tail)).unwrap();
+        assert_eq!(value["persisted_entry"], "tail");
+
+        let mut removed_tag = value.clone();
+        removed_tag["persisted_entry"] = serde_json::json!("tail_v2");
+        assert!(serde_json::from_value::<PersistedChatEntry>(removed_tag).is_err());
+    }
+
+    #[test]
+    fn replacement_tail_journal_forms_a_complete_rebuild_baseline() {
+        let wrapper = wrapper_fixture(&portable_fixture(), None);
+        let messages = vec![
+            ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone())),
+            ConversationItem::system_reminder("mode hint"),
+            ConversationItem::user("next"),
+        ];
+        let repairs = tail_journal_repairs_for_replacement("replace-op", &messages).unwrap();
+        assert_eq!(repairs.len(), 2);
+        assert_eq!(repairs[0].0.operation_id, "replace-op-1");
+        assert_eq!(repairs[1].0.sequence, 2);
+        let records = repairs
+            .into_iter()
+            .flat_map(|(prepared, committed)| {
+                [
+                    TailJournalRecord::Prepared(prepared),
+                    TailJournalRecord::Committed(committed),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let rebuilt = rebuild_updates_only(wrapper, &records).unwrap();
+        assert_eq!(
+            serde_json::to_value(rebuilt).unwrap(),
+            serde_json::to_value(messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn history_tail_is_durable_contiguous_and_rebuildable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_history.jsonl");
+        let wrapper = wrapper_fixture(&portable_fixture(), None);
+        write_history_durable(
+            &path,
+            &[PersistedChatEntry::Item(
+                ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone())),
+            )],
+        )
+        .unwrap();
+        let tail = PersistedTail {
+            operation_id: "tail-1".into(),
+            checkpoint_id: wrapper.checkpoint_id.clone(),
+            branch_id: wrapper.branch_id.clone(),
+            sequence: 1,
+            prompt_index: 6,
+            item: ConversationItem::user("next"),
+        };
+        assert!(append_history_tail_durable(&path, &tail).unwrap());
+        assert!(!append_history_tail_durable(&path, &tail).unwrap());
+
+        // A complete record whose final newline was torn is retained and
+        // terminated before the next append.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, bytes).unwrap();
+        let next = PersistedTail {
+            operation_id: "tail-2".into(),
+            sequence: 2,
+            item: ConversationItem::assistant("answer"),
+            ..tail.clone()
+        };
+        assert!(append_history_tail_durable(&path, &next).unwrap());
+        let recovered = read_history(&path).unwrap();
+        assert_eq!(recovered.conversation.len(), 3);
+        assert_eq!(recovered.prepared_repairs.len(), 2);
+
+        let prepared = recovered.prepared_repairs[0].clone();
+        let records = vec![
+            TailJournalRecord::Prepared(prepared.clone()),
+            TailJournalRecord::Committed(ConversationAppendCommitted::from(&prepared)),
+        ];
+        let rebuilt = rebuild_updates_only(wrapper, &records).unwrap();
+        assert_eq!(rebuilt.len(), 2);
+    }
+
+    #[test]
+    fn invalid_torn_tail_is_dropped_before_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_history.jsonl");
+        let wrapper = wrapper_fixture(&portable_fixture(), None);
+        write_history_durable(
+            &path,
+            &[PersistedChatEntry::Item(
+                ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone())),
+            )],
+        )
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"persisted_entry\":\"tail\",\"operation_id\":")
+            .unwrap();
+        drop(file);
+
+        // Resume can ignore only this final unterminated fragment.
+        assert_eq!(read_history(&path).unwrap().conversation.len(), 1);
+        let tail = PersistedTail {
+            operation_id: "tail-1".into(),
+            checkpoint_id: wrapper.checkpoint_id,
+            branch_id: wrapper.branch_id,
+            sequence: 1,
+            prompt_index: 6,
+            item: ConversationItem::user("retry"),
+        };
+        assert!(append_history_tail_durable(&path, &tail).unwrap());
+        assert_eq!(read_history(&path).unwrap().conversation.len(), 2);
+    }
+
+    fn staging_fixture(wrapper: &ServerResponsesCheckpoint) -> ResponsesCompactionSegmentStaging {
+        ResponsesCompactionSegmentStaging::new(
             wrapper.checkpoint_id.clone(),
             wrapper.operation_id.clone(),
             wrapper.branch_id.clone(),
@@ -2040,160 +1824,35 @@ mod tests {
     }
 
     #[test]
-    fn staging_v2_strong_binding() {
+    fn staging_strong_binding_and_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let staging = staging_fixture(&wrapper);
-        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
-
-        let read = read_segment_staging_v2_for_wrapper(dir.path(), &wrapper)
-            .unwrap()
-            .expect("staging binds to the live wrapper");
-        assert_eq!(read.items.len(), 1);
-        let read_plain = read_segment_staging_v2(
-            dir.path(),
-            &wrapper.checkpoint_id,
-            &wrapper.operation_id,
-            &wrapper.wrapper_digest(),
-        )
-        .unwrap()
-        .expect("staging binds by strong keys");
-        assert_eq!(read_plain.checkpoint_id, wrapper.checkpoint_id);
-
-        // Idempotent restage of the identical payload is allowed.
-        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
-    }
-
-    #[test]
-    fn staging_v2_rotation_tolerance() {
-        let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let staging = staging_fixture(&wrapper);
-        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
-
-        let mut rotated = wrapper.clone();
-        rotated.branch_id = "branch-rotated".into();
-        assert_ne!(rotated.wrapper_digest(), staging.wrapper_digest);
-        let read = read_segment_staging_v2_for_wrapper(dir.path(), &rotated)
-            .unwrap()
-            .expect("branch-only rotation is tolerated");
-        assert_eq!(read.branch_id, "branch-1");
-    }
-
-    #[test]
-    fn staging_v2_rejects_wrong_binding_and_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        stage_compaction_segment_v2_durable(dir.path(), &staging_fixture(&wrapper)).unwrap();
-
-        // Wrong operation id is rejected (strong binding).
-        let mut wrong_operation = wrapper.clone();
-        wrong_operation.operation_id = "op-forged".into();
-        let error = read_segment_staging_v2_for_wrapper(dir.path(), &wrong_operation).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        // Wrong digest via the key-based reader is rejected.
-        let error = read_segment_staging_v2(
-            dir.path(),
-            &wrapper.checkpoint_id,
-            &wrapper.operation_id,
-            "deadbeef",
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        // No staging file for an unknown checkpoint is Ok(None).
-        let mut unknown = wrapper_fixture(&portable_fixture(), None);
-        unknown.checkpoint_id = "cp-unknown".into();
-        unknown.portable_history_path = "compaction_checkpoints/cp-unknown.json".into();
-        let missing = read_segment_staging_v2_for_wrapper(dir.path(), &unknown).unwrap();
-        assert!(missing.is_none());
-    }
-
-    #[test]
-    fn staging_v2_rejects_empty_items() {
         let wrapper = wrapper_fixture(&portable_fixture(), None);
-        assert!(
-            ResponsesCompactionSegmentStagingV2::new(
-                wrapper.checkpoint_id.clone(),
-                wrapper.operation_id.clone(),
-                wrapper.branch_id.clone(),
-                wrapper.wrapper_digest(),
-                vec![],
-                "summary",
-                xai_chat_state::CompactionDetail::Balanced,
-                "2026-01-01T00:00:00Z",
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn staging_v2_sidecar_schema_mismatch_rejected() {
-        // A V1 staging payload must never satisfy the V2 strong-binding
-        // reader even when it shares the checkpoint id.
-        let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let v1 = ResponsesCompactionSegmentStagingV1::new(
-            wrapper.checkpoint_id.clone(),
-            vec![ConversationItem::user("segmented turn")],
-            "summary",
-            xai_chat_state::CompactionDetail::Balanced,
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        stage_compaction_segment_durable(dir.path(), &v1).unwrap();
-        let error = read_segment_staging_v2_for_wrapper(dir.path(), &wrapper).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn v3_sidecar_fills_portable_history_bytes() {
-        // The V3 sidecar construction keeps the wrapper's byte count
-        // truthful (mirror of the V2 sidecar), feeding checkpoint-bytes
-        // telemetry.
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let material = material_fixture(&wrapper, &portable);
-        let sidecar = CompactionCheckpointFileV3::new(
-            wrapper.clone(),
-            material,
-            portable,
-            None,
-            Vec::new(),
-        )
-        .unwrap();
-        let expected = portable_history_bytes(&portable_fixture()).unwrap().len() as u64;
-        assert_eq!(sidecar.wrapper.portable_history_bytes, expected);
-        // An unsupported wrapper schema is still rejected by the sidecar
-        // constructor (material `try_new` only binds the portable digest,
-        // so this exercises the V3 schema guard).
-        let mut tampered = wrapper_fixture(&portable_fixture(), None);
-        tampered.schema_version = 99;
-        let material = material_fixture(&tampered, &portable_fixture());
-        assert!(CompactionCheckpointFileV3::new(
-            tampered,
-            material,
-            portable_fixture(),
-            None,
-            Vec::new(),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn publish_v2_segment_consumes_staging_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
         let staging = staging_fixture(&wrapper);
-        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
+        stage_compaction_segment_durable(dir.path(), &staging).unwrap();
+        stage_compaction_segment_durable(dir.path(), &staging).unwrap();
 
-        let published = publish_staged_compaction_segment_durable_v2(
+        let read = read_segment_staging_for_wrapper(dir.path(), &wrapper)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.kind, CompactionCheckpointKind::ResponsesServer);
+        assert!(
+            serde_json::to_value(&read)
+                .unwrap()
+                .get("schema_version")
+                .is_none()
+        );
+        assert!(
+            read_segment_staging(
+                dir.path(),
+                &wrapper.checkpoint_id,
+                &wrapper.operation_id,
+                &wrapper.wrapper_digest(),
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let published = publish_staged_compaction_segment_durable(
             dir.path(),
             &wrapper.checkpoint_id,
             &wrapper.operation_id,
@@ -2201,21 +1860,7 @@ mod tests {
         )
         .unwrap();
         assert!(published.newly_published);
-        let compaction_dir = dir
-            .path()
-            .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
-        let segment = compaction_dir
-            .join(xai_chat_state::compaction_transcript::segment_filename(published.index));
-        let markdown = std::fs::read_to_string(&segment).unwrap();
-        assert!(
-            markdown.contains(&format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{}", wrapper.checkpoint_id)),
-            "published segment carries the checkpoint marker"
-        );
-        // Staging is consumed and the publish is idempotent.
-        assert!(!segment_staging_path(dir.path(), &wrapper.checkpoint_id)
-            .unwrap()
-            .exists());
-        let again = publish_staged_compaction_segment_durable_v2(
+        let again = publish_staged_compaction_segment_durable(
             dir.path(),
             &wrapper.checkpoint_id,
             &wrapper.operation_id,
@@ -2227,32 +1872,26 @@ mod tests {
     }
 
     #[test]
-    fn publish_v2_rejects_operation_or_digest_mismatch() {
+    fn staging_rotation_is_tolerated_but_forgery_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let portable = portable_fixture();
-        let wrapper = wrapper_fixture(&portable, None);
-        let staging = staging_fixture(&wrapper);
-        stage_compaction_segment_v2_durable(dir.path(), &staging).unwrap();
+        let wrapper = wrapper_fixture(&portable_fixture(), None);
+        stage_compaction_segment_durable(dir.path(), &staging_fixture(&wrapper)).unwrap();
 
-        let wrong_operation = publish_staged_compaction_segment_durable_v2(
-            dir.path(),
-            &wrapper.checkpoint_id,
-            "op-forged",
-            &wrapper.wrapper_digest(),
-        )
-        .unwrap_err();
-        assert_eq!(wrong_operation.kind(), io::ErrorKind::InvalidData);
-        let wrong_digest = publish_staged_compaction_segment_durable_v2(
-            dir.path(),
-            &wrapper.checkpoint_id,
-            &wrapper.operation_id,
-            "deadbeef",
-        )
-        .unwrap_err();
-        assert_eq!(wrong_digest.kind(), io::ErrorKind::InvalidData);
-        // Staging survived both rejected publishes.
-        assert!(segment_staging_path(dir.path(), &wrapper.checkpoint_id)
+        let mut rotated = wrapper.clone();
+        rotated.branch_id = "branch-rotated".into();
+        let staging = read_segment_staging_for_wrapper(dir.path(), &rotated)
             .unwrap()
-            .exists());
+            .expect("rotated staging");
+        let mut forged = rotated.clone();
+        forged.operation_id = "operation-forged".into();
+        assert!(read_segment_staging_for_wrapper(dir.path(), &forged).is_err());
+
+        publish_staged_compaction_segment_durable(
+            dir.path(),
+            &rotated.checkpoint_id,
+            &staging.operation_id,
+            &staging.wrapper_digest,
+        )
+        .unwrap();
     }
 }

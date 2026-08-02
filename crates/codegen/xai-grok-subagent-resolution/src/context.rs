@@ -335,9 +335,7 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
         }
         // Reasoning siblings and local opaque checkpoints never enter fork
         // background text. Checkpoint migration uses its portable sidecar.
-        ConversationItem::Reasoning(_)
-        | ConversationItem::ResponsesCompactionCheckpoint(_)
-        | ConversationItem::ResponsesCompactionCheckpointV2(_) => {}
+        ConversationItem::Reasoning(_) | ConversationItem::ResponsesCompactionCheckpoint(_) => {}
     }
 }
 

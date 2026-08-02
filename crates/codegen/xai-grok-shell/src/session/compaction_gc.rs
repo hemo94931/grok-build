@@ -5,9 +5,8 @@
 //! Retention rules (hard, see the D4 plan section):
 //! * ALWAYS retain sidecars/staging reachable from the live wrapper (the
 //!   first `chat_history.jsonl` item when it is a checkpoint), from ANY
-//!   compaction marker in `updates.jsonl`, from pending/migrating/
-//!   salvage-required checkpoint recovery records, from prepared/committed
-//!   journal tail records, and from published `compaction/segment_*.md`
+//!   compaction marker in `updates.jsonl`, from prepared/committed journal
+//!   tail records, and from published `compaction/segment_*.md`
 //!   marker headers (retained rewind/fork branches keep their markers, so
 //!   they are covered by the marker scan).
 //! * Pre-CAS orphan sidecar/staging (referenced by NOTHING after the full
@@ -24,8 +23,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
-use crate::session::checkpoint_recovery::CheckpointRecoveryStatus;
+use crate::extensions::notification::{
+    CompactionCheckpointKind, SessionUpdate as XaiSessionUpdate,
+};
 use crate::session::storage::{self, SessionUpdate};
 
 /// Default per-session cap on total compaction checkpoint bytes (sidecars +
@@ -38,7 +38,7 @@ pub(crate) const DEFAULT_SESSION_CHECKPOINT_QUOTA_BYTES: u64 = 256 * 1024 * 1024
 /// [`DEFAULT_SESSION_CHECKPOINT_QUOTA_BYTES`].
 const QUOTA_ENV_OVERRIDE_MB: &str = "GROK_SESSION_CHECKPOINT_QUOTA_MB";
 
-/// Directory holding published V2/V3 sidecar files,
+/// Directory holding current Responses sidecar files,
 /// `{session_dir}/compaction_checkpoints/{checkpoint_id}.json`.
 const CHECKPOINT_DIR: &str = "compaction_checkpoints";
 
@@ -100,7 +100,10 @@ fn quota_from_mb_override(value: Option<&str>) -> u64 {
 /// and special files are not counted). Missing directories count as zero.
 pub(crate) fn session_checkpoint_bytes(session_dir: &Path) -> io::Result<u64> {
     let mut total = 0_u64;
-    for dir in [session_dir.join(CHECKPOINT_DIR), session_dir.join(STAGING_SUBDIR)] {
+    for dir in [
+        session_dir.join(CHECKPOINT_DIR),
+        session_dir.join(STAGING_SUBDIR),
+    ] {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -148,8 +151,8 @@ impl Default for GcOptions {
 pub(crate) struct SessionGcReport {
     /// Total bytes of every scanned candidate file (sidecars + staging).
     pub scanned_bytes: u64,
-    /// Bytes of candidates reachable from the live wrapper / markers /
-    /// recovery records / journal / published segments (always retained).
+    /// Bytes of candidates reachable from the live wrapper, markers,
+    /// journal records, or published segments (always retained).
     pub referenced_bytes: u64,
     /// Bytes of candidates referenced by nothing (pre-CAS orphans).
     pub orphan_bytes: u64,
@@ -260,8 +263,8 @@ impl Candidate {
 }
 
 /// Full reachability scan: live wrapper + typed tail from `chat_history.jsonl`,
-/// and markers + recovery records + journal from `updates.jsonl`, plus
-/// published segment marker headers. Fail-closed on any parse error.
+/// markers + journal records from `updates.jsonl`, and published segment
+/// marker headers. Fail-closed on any parse error.
 ///
 /// Returns the set of referenced checkpoint ids and the set of referenced
 /// file names (basenames), so candidates can be matched either way.
@@ -284,6 +287,16 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
             };
             match &notification.update {
                 XaiSessionUpdate::CompactionCheckpoint(marker) => {
+                    if marker.kind == CompactionCheckpointKind::Unknown {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unknown compaction checkpoint kind at updates.jsonl line {}; \
+                                 refusing to GC",
+                                index + 1
+                            ),
+                        ));
+                    }
                     ids.insert(marker.checkpoint_id.clone());
                     if let Some(prior) = &marker.prior_checkpoint_id {
                         // Recompact chain link / retained rewind-fork lineage:
@@ -291,22 +304,10 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
                         ids.insert(prior.clone());
                     }
                 }
-                XaiSessionUpdate::CheckpointRecovery(record) => {
-                    // Pending/migrating/salvage-required records still need
-                    // their recovery source; terminal states no longer do.
-                    if matches!(
-                        record.status,
-                        CheckpointRecoveryStatus::Pending
-                            | CheckpointRecoveryStatus::Migrating { .. }
-                            | CheckpointRecoveryStatus::SalvageRequired { .. }
-                    ) {
-                        ids.insert(record.checkpoint_id.clone());
-                    }
-                }
-                XaiSessionUpdate::ConversationAppendPreparedV2(prepared) => {
+                XaiSessionUpdate::ConversationAppendPrepared(prepared) => {
                     ids.insert(prepared.checkpoint_id.clone());
                 }
-                XaiSessionUpdate::ConversationAppendCommittedV2(committed) => {
+                XaiSessionUpdate::ConversationAppendCommitted(committed) => {
                     ids.insert(committed.checkpoint_id.clone());
                 }
                 _ => {}
@@ -320,15 +321,15 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
     if chat_path.exists() {
         for entry in storage::read_persisted_chat_entries(&chat_path)? {
             match entry {
-                storage::responses_compaction::PersistedChatEntry::Legacy(item) => {
-                    if let Some(reference) = item.as_responses_checkpoint() {
-                        ids.insert(reference.checkpoint_id().to_string());
-                        if let Some(prior) = reference.prior_checkpoint_id() {
+                storage::responses_compaction::PersistedChatEntry::Item(item) => {
+                    if let Some(wrapper) = item.as_responses_checkpoint() {
+                        ids.insert(wrapper.checkpoint_id.clone());
+                        if let Some(prior) = &wrapper.prior_checkpoint_id {
                             // The live wrapper's own recompact chain link:
                             // its prior sidecar stays reachable.
-                            ids.insert(prior.to_string());
+                            ids.insert(prior.clone());
                         }
-                        if let Some(file_name) = Path::new(reference.portable_history_path())
+                        if let Some(file_name) = Path::new(&wrapper.portable_history_path)
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                         {
@@ -336,7 +337,7 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
                         }
                     }
                 }
-                storage::responses_compaction::PersistedChatEntry::TailV2(tail) => {
+                storage::responses_compaction::PersistedChatEntry::Tail(tail) => {
                     ids.insert(tail.checkpoint_id.clone());
                 }
             }
@@ -378,17 +379,18 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
             ids.insert(id.to_string());
         }
     }
-    // Transitive prior-chain closure: walk every reachable V3 sidecar's
+    // Transitive prior-chain closure: walk every reachable current sidecar's
     // `prior_checkpoint_id` so the whole recompact ancestry of a reachable
     // checkpoint stays retained.
     walk_prior_chain_closure(session_dir, &mut ids)?;
     Ok((ids, files))
 }
 
-/// Transitive prior-chain closure over V3 sidecars. A missing sidecar ends
-/// that chain branch (already gone — nothing to retain); a corrupt V3
-/// sidecar or an unknown schema aborts the GC (an incomplete reference set
-/// must never authorize a deletion).
+/// Transitive prior-chain closure over Responses sidecars. A missing sidecar
+/// ends that chain branch (already gone — nothing to retain); a corrupt
+/// sidecar or an unknown kind aborts the GC because an incomplete reference
+/// set must never authorize a deletion. Builtin checkpoints have no Responses
+/// prior chain and are deliberately left untouched.
 fn walk_prior_chain_closure(session_dir: &Path, ids: &mut BTreeSet<String>) -> io::Result<()> {
     let mut frontier: Vec<String> = ids.iter().cloned().collect();
     let mut walked = BTreeSet::new();
@@ -396,11 +398,19 @@ fn walk_prior_chain_closure(session_dir: &Path, ids: &mut BTreeSet<String>) -> i
         if !walked.insert(id.clone()) {
             continue;
         }
-        let path = session_dir
-            .join(CHECKPOINT_DIR)
-            .join(format!("{id}.json"));
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
+        let path = session_dir.join(CHECKPOINT_DIR).join(format!("{id}.json"));
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to read reachable checkpoint sidecar {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
         };
         let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
             io::Error::new(
@@ -408,28 +418,87 @@ fn walk_prior_chain_closure(session_dir: &Path, ids: &mut BTreeSet<String>) -> i
                 format!("corrupt checkpoint sidecar {}: {error}", path.display()),
             )
         })?;
-        match value.get("schema_version").and_then(serde_json::Value::as_u64) {
-            Some(3) => {
-                let v3: storage::responses_compaction::CompactionCheckpointFileV3 =
+        let kind = value
+            .get("kind")
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "checkpoint sidecar has no semantic kind at {}; refusing to GC",
+                        path.display()
+                    ),
+                )
+            })
+            .and_then(|kind| {
+                serde_json::from_value::<CompactionCheckpointKind>(kind).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid checkpoint sidecar kind at {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })
+            })?;
+        match kind {
+            CompactionCheckpointKind::ResponsesServer => {
+                let parsed: storage::responses_compaction::CompactionCheckpointFile =
                     serde_json::from_value(value).map_err(|error| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("corrupt V3 checkpoint sidecar {}: {error}", path.display()),
+                            format!(
+                                "corrupt Responses checkpoint sidecar {}: {error}",
+                                path.display()
+                            ),
                         )
                     })?;
-                if let Some(prior) = v3.wrapper.prior_checkpoint_id
+                if parsed.checkpoint_id != id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid Responses checkpoint sidecar at {}", path.display()),
+                    ));
+                }
+                // Re-run the complete sidecar binding checks before trusting
+                // its prior link. A merely deserializable payload must never
+                // be allowed to truncate the retained ancestry.
+                let relative_path = format!("{CHECKPOINT_DIR}/{id}.json");
+                let checkpoint = storage::responses_compaction::read_checkpoint(
+                    session_dir,
+                    &relative_path,
+                    &id,
+                    parsed.prompt_index_at_compaction,
+                    &parsed.portable_history_sha256,
+                )?;
+                if let Some(prior) = checkpoint.wrapper.prior_checkpoint_id
                     && ids.insert(prior.clone())
                 {
                     frontier.push(prior);
                 }
             }
-            // V2 sidecars predate the recompact chain: no prior links.
-            Some(2) => {}
-            other => {
+            CompactionCheckpointKind::Builtin => {
+                let checkpoint: crate::extensions::notification::CompactionCheckpointFile =
+                    serde_json::from_value(value).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "corrupt builtin checkpoint sidecar {}: {error}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                if checkpoint.checkpoint_id != id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid builtin checkpoint sidecar at {}", path.display()),
+                    ));
+                }
+            }
+            CompactionCheckpointKind::Unknown => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "unknown checkpoint sidecar schema {other:?} at {}; refusing to GC",
+                        "unknown checkpoint sidecar kind at {}; refusing to GC",
                         path.display()
                     ),
                 ));
@@ -448,11 +517,10 @@ fn first_line(path: &Path) -> io::Result<String> {
     Ok(line.trim_end().to_string())
 }
 
-/// Collect every deletable candidate (regular `*.json` file) from
-/// `compaction_checkpoints/` and `compaction/staging/`. Files that are
-/// symlinks, non-regular, not named `{checkpoint_id}.json` with a safe
-/// checkpoint id, or whose age cannot be trusted are skipped and reported —
-/// they are always retained.
+/// Collect every deletable Responses candidate from
+/// `compaction_checkpoints/` and `compaction/staging/`. Builtin checkpoints,
+/// unknown kinds, malformed payloads, symlinks, non-regular files, and unsafe
+/// names are skipped and always retained.
 fn collect_candidates(session_dir: &Path) -> io::Result<(Vec<Candidate>, Vec<String>)> {
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
@@ -475,9 +543,7 @@ fn collect_candidates(session_dir: &Path) -> io::Result<(Vec<Candidate>, Vec<Str
                 Err(error) => return Err(error),
             };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                skipped.push(format!(
-                    "{file_name}: not a regular file; retained"
-                ));
+                skipped.push(format!("{file_name}: not a regular file; retained"));
                 continue;
             }
             let Some(stem) = file_name.strip_suffix(".json") else {
@@ -490,25 +556,54 @@ fn collect_candidates(session_dir: &Path) -> io::Result<(Vec<Candidate>, Vec<Str
                 ));
                 continue;
             }
+            if let Err(reason) = validate_candidate_payload(&path, stem, staging) {
+                skipped.push(format!("{file_name}: {reason}; retained"));
+                continue;
+            }
             let checkpoint_id = stem.to_string();
             candidates.push(Candidate {
                 path,
                 file_name,
                 checkpoint_id,
                 bytes: metadata.len(),
-                mtime: metadata
-                    .modified()
-                    .map_err(|error| {
-                        io::Error::new(
-                            error.kind(),
-                            format!("cannot read mtime of {}: {error}", entry.path().display()),
-                        )
-                    })?,
+                mtime: metadata.modified().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cannot read mtime of {}: {error}", entry.path().display()),
+                    )
+                })?,
                 staging,
             });
         }
     }
     Ok((candidates, skipped))
+}
+
+/// Restrict deletion candidates to semantic Responses artifacts. Builtin
+/// checkpoint files share the checkpoint directory and must never be
+/// collected by Responses GC.
+fn validate_candidate_payload(path: &Path, file_stem: &str, staging: bool) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("cannot read payload ({error})"))?;
+    if staging {
+        let payload: storage::responses_compaction::ResponsesCompactionSegmentStaging =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("unrecognized staging payload ({error})"))?;
+        if payload.kind != CompactionCheckpointKind::ResponsesServer
+            || payload.checkpoint_id != file_stem
+        {
+            return Err("not a Responses staging payload".into());
+        }
+    } else {
+        let payload: storage::responses_compaction::CompactionCheckpointFile =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("not a current Responses sidecar ({error})"))?;
+        if payload.kind != CompactionCheckpointKind::ResponsesServer
+            || payload.checkpoint_id != file_stem
+        {
+            return Err("not a Responses sidecar".into());
+        }
+    }
+    Ok(())
 }
 
 /// Mirrors `responses_compaction::validate_checkpoint_component`: only

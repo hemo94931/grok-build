@@ -454,9 +454,18 @@ impl SessionActor {
         let compactions_remaining = self.compactions_remaining.get();
         let send_inline_compaction_headers =
             crate::session::responses_server_compaction::should_send_inline_compaction_headers(
-                self.agent.borrow().compaction_policy().server_compaction,
                 &cfg.api_backend,
             );
+        let mut env_http_headers = cfg.env_http_headers.clone();
+        if !send_inline_compaction_headers {
+            // Responses uses exactly one explicit compaction mechanism. Strip
+            // even user/model/env-injected inline controls so disabling the
+            // endpoint cannot silently re-enable provider compaction.
+            for name in ["x-compaction-at", "x-compactions-remaining"] {
+                extra_headers.shift_remove(name);
+                env_http_headers.shift_remove(name);
+            }
+        }
         if send_inline_compaction_headers
             && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
         {
@@ -492,7 +501,7 @@ impl SessionActor {
             auth_scheme,
             extra_headers,
             query_params: cfg.query_params.clone(),
-            env_http_headers: cfg.env_http_headers.clone(),
+            env_http_headers,
             context_window: cfg.context_window.get(),
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
@@ -1187,27 +1196,10 @@ impl SessionActor {
             )),
         )
     }
-    /// Drive a single turn through the sampler-based path.
-    ///
-    /// Calls `prepare_sampler_for_turn` first (auth refresh + config
-    /// push), then submits via `SamplerHandle::submit_and_collect` and
-    /// returns:
-    /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
-    /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
-    ///    ran, the outer turn loop should `continue`.
-    /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth 401
-    ///    recovery succeeded, credentials refreshed, retry once.
-    /// * `Err(acp::Error)` - terminal failure already reported via
-    ///    `send_xai_notification(RetryState::Failed)`.
-    /// Compose the current V2 wire instructions: base instructions (from
-    /// live `BaseInstructions` items, else the persisted trusted base
-    /// prompt) + fixed separator + current memory context (from
-    /// `MemoryContext` items). The composed string is what the V2 replay
-    /// body carries in its top-level `instructions` field.
-    pub(crate) async fn current_wire_instructions_v2(
-        &self,
-        request: &ConversationRequest,
-    ) -> String {
+    /// Compose current wire instructions: live base instructions (or the
+    /// persisted trusted base prompt), followed by current memory context.
+    /// Replay freezes this value in the resolved request body.
+    pub(crate) async fn current_wire_instructions(&self, request: &ConversationRequest) -> String {
         let base_from_items: Vec<String> = request
             .items
             .iter()
@@ -1224,11 +1216,10 @@ impl SessionActor {
         let mut parts = base_from_items;
         if parts.is_empty() {
             let session_dir = crate::session::persistence::session_dir(&self.session_info);
-            if let Some(base) = crate::session::acp_session::load_system_prompt_from_dir(
-                &session_dir,
-            )
-            .map(|base| base.trim().to_string())
-            .filter(|base| !base.is_empty())
+            if let Some(base) =
+                crate::session::acp_session::load_system_prompt_from_dir(&session_dir)
+                    .map(|base| base.trim().to_string())
+                    .filter(|base| !base.is_empty())
             {
                 parts.push(base);
             }
@@ -1246,6 +1237,18 @@ impl SessionActor {
         parts.join(xai_grok_sampling_types::INSTRUCTIONS_MEMORY_SEPARATOR)
     }
 
+    /// Drive a single turn through the sampler-based path.
+    ///
+    /// Calls `prepare_sampler_for_turn` first (auth refresh + config
+    /// push), then submits via `SamplerHandle::submit_and_collect` and
+    /// returns:
+    /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
+    /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
+    ///   ran, the outer turn loop should `continue`.
+    /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth 401
+    ///   recovery succeeded, credentials refreshed, retry once.
+    /// * `Err(acp::Error)` - terminal failure already reported via
+    ///   `send_xai_notification(RetryState::Failed)`.
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
@@ -1257,72 +1260,42 @@ impl SessionActor {
         if gate.resubmit {
             return Ok(SamplerTurnOutcome::CompactAndResubmit);
         }
-        // Stage D3 (plan 阶段 7): stable cache routing. Both the V2-replay
-        // frozen request and the normal path carry the routing-derived
-        // `prompt_cache_key`; the V1 legacy permit path deliberately stays
-        // byte-stable (no key — V1 writers are off). Best-effort: no
-        // credential or an unreadable namespace file ⇒ no key, never a turn
-        // failure. The dispatch is frozen, so sampler retries reuse the
-        // same key automatically.
+        // Stable cache routing is applied before either dispatch is frozen.
+        // Resolved replay retries reuse the exact body, cache key, correlation,
+        // and credential snapshot selected here.
         let routing_key = self
             .cache_routing_for_config(
                 &full_config,
                 request.model.as_deref().unwrap_or(&full_config.model),
             )
             .map(|routing| routing.prompt_cache_key());
-        let has_checkpoint = request
-            .items
-            .first()
-            .is_some_and(|item| item.is_responses_checkpoint());
-        let dispatch = if let Some(replay) = gate.replay_v2 {
-            // V2 replay: the gate verified the full replay material. Freeze
-            // the credential and compose the current wire instructions
-            // (base + separator + memory) before resolving — sampler
-            // retries reuse this body verbatim.
+        let dispatch = if let Some(replay) = gate.replay {
+            // Freeze the just-validated credential for this provider send. A
+            // later auth resubmit rebuilds config only after replay is verified
+            // again against the current request identity.
             let mut request_config = full_config.clone();
             request_config.bearer_resolver = None;
             self.sampler_handle.update_config(request_config);
             let mut frozen = request.clone();
-            frozen.instructions = Some(self.current_wire_instructions_v2(&request).await);
+            let wire_instructions = self.current_wire_instructions(&request).await;
+            frozen.instructions = (!wire_instructions.is_empty()).then_some(wire_instructions);
             frozen.prompt_cache_key = routing_key.clone();
             full_config.apply_conversation_defaults_to(&mut frozen);
-            let resolved = xai_grok_sampling_types::ResolvedResponsesRequest::from_validated_replay(
-                &replay, &frozen,
-            )
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            let resolved =
+                xai_grok_sampling_types::ResolvedResponsesRequest::from_validated_replay(
+                    &replay, &frozen,
+                )
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
             xai_grok_sampler::SamplingDispatch::ResolvedResponses(std::sync::Arc::new(resolved))
-        } else if has_checkpoint {
-            // Freeze the just-validated credential for this provider send.
-            // A later 401 resubmit rebuilds config and may refresh only after
-            // the continuity gate runs again.
-            let mut request_config = full_config.clone();
-            request_config.bearer_resolver = None;
-            self.sampler_handle.update_config(request_config);
-
-            // Issue the temporary V1 replay permit: the gate just proved the
-            // checkpoint `Replayable` at this history revision and validated
-            // the live wrapper against its sidecar. The permit freezes the
-            // typed-conversion body (with conversation defaults applied) so
-            // sampler retries never re-read session state.
-            let binding = gate.replayable_binding.ok_or_else(|| {
-                acp::Error::internal_error().data("responses_compaction_missing_replay_binding")
-            })?;
-            let replay_portable_history = gate.replay_portable_history.ok_or_else(|| {
-                acp::Error::internal_error().data("responses_compaction_missing_replay_material")
-            })?;
-            let mut frozen = request.clone();
-            full_config.apply_conversation_defaults_to(&mut frozen);
-            // The permit constructor re-verifies the material proof: the
-            // sidecar portable history must hash to the live wrapper's
-            // digest, so a permit can only exist for gate-validated bytes.
-            let permit = xai_grok_sampling_types::ValidatedLegacyReplayV1::try_new(
-                &frozen,
-                &replay_portable_history,
-                binding.request_identity_generation,
-            )
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
-            xai_grok_sampler::SamplingDispatch::LegacyV1(std::sync::Arc::new(permit))
         } else {
+            if request
+                .items
+                .iter()
+                .any(ConversationItem::is_responses_checkpoint)
+            {
+                return Err(acp::Error::internal_error()
+                    .data("responses_compaction_checkpoint_without_replay"));
+            }
             let mut normal = request.clone();
             normal.prompt_cache_key = routing_key;
             xai_grok_sampler::SamplingDispatch::Normal(Box::new(normal))
@@ -1596,7 +1569,9 @@ impl SessionActor {
         usage: &xai_grok_sampling_types::TokenUsage,
         model: &str,
     ) {
-        let state = self.post_compact_usage_state.load(std::sync::atomic::Ordering::Relaxed);
+        let state = self
+            .post_compact_usage_state
+            .load(std::sync::atomic::Ordering::Relaxed);
         let request_kind = match state {
             2 => "post_compact_first",
             1 => "post_compact_subsequent",
@@ -1606,10 +1581,8 @@ impl SessionActor {
             return;
         };
         if state != 0 {
-            self.post_compact_usage_state.store(
-                1,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.post_compact_usage_state
+                .store(1, std::sync::atomic::Ordering::Relaxed);
         }
         xai_grok_telemetry::session_ctx::log_event(
             xai_grok_telemetry::events::PromptCacheObservation {

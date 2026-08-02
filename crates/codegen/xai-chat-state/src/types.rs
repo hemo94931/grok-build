@@ -95,6 +95,8 @@ pub struct ChatCompactionSnapshot {
     pub history_revision: u64,
     pub request_identity_generation: u64,
     pub prompt_index: usize,
+    /// Current compaction baseline: the last provider total plus estimated
+    /// user/tool tokens appended since that response.
     pub total_tokens: u64,
     pub conversation: Vec<ConversationItem>,
     pub sampling_config: SamplingConfig,
@@ -111,7 +113,7 @@ pub struct CommitCompaction {
     pub committed_total_tokens: u64,
 }
 
-/// One provider-visible append after an active v2 checkpoint.
+/// One provider-visible append after an active Responses checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailAppend {
     pub operation_id: String,

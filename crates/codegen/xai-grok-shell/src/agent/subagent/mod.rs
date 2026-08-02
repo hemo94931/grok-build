@@ -1321,6 +1321,7 @@ async fn bootstrap_initial_context(
             copy_plan_mode_state: false,
             copy_signals: false,
             copy_tool_state: false,
+            copy_compaction_segments: true,
             fork_filter: true,
             ..Default::default()
         };

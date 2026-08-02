@@ -119,11 +119,11 @@ impl SamplerHandle {
             .await
     }
 
-    /// Submit an explicit dispatch (normal typed request, opaque resolved
-    /// request, or a legacy replay permit) and await its completion.
+    /// Submit an explicit dispatch (normal typed request or opaque resolved
+    /// request) and await its completion.
     ///
-    /// Resolved/legacy dispatches carry a frozen body: every sampler retry
-    /// re-sends the identical bytes with the identical correlation headers.
+    /// Resolved dispatches carry a frozen body: every sampler retry re-sends
+    /// the identical bytes with the identical correlation headers.
     pub async fn submit_dispatch_and_collect(
         &self,
         request_id: RequestId,

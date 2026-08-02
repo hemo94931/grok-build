@@ -122,7 +122,10 @@ impl ChatStateActor {
 
             // Step 2: Prune old tool results if context is > 50% utilized
             if needs_prune {
-                if items.first().is_some_and(|item| item.is_responses_checkpoint()) {
+                if items
+                    .first()
+                    .is_some_and(|item| item.is_responses_checkpoint())
+                {
                     prune_conversation(&mut items[1..], &self.pruning_config);
                 } else {
                     prune_conversation(&mut items, &self.pruning_config);
@@ -183,7 +186,7 @@ impl ChatStateActor {
             service_tier: None,
             // The main agent loop supports parallel tool execution. Keep this
             // explicit on every request so normal, compact, and post-compact
-            // V2 envelope fingerprints bind the same semantics.
+            // envelope fingerprints bind the same semantics.
             parallel_tool_calls: Some(true),
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
@@ -219,7 +222,7 @@ impl ChatStateActor {
         }
         let checkpoint_id = match replacement.first() {
             Some(item) => match item.as_responses_checkpoint() {
-                Some(checkpoint) => checkpoint.checkpoint_id().to_string(),
+                Some(checkpoint) => checkpoint.checkpoint_id.clone(),
                 None => return false,
             },
             None => return false,
@@ -756,10 +759,7 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].text_content(), "You are helpful.");
         assert_eq!(items[1].text_content(), "new memory");
-        assert_eq!(
-            items[1].system_source(),
-            Some(SystemSource::MemoryContext)
-        );
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
         // Idempotent: same reminder is a no-op.
         assert!(!inject_memory_reminder(&mut items, "new memory"));
     }
@@ -778,12 +778,15 @@ mod tests {
         // Legacy item shrinks to the base part; the memory block moves into
         // its own marked item right after it.
         assert_eq!(items[0].text_content(), "You are helpful.");
-        assert_eq!(items[0].system_source(), Some(SystemSource::LegacyUnclassified));
         assert_eq!(
-            items[1].system_source(),
-            Some(SystemSource::MemoryContext)
+            items[0].system_source(),
+            Some(SystemSource::LegacyUnclassified)
         );
-        assert_eq!(items[1].text_content(), "<memory-context>new</memory-context>");
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
+        assert_eq!(
+            items[1].text_content(),
+            "<memory-context>new</memory-context>"
+        );
     }
 
     #[test]
@@ -797,11 +800,11 @@ mod tests {
             "<memory-context>new</memory-context>"
         ));
         assert_eq!(items.len(), 2);
+        assert_eq!(items[0].system_source(), Some(SystemSource::MemoryContext));
         assert_eq!(
-            items[0].system_source(),
-            Some(SystemSource::MemoryContext)
+            items[0].text_content(),
+            "<memory-context>new</memory-context>"
         );
-        assert_eq!(items[0].text_content(), "<memory-context>new</memory-context>");
     }
 
     #[test]
@@ -809,13 +812,13 @@ mod tests {
         let mut items = vec![ConversationItem::system(
             "base <memory-context>one</memory-context> mid <memory-context>two</memory-context>",
         )];
-        assert!(inject_memory_reminder(&mut items, "<memory-context>new</memory-context>"));
+        assert!(inject_memory_reminder(
+            &mut items,
+            "<memory-context>new</memory-context>"
+        ));
         // The ambiguous legacy item is untouched; a dedicated item is added.
         assert!(items[0].text_content().contains("one"));
-        assert_eq!(
-            items[1].system_source(),
-            Some(SystemSource::MemoryContext)
-        );
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
     }
 
     #[test]
@@ -824,10 +827,7 @@ mod tests {
         inject_memory_reminder(&mut items, "Remember: user likes rust");
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], ConversationItem::System(_)));
-        assert_eq!(
-            items[0].system_source(),
-            Some(SystemSource::MemoryContext)
-        );
+        assert_eq!(items[0].system_source(), Some(SystemSource::MemoryContext));
     }
 
     // -- image size-gated compaction tests --

@@ -2,13 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use sha2::Digest as _;
 use xai_grok_sampler::{ResponsesCompactFailure, ResponsesCompactResponse};
 use xai_grok_sampling_types::{
-    CheckpointIdentityV1, CheckpointIdentityV2, ConversationItem, FinalResponsesRequest,
-    RESPONSES_CHECKPOINT_SCHEMA_V2, RESPONSES_COMPACTION_CONTRACT_V1,
-    ResponsesCompactionModeV1, ServerResponsesCheckpointV1,
-    ServerResponsesCheckpointV2, TokenSeedSource,
+    CheckpointIdentity, ConversationItem, ResponsesCompactionMode, ServerResponsesCheckpoint,
+    TokenSeedSource, TrustedPromptEnvelope,
 };
 
 pub const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -19,9 +16,8 @@ pub struct ResponsesRequestSnapshot {
     pub request_identity_generation: u64,
     pub prompt_index: usize,
     pub pre_compaction_tokens: u64,
-    /// Flattened provider-visible body at snapshot time. Raw JSON: the
-    /// snapshot feeds identity/token accounting and the (currently
-    /// disabled) V1 writer, never a normal POST gate.
+    /// Flattened provider-visible body at snapshot time. Raw JSON used for
+    /// diagnostics and token accounting, never as a normal POST gate.
     pub final_request: serde_json::Value,
     pub credential: xai_grok_sampler::RequestCredentialSnapshot,
     pub model: String,
@@ -34,18 +30,13 @@ pub struct ResponsesRequestSnapshot {
     pub service_tier: Option<String>,
     pub semantic_envelope: serde_json::Value,
     pub semantic_envelope_tokens: u64,
-    pub identity: CheckpointIdentityV1,
-    /// V2-contract writer identity (D4): contract v2, trusted prompt
-    /// envelope digests, prior checkpoint link and cache route fingerprint.
-    /// Always computed; consumed only when the V2 writer branch runs.
-    pub identity_v2: CheckpointIdentityV2,
-    /// V2 trusted prompt envelope resolved from the same request that fed
-    /// the gate (`current_trusted_envelope_v2`), so the writer's identity
-    /// matches the next turn's gate identity.
-    pub trusted_envelope_v2: xai_grok_sampling_types::TrustedPromptEnvelopeV2,
+    pub identity: CheckpointIdentity,
+    /// Trusted prompt envelope resolved from the same request that fed the
+    /// gate, so writer identity matches the next turn's gate identity.
+    pub trusted_envelope: TrustedPromptEnvelope,
     pub request_bytes: Vec<u8>,
     pub trigger: xai_grok_telemetry::events::CompactionTrigger,
-    pub mode: ResponsesCompactionModeV1,
+    pub mode: ResponsesCompactionMode,
     pub user_context: Option<String>,
     pub cancellation: tokio_util::sync::CancellationToken,
 }
@@ -73,7 +64,7 @@ impl std::fmt::Debug for ResponsesRequestSnapshot {
 #[derive(Debug, Clone)]
 pub enum PreparedCompaction {
     Server {
-        wrapper: Box<ServerResponsesCheckpointV1>,
+        wrapper: Box<ServerResponsesCheckpoint>,
         portable: Vec<ConversationItem>,
         mode_artifacts: Vec<ConversationItem>,
         token_seed: u64,
@@ -93,99 +84,24 @@ pub enum CompactionExecutionOutcome {
     Failed(String),
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", sha2::Sha256::digest(bytes))
+#[derive(Debug, thiserror::Error)]
+pub enum ServerCheckpointSeedError {
+    #[error("failed to serialize canonical server output: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("server checkpoint did not reduce the conversation")]
+    DidNotShrink,
 }
 
-/// Stage D1b kill switch: new V1 server checkpoints are disabled globally
-/// and compaction falls back to builtin, so no new unsafe checkpoints are
-/// produced. V2 writers (stage D4) supersede this switch; the env var
-/// exists only for integration harnesses verifying the legacy path.
-pub fn v1_server_compaction_writers_enabled() -> bool {
-    std::env::var("GROK_RESPONSES_V1_SERVER_COMPACTION")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-}
-
-/// Stage-D4 (plan 阶段 5b) kill switch: V2 server compaction writers.
-/// Default OFF — reader-first deployments keep write capability disabled
-/// until every binary that can host a session reads V2 wrappers. When both
-/// V1 and V2 writer flags are enabled, the V2 writer wins (V1 is legacy).
-pub fn v2_server_compaction_writers_enabled() -> bool {
-    std::env::var("GROK_RESPONSES_V2_SERVER_COMPACTION")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-}
-
-/// Stage-D4 writer rollout percent from `GROK_V2_WRITER_PERCENT`
-/// (1 → 10 → 50 → 100 during the canary; defaults to 0 = writers off).
-pub fn v2_writer_cohort_percent() -> u32 {
-    std::env::var("GROK_V2_WRITER_PERCENT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        .min(100)
-}
-
-/// Deterministic V2-writer cohort check: stable session-hash bucket in
-/// `[0, 100)` against the current `GROK_V2_WRITER_PERCENT`. Mirrors the
-/// D1b migration cohort hash exactly, so a session admitted at p% stays
-/// admitted at every q >= p.
-pub fn v2_writer_cohort_allows(session_id: &str) -> bool {
-    v1_migration_cohort_percent(session_id, v2_writer_cohort_percent())
-}
-
-/// Stage-D1b migration cohort from `GROK_V1_MIGRATION_PERCENT`
-/// (1 → 10 → 50 → 100 during the rollout; defaults to 100).
-pub fn v1_migration_cohort(session_id: &str) -> bool {
-    let percent = std::env::var("GROK_V1_MIGRATION_PERCENT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(100);
-    v1_migration_cohort_percent(session_id, percent)
-}
-
-/// Pure cohort decision: stable session-hash bucket in `[0, 100)`.
-pub fn v1_migration_cohort_percent(session_id: &str, percent: u32) -> bool {
-    let percent = percent.min(100);
-    if percent >= 100 {
-        return true;
-    }
-    if percent == 0 {
-        return false;
-    }
-    let digest = sha2::Sha256::digest(session_id.as_bytes());
-    let bucket = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) % 100;
-    bucket < u64::from(percent)
-}
-
-/// Canonical normal-request semantics that are outside the compactable transcript.
+/// Canonical non-transcript portion of a final sealed compact body.
 ///
-/// Takes the flattened provider-visible body as raw JSON (see
-/// `FinalResponsesRequest::replay_projection_body`): identity computation
-/// never needs a sendable request.
-pub fn canonical_prompt_envelope(
-    body: &serde_json::Value,
-) -> Result<(serde_json::Value, serde_json::Value), serde_json::Error> {
-    let prompt_projection = serde_json::Value::Array(
-        body.get("input")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                matches!(
-                    item.get("role").and_then(serde_json::Value::as_str),
-                    Some("system" | "developer")
-                )
-            })
-            .cloned()
-            .collect(),
-    );
+/// `input` is deliberately excluded: the server output token seed accounts
+/// for the compacted transcript, while this envelope accounts only for prompt
+/// semantics that remain live around it. Routing and transport-only fields do
+/// not consume model context and are excluded as well.
+pub fn resolved_prompt_envelope(
+    final_body: &serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Error> {
     let mut envelope = serde_json::Map::new();
-    envelope.insert(
-        "canonical_prompt_projection".into(),
-        prompt_projection.clone(),
-    );
     for field in [
         "instructions",
         "tools",
@@ -194,83 +110,22 @@ pub fn canonical_prompt_envelope(
         "text",
         "parallel_tool_calls",
     ] {
-        if let Some(value) = body.get(field).filter(|value| !value.is_null()) {
+        if let Some(value) = final_body.get(field).filter(|value| !value.is_null()) {
             envelope.insert(field.into(), value.clone());
         }
     }
-    // Validate that the value remains canonically serializable here; callers
-    // use the exact same serializer for both identity and token accounting.
     let envelope = serde_json::Value::Object(envelope);
     xai_grok_sampling_types::canonical_json_bytes(&envelope)?;
-    Ok((prompt_projection, envelope))
+    Ok(envelope)
 }
 
-pub fn build_checkpoint_identity(
-    provider_id: &str,
-    endpoint_fingerprint: &str,
-    auth_principal_fingerprint: &str,
-    final_body: &serde_json::Value,
-) -> Result<CheckpointIdentityV1, serde_json::Error> {
-    build_checkpoint_identity_with_projection(
-        provider_id,
-        endpoint_fingerprint,
-        auth_principal_fingerprint,
-        final_body,
-        None,
-    )
-}
-
-pub fn build_checkpoint_identity_with_projection(
-    provider_id: &str,
-    endpoint_fingerprint: &str,
-    auth_principal_fingerprint: &str,
-    final_body: &serde_json::Value,
-    prompt_projection: Option<serde_json::Value>,
-) -> Result<CheckpointIdentityV1, serde_json::Error> {
-    let model = final_body
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let (default_projection, mut envelope) = canonical_prompt_envelope(final_body)?;
-    let prompt_projection = prompt_projection.unwrap_or(default_projection);
-    envelope["canonical_prompt_projection"] = prompt_projection.clone();
-    let prompt_envelope_fingerprint =
-        sha256_hex(&xai_grok_sampling_types::canonical_json_bytes(&envelope)?);
-    Ok(CheckpointIdentityV1 {
-        provider_id: provider_id.to_string(),
-        api: "responses".into(),
-        endpoint_fingerprint: endpoint_fingerprint.to_string(),
-        model,
-        auth_principal_fingerprint: auth_principal_fingerprint.to_string(),
-        contract_version: RESPONSES_COMPACTION_CONTRACT_V1.into(),
-        prompt_envelope_fingerprint,
-        canonical_prompt_projection: Some(prompt_projection),
-    })
-}
-
+/// Approximate token cost of the non-transcript envelope in the final sealed
+/// compact body. This never reconstructs checkpoint identity or history.
 pub fn prompt_envelope_token_estimate(
     final_body: &serde_json::Value,
 ) -> Result<u64, serde_json::Error> {
-    prompt_envelope_token_estimate_with_projection(final_body, None)
-}
-
-pub fn prompt_envelope_token_estimate_with_projection(
-    final_body: &serde_json::Value,
-    prompt_projection: Option<serde_json::Value>,
-) -> Result<u64, serde_json::Error> {
-    let (default_projection, mut envelope) = canonical_prompt_envelope(final_body)?;
-    envelope["canonical_prompt_projection"] = prompt_projection.unwrap_or(default_projection);
-    let bytes = xai_grok_sampling_types::canonical_json_bytes(&envelope)?.len() as u64;
-    Ok(bytes.div_ceil(4))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ServerCheckpointSeedError {
-    #[error("failed to serialize canonical server output: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("server checkpoint did not reduce the conversation")]
-    DidNotShrink,
+    let envelope = resolved_prompt_envelope(final_body)?;
+    Ok((xai_grok_sampling_types::canonical_json_bytes(&envelope)?.len() as u64).div_ceil(4))
 }
 
 fn canonical_output_token_estimate(output: &[serde_json::Value]) -> Result<u64, serde_json::Error> {
@@ -333,49 +188,46 @@ pub fn server_checkpoint_token_seed(
     Ok((seed, source))
 }
 
-/// Derive the identity used to bind the *current* live wrapper while
-/// preparing a V2 recompact. `successor_identity` intentionally points its
-/// prior link at the current checkpoint, but that future chain link must not
-/// be used to validate the current wrapper: the current wrapper still points
-/// at its own predecessor. Every other freshly recomputed compatibility field
-/// is retained, so model/route/envelope drift continues to fail closed.
-pub fn current_v2_identity_for_recompact_binding(
-    successor_identity: &CheckpointIdentityV2,
-    live_wrapper: &ServerResponsesCheckpointV2,
-) -> CheckpointIdentityV2 {
+/// Derive the identity used to bind the current live wrapper while preparing
+/// a recompact. `successor_identity` points at the live checkpoint, while the
+/// live wrapper still points at its own predecessor. All other freshly
+/// recomputed compatibility fields remain in force.
+pub fn current_identity_for_recompact_binding(
+    successor_identity: &CheckpointIdentity,
+    live_wrapper: &ServerResponsesCheckpoint,
+) -> CheckpointIdentity {
     let mut current = successor_identity.clone();
     current.prior_checkpoint_id = live_wrapper.prior_checkpoint_id.clone();
     current
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Stage-D4 V2 successor: `[ResponsesCompactionCheckpointV2(wrapper)] ++ tail`.
+/// Build the one current server-compaction successor:
+/// `[ResponsesCompactionCheckpoint(wrapper)] ++ tail`.
 ///
-/// The caller supplies the portable-history digest (computed over the same
-/// history that will be embedded in the V3 sidecar) and the previous live
-/// V2 checkpoint id (the recompact chain link); the sidecar constructor
-/// re-verifies both. `portable_history_bytes` is filled in by the sidecar
-/// construction, exactly like the V1 path.
+/// The caller supplies the digest of the portable history that will be
+/// embedded in the sidecar. The sidecar constructor independently
+/// recomputes it and fills `portable_history_bytes` before persistence.
 #[allow(clippy::too_many_arguments)]
-pub fn build_server_successor_v2(
+pub fn build_server_successor(
     checkpoint_id: &str,
     operation_id: &str,
     prompt_index: usize,
     auto_continue: bool,
-    mode: ResponsesCompactionModeV1,
+    mode: ResponsesCompactionMode,
     branch_id: &str,
-    identity: CheckpointIdentityV2,
+    mut identity: CheckpointIdentity,
     output: Vec<serde_json::Value>,
     portable_history_path: &str,
     portable_history_sha256: String,
     token_seed: u64,
     token_seed_source: TokenSeedSource,
     prior_checkpoint_id: Option<String>,
+    memory_revision: Option<u64>,
     tail: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
+    identity.prior_checkpoint_id = prior_checkpoint_id.clone();
     let server_output_item_count = output.len();
-    let wrapper = Box::new(ServerResponsesCheckpointV2 {
-        schema_version: RESPONSES_CHECKPOINT_SCHEMA_V2,
+    let wrapper = Box::new(ServerResponsesCheckpoint {
         checkpoint_id: checkpoint_id.to_string(),
         operation_id: operation_id.to_string(),
         prompt_index,
@@ -392,56 +244,21 @@ pub fn build_server_successor_v2(
         token_seed_source,
         server_output_item_count,
         prior_checkpoint_id,
-        memory_revision: None,
-    });
-    std::iter::once(ConversationItem::ResponsesCompactionCheckpointV2(wrapper))
-        .chain(tail)
-        .collect()
-}
-
-pub fn build_server_successor(
-    checkpoint_id: &str,
-    operation_id: &str,
-    prompt_index: usize,
-    auto_continue: bool,
-    mode: ResponsesCompactionModeV1,
-    branch_id: &str,
-    identity: CheckpointIdentityV1,
-    output: Vec<serde_json::Value>,
-    portable_history_path: &str,
-    checkpoint_token_seed: u64,
-    token_seed_source: TokenSeedSource,
-    tail: Vec<ConversationItem>,
-) -> Vec<ConversationItem> {
-    let server_output_item_count = output.len();
-    let wrapper = Box::new(ServerResponsesCheckpointV1 {
-        schema_version: 1,
-        checkpoint_id: checkpoint_id.to_string(),
-        operation_id: operation_id.to_string(),
-        prompt_index,
-        created_at: chrono::Utc::now(),
-        auto_continue,
-        mode,
-        branch_id: branch_id.to_string(),
-        identity,
-        output,
-        portable_history_path: portable_history_path.to_string(),
-        portable_history_sha256: String::new(),
-        portable_history_bytes: 0,
-        checkpoint_token_seed,
-        token_seed_source,
-        server_output_item_count,
+        memory_revision,
     });
     std::iter::once(ConversationItem::ResponsesCompactionCheckpoint(wrapper))
         .chain(tail)
         .collect()
 }
 
+/// Inline provider compaction is never mixed with the explicit Responses
+/// compaction endpoint. When explicit remote compaction is disabled,
+/// grok-build falls back to its builtin compactor instead of silently
+/// enabling a second server-side mechanism through headers.
 pub fn should_send_inline_compaction_headers(
-    server_compaction_enabled: bool,
     backend: &xai_grok_sampling_types::ApiBackend,
 ) -> bool {
-    !(server_compaction_enabled && *backend == xai_grok_sampling_types::ApiBackend::Responses)
+    *backend != xai_grok_sampling_types::ApiBackend::Responses
 }
 
 pub fn resolve_server_compaction_layers(

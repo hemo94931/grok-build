@@ -97,7 +97,7 @@ impl ChatPersistence for ChannelChatPersistence {
         let (reply, receiver) = oneshot::channel();
         if self
             .tx
-            .send(PersistenceMsg::AppendChatTailV2AndAck {
+            .send(PersistenceMsg::AppendChatTailAndAck {
                 append: append.clone(),
                 respond_to: reply,
             })

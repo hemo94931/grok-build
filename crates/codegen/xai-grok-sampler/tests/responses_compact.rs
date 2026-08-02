@@ -29,7 +29,7 @@ use xai_grok_sampler::{
     compact_directive_hash, validate_responses_compact_response,
 };
 use xai_grok_sampling_types::{
-    CanonicalResponsesContext, INSTRUCTIONS_MEMORY_SEPARATOR,
+    ConversationItem, ConversationRequest, ReasoningEffort, ResolvedCompactRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -66,29 +66,23 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
-fn canonical_context() -> CanonicalResponsesContext {
-    CanonicalResponsesContext {
-        model: "grok-test".into(),
-        base_instructions: "normal instructions".into(),
-        memory_context: None,
-        tools: json!([]),
-        tool_choice: None,
-        reasoning: Some(json!({ "effort": "medium" })),
-        text: None,
-        parallel_tool_calls: true,
+fn compact_request_with_context(user_context: Option<&str>) -> ResponsesCompactRequest {
+    let request = ConversationRequest {
+        items: vec![ConversationItem::user("hello")],
+        model: Some("grok-test".into()),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        instructions: Some("normal instructions".into()),
         prompt_cache_key: Some("cache-key".into()),
-        prompt_cache_options: None,
-        prompt_cache_retention: None,
         service_tier: Some("priority".into()),
-    }
-}
-
-fn canonical_input() -> Vec<Value> {
-    vec![json!({ "role": "user", "content": "hello" })]
+        parallel_tool_calls: Some(true),
+        ..Default::default()
+    };
+    let resolved = ResolvedCompactRequest::try_normal(&request, user_context).unwrap();
+    ResponsesCompactRequest::from_resolved(&resolved).unwrap()
 }
 
 fn compact_request() -> ResponsesCompactRequest {
-    ResponsesCompactRequest::from_canonical(&canonical_context(), canonical_input(), None).unwrap()
+    compact_request_with_context(None)
 }
 
 fn valid_response() -> Value {
@@ -106,146 +100,14 @@ fn valid_response() -> Value {
 }
 
 #[test]
-fn from_canonical_sends_full_allowlist_and_never_tool_choice() {
-    let context = CanonicalResponsesContext {
-        model: "grok-test".into(),
-        base_instructions: "base instructions".into(),
-        memory_context: Some("memory".into()),
-        tools: json!([{ "type": "function", "name": "read_file" }]),
-        tool_choice: Some(json!({ "type": "auto" })),
-        reasoning: Some(json!({ "effort": "high" })),
-        text: Some(json!({ "format": { "type": "text" } })),
-        parallel_tool_calls: false,
-        prompt_cache_key: Some("cache-key".into()),
-        prompt_cache_options: Some(json!({ "scope": "session" })),
-        prompt_cache_retention: Some("24h".into()),
-        service_tier: Some("priority".into()),
-    };
-    let body = serde_json::to_value(
-        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some("directive"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        body["instructions"],
-        format!(
-            "base instructions{INSTRUCTIONS_MEMORY_SEPARATOR}memory{USER_CONTEXT_DELIMITER}directive"
-        )
-    );
-    assert_eq!(body["model"], "grok-test");
-    assert_eq!(body["parallel_tool_calls"], false);
-    assert_eq!(body["tools"], context.tools);
-    assert_eq!(body["reasoning"], json!({ "effort": "high" }));
-    assert_eq!(body["text"], json!({ "format": { "type": "text" } }));
-    assert_eq!(body["prompt_cache_key"], "cache-key");
-    assert_eq!(body["prompt_cache_options"], json!({ "scope": "session" }));
-    assert_eq!(body["prompt_cache_retention"], "24h");
-    assert_eq!(body["service_tier"], "priority");
-    assert_eq!(body["input"], json!(canonical_input()));
-    assert!(
-        body.get("tool_choice").is_none(),
-        "tool_choice is create-only and must never reach the compact endpoint"
-    );
-}
-
-#[test]
-fn from_canonical_omits_fields_the_compact_endpoint_does_not_support() {
-    let context = CanonicalResponsesContext {
-        model: "grok-test".into(),
-        base_instructions: String::new(),
-        memory_context: None,
-        tools: json!([]),
-        tool_choice: Some(json!({ "type": "auto" })),
-        reasoning: None,
-        text: None,
-        parallel_tool_calls: true,
-        prompt_cache_key: None,
-        prompt_cache_options: None,
-        prompt_cache_retention: None,
-        service_tier: None,
-    };
-    let body = serde_json::to_value(
-        ResponsesCompactRequest::from_canonical(&context, canonical_input(), None).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        body.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
-        vec!["model", "input", "parallel_tool_calls"]
-    );
-    for absent in [
-        "instructions",
-        "tools",
-        "reasoning",
-        "text",
-        "prompt_cache_key",
-        "prompt_cache_options",
-        "prompt_cache_retention",
-        "service_tier",
-        "tool_choice",
-    ] {
-        assert!(body.get(absent).is_none(), "unexpected field {absent}");
-    }
-}
-
-#[test]
-fn from_canonical_preserves_explicit_false_parallel_tool_calls() {
-    let context = CanonicalResponsesContext {
-        parallel_tool_calls: false,
-        ..canonical_context()
-    };
-    let body = serde_json::to_value(
-        ResponsesCompactRequest::from_canonical(&context, canonical_input(), None).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(body["parallel_tool_calls"], false);
-    assert!(body.get("parallel_tool_calls").is_some());
-}
-
-#[test]
-fn from_canonical_rejects_empty_input_and_system_items() {
-    let context = canonical_context();
-    let empty = ResponsesCompactRequest::from_canonical(&context, Vec::new(), None);
-    assert_eq!(
-        empty.unwrap_err().failure(),
-        ResponsesCompactFailure::InvalidResponse
-    );
-    let with_system = vec![
-        json!({ "role": "system", "content": "system prompt" }),
-        json!({ "role": "user", "content": "hello" }),
-    ];
-    let rejected =
-        ResponsesCompactRequest::from_canonical(&context, with_system, None);
-    assert_eq!(
-        rejected.unwrap_err().failure(),
-        ResponsesCompactFailure::InvalidResponse
-    );
-    // The user item alone (no system) is accepted.
-    assert!(ResponsesCompactRequest::from_canonical(
-        &context,
-        canonical_input(),
-        None
-    )
-    .is_ok());
-}
-
-#[test]
-fn from_canonical_appends_compact_only_user_context_suffix() {
-    let context = canonical_context();
-    let body = serde_json::to_value(
-        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some("preserve this"))
-            .unwrap(),
-    )
-    .unwrap();
+fn resolved_constructor_appends_compact_only_user_context() {
+    let body = serde_json::to_value(compact_request_with_context(Some("preserve this"))).unwrap();
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains(USER_CONTEXT_DELIMITER));
     assert!(instructions.ends_with("preserve this"));
-    // An empty suffix is treated as absent: no delimiter, plain canonical instructions.
-    let body = serde_json::to_value(
-        ResponsesCompactRequest::from_canonical(&context, canonical_input(), Some(""))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(body["instructions"], "normal instructions");
+    assert_eq!(body["model"], "grok-test");
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -348,15 +210,15 @@ async fn compact_uses_real_endpoint_exact_body_and_metadata_only_auth() {
     config.header_injector = Some(Arc::new(TestHeaderInjector));
 
     let client = SamplingClient::new(config).unwrap();
-    let request = ResponsesCompactRequest::from_canonical(&canonical_context(), canonical_input(), Some("preserve this"))
-        .unwrap()
-        .with_correlation(CompactCorrelationHeaders {
+    let request = compact_request_with_context(Some("preserve this")).with_correlation(
+        CompactCorrelationHeaders {
             conversation_id: Some("conv".into()),
             request_id: Some("req".into()),
             session_id: Some("session".into()),
             agent_id: Some("agent".into()),
             ..Default::default()
-        });
+        },
+    );
     let credential = RequestCredentialSnapshot::bearer("live-token", "principal-a");
     let response = client
         .compact_responses(&request, &credential, &CancellationToken::new())
@@ -619,10 +481,13 @@ fn response_validation_preserves_unknown_items_and_rejects_aliases_and_triggers(
     assert_eq!(parsed.output.len(), 2);
     assert_eq!(parsed.output[0]["nested"]["z"], 1);
 
-    let mut codex_v1 = valid_response();
-    codex_v1.as_object_mut().unwrap().remove("object");
+    let mut without_object_field = valid_response();
+    without_object_field
+        .as_object_mut()
+        .unwrap()
+        .remove("object");
     assert_eq!(
-        validate_responses_compact_response(codex_v1)
+        validate_responses_compact_response(without_object_field)
             .unwrap()
             .output
             .len(),
@@ -700,8 +565,7 @@ async fn compact_logs_never_expose_prompt_blob_query_or_credentials() {
             ..Default::default()
         })
         .unwrap();
-        let request = compact_request()
-            .with_instructions(Some(PROMPT.into()));
+        let request = compact_request().with_instructions(Some(PROMPT.into()));
         let error = client
             .compact_responses(
                 &request,
@@ -730,8 +594,8 @@ async fn oversized_request_is_rejected_before_transport() {
         ..Default::default()
     })
     .unwrap();
-    let request = compact_request()
-        .with_instructions(Some("x".repeat(RESPONSES_COMPACT_MAX_BYTES)));
+    let request =
+        compact_request().with_instructions(Some("x".repeat(RESPONSES_COMPACT_MAX_BYTES)));
 
     let error = client
         .compact_responses(

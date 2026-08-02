@@ -8,9 +8,9 @@ use xai_chat_state::{
     RequestIdentityBindResult, RequestIdentityBinding, estimate_conversation_tokens,
 };
 use xai_grok_sampling_types::{
-    CheckpointIdentity,
-    ApiBackend, CheckpointIdentityV1, ContentPart, ConversationItem, ResponsesCompactionModeV1,
-    SamplingConfig, ServerResponsesCheckpointV1, TokenSeedSource,
+    ApiBackend, CheckpointIdentity, ContentPart, ConversationItem, RESPONSES_COMPACTION_CONTRACT,
+    ResponsesCompactionMode, SamplingConfig, ServerResponsesCheckpoint, TokenSeedSource,
+    base_instructions_sha256,
 };
 
 fn sampling_config(model: &str) -> SamplingConfig {
@@ -30,32 +30,30 @@ fn sampling_config(model: &str) -> SamplingConfig {
     }
 }
 
-fn identity(model: &str, prompt: &str) -> CheckpointIdentityV1 {
-    CheckpointIdentityV1 {
+fn identity(model: &str, prompt: &str) -> CheckpointIdentity {
+    CheckpointIdentity {
         provider_id: "provider".into(),
         api: "responses".into(),
         endpoint_fingerprint: "endpoint".into(),
         model: model.into(),
         auth_principal_fingerprint: "principal".into(),
-        contract_version: "responses-compact-codex-v1".into(),
+        contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
         prompt_envelope_fingerprint: format!("prompt-{prompt}"),
-        canonical_prompt_projection: Some(json!([{
-            "type": "message",
-            "role": "system",
-            "content": prompt
-        }])),
+        base_instructions_sha256: base_instructions_sha256(prompt),
+        prior_checkpoint_id: Some("checkpoint-0".into()),
+        cache_route_fingerprint: Some("cache-route".into()),
     }
 }
 
-fn wrapper(seed: u64, identity: CheckpointIdentityV1) -> ConversationItem {
-    ConversationItem::ResponsesCompactionCheckpoint(Box::new(ServerResponsesCheckpointV1 {
-        schema_version: 1,
+fn wrapper(seed: u64, identity: CheckpointIdentity) -> ConversationItem {
+    let prior_checkpoint_id = identity.prior_checkpoint_id.clone();
+    ConversationItem::ResponsesCompactionCheckpoint(Box::new(ServerResponsesCheckpoint {
         checkpoint_id: "checkpoint-1".into(),
         operation_id: "operation-1".into(),
         prompt_index: 1,
         created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
         auto_continue: false,
-        mode: ResponsesCompactionModeV1 {
+        mode: ResponsesCompactionMode {
             name: "summary".into(),
             detail: None,
         },
@@ -68,6 +66,8 @@ fn wrapper(seed: u64, identity: CheckpointIdentityV1) -> ConversationItem {
         checkpoint_token_seed: seed,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
         server_output_item_count: 1,
+        prior_checkpoint_id,
+        memory_revision: Some(7),
     }))
 }
 
@@ -87,12 +87,9 @@ fn spawn(
 
 async fn bind(
     handle: &xai_chat_state::ChatStateHandle,
-    identity: CheckpointIdentityV1,
+    identity: CheckpointIdentity,
 ) -> RequestIdentityBinding {
-    handle
-        .bind_request_identity(CheckpointIdentity::V1(identity))
-        .await
-        .unwrap()
+    handle.bind_request_identity(identity).await.unwrap()
 }
 
 async fn snapshot(handle: &xai_chat_state::ChatStateHandle) -> ChatCompactionSnapshot {
@@ -137,10 +134,7 @@ async fn request_revision_binding_is_atomic_and_rejects_stale_history() {
         .await
         .unwrap();
     let stale = handle
-        .bind_request_identity_at_revision(
-            CheckpointIdentity::V1(identity("grok-test", "system")),
-            request_revision,
-        )
+        .bind_request_identity_at_revision(identity("grok-test", "system"), request_revision)
         .await
         .unwrap();
     assert!(matches!(
@@ -149,6 +143,11 @@ async fn request_revision_binding_is_atomic_and_rejects_stale_history() {
             if current_revision > request_revision
     ));
     let after_stale = snapshot(&handle).await;
+    assert_eq!(
+        after_stale.total_tokens,
+        before.total_tokens + estimate_conversation_tokens(&[ConversationItem::user("concurrent")]),
+        "the compaction baseline includes user/tool deltas since the last model usage"
+    );
     assert_eq!(
         after_stale.request_identity_generation, before.request_identity_generation,
         "a stale request must not bind its identity"
@@ -161,10 +160,7 @@ async fn request_revision_binding_is_atomic_and_rejects_stale_history() {
         .unwrap();
     let rebuilt_revision = rebuilt.history_revision.expect("rebuilt request revision");
     let bound = handle
-        .bind_request_identity_at_revision(
-            CheckpointIdentity::V1(identity("grok-test", "system")),
-            rebuilt_revision,
-        )
+        .bind_request_identity_at_revision(identity("grok-test", "system"), rebuilt_revision)
         .await
         .unwrap();
     let RequestIdentityBindResult::Bound {
@@ -323,8 +319,17 @@ async fn every_checkpoint_identity_component_mismatch_requires_migration() {
     let mut changed = expected.clone();
     changed.contract_version = "future-contract".into();
     mismatches.push(changed);
-    let mut changed = expected;
+    let mut changed = expected.clone();
     changed.prompt_envelope_fingerprint = "other-prompt".into();
+    mismatches.push(changed);
+    let mut changed = expected.clone();
+    changed.base_instructions_sha256 = "other-base-instructions".into();
+    mismatches.push(changed);
+    let mut changed = expected.clone();
+    changed.prior_checkpoint_id = None;
+    mismatches.push(changed);
+    let mut changed = expected;
+    changed.cache_route_fingerprint = None;
     mismatches.push(changed);
 
     for mismatch in mismatches {
@@ -333,6 +338,64 @@ async fn every_checkpoint_identity_component_mismatch_requires_migration() {
             CheckpointReplayStatus::MigrationRequired
         );
     }
+}
+
+#[tokio::test]
+async fn invalid_checkpoint_layout_and_output_are_rejected() {
+    let id = identity("grok-test", "system");
+    let valid = wrapper(40, id.clone());
+    let misplaced = vec![ConversationItem::user("before checkpoint"), valid.clone()];
+    let duplicate = vec![valid.clone(), valid.clone()];
+
+    for conversation in [misplaced, duplicate] {
+        let (persistence, _records) = MockChatPersistence::new();
+        let handle = spawn(conversation, persistence);
+        assert_eq!(
+            bind(&handle, id.clone()).await.checkpoint_status,
+            CheckpointReplayStatus::InvalidCheckpoint
+        );
+    }
+
+    let mut empty_output = valid.clone();
+    let ConversationItem::ResponsesCompactionCheckpoint(checkpoint) = &mut empty_output else {
+        unreachable!("fixture is a checkpoint");
+    };
+    checkpoint.output.clear();
+
+    let (persistence, mut records) = MockChatPersistence::new();
+    let handle = spawn(vec![ConversationItem::system("system")], persistence);
+    bind(&handle, id).await;
+    let before = snapshot(&handle).await;
+    for (operation_id, replacement) in [
+        (
+            "invalid-layout",
+            vec![ConversationItem::user("before checkpoint"), valid],
+        ),
+        ("empty-output", vec![empty_output]),
+    ] {
+        let result = handle
+            .commit_compaction(CommitCompaction {
+                operation_id: operation_id.into(),
+                expected_history_revision: before.history_revision,
+                expected_request_identity_generation: before.request_identity_generation,
+                replacement,
+                committed_total_tokens: 40,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            CommitCompactionResult::PersistenceFailed(_)
+        ));
+    }
+    assert!(matches!(
+        handle.get_conversation().await[0],
+        ConversationItem::System(_)
+    ));
+    assert!(!records.drain().iter().any(|record| matches!(
+        record,
+        xai_chat_state::PersistenceRecord::AcknowledgedReplaceHistory { .. }
+    )));
 }
 
 #[tokio::test]
@@ -467,10 +530,7 @@ async fn snapshot_serde_restore_preserves_wrapper_tokens_and_monotonic_generatio
     let serialized = serde_json::to_vec(&handle.snapshot().await.unwrap()).unwrap();
     let saved: xai_chat_state::ChatStateSnapshot = serde_json::from_slice(&serialized).unwrap();
     assert_eq!(saved.total_tokens, 45);
-    assert_eq!(
-        saved.bound_request_identity.as_ref(),
-        Some(&CheckpointIdentity::V1(id.clone()))
-    );
+    assert_eq!(saved.bound_request_identity.as_ref(), Some(&id));
     assert_eq!(estimate_conversation_tokens(&saved.conversation), 45);
 
     handle
@@ -488,10 +548,7 @@ async fn snapshot_serde_restore_preserves_wrapper_tokens_and_monotonic_generatio
         restored.conversation[0],
         ConversationItem::ResponsesCompactionCheckpoint(_)
     ));
-    assert_eq!(
-        restored.bound_request_identity.as_ref(),
-        Some(&CheckpointIdentity::V1(id))
-    );
+    assert_eq!(restored.bound_request_identity.as_ref(), Some(&id));
     assert!(restored.history_revision > mutated.history_revision);
     assert!(restored.request_identity_generation > mutated.request_identity_generation);
     assert_eq!(estimate_conversation_tokens(&restored.conversation), 45);

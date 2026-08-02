@@ -341,8 +341,8 @@ async fn apply_retry_decision(
     // rejected an oversized payload before responding 413. Strip
     // images proactively before any retry of those errors so we don't
     // burn budget re-uploading the same large body. Only `Normal`
-    // dispatches can be rewritten; resolved/legacy bodies are frozen
-    // by construction and are retried byte-identically.
+    // dispatches can be rewritten; resolved bodies are frozen by
+    // construction and are retried byte-identically.
     if err.is_likely_body_rejected()
         && let SamplingDispatch::Normal(normal) = request
     {
@@ -377,8 +377,8 @@ async fn apply_retry_decision(
             }
         }
         RetryDecision::RetryWithImageStrip => {
-            // Only typed normal requests can strip images; resolved/legacy
-            // bodies are frozen, so there is nothing to strip.
+            // Only typed normal requests can strip images; resolved bodies
+            // are frozen, so there is nothing to strip.
             let stripped = match request {
                 SamplingDispatch::Normal(normal) => normal.strip_images(),
                 _ => 0,
@@ -516,27 +516,12 @@ async fn run_one_attempt(
             )
             .await
         }
-        SamplingDispatch::LegacyV1(permit) => {
-            let init = client
-                .legacy_replay_stream_responses((*permit).clone())
-                .await;
-            run_responses_attempt(
-                init,
-                request_id,
-                idle_timeout,
-                event_tx,
-                cancel_token,
-                doom_check,
-                output_observed,
-            )
-            .await
-        }
     }
 }
 
 /// Typed `ConversationRequest` attempt: conversation defaults are applied
 /// inside the client and the body is rebuilt from the typed request, exactly
-/// like historical behavior. Resolved/legacy dispatches bypass this entirely.
+/// like historical behavior. Resolved dispatches bypass this entirely.
 #[allow(clippy::too_many_arguments)]
 async fn run_normal_attempt(
     client: &SamplingClient,
@@ -601,9 +586,9 @@ async fn run_normal_attempt(
     }
 }
 
-/// Shared Responses L2 pipeline for typed-normal, resolved and legacy
-/// attempts. The raw stream init is the only step that differs between
-/// them; the frozen body lives behind the client call.
+/// Shared Responses L2 pipeline for typed-normal and resolved attempts. The
+/// raw stream init is the only step that differs between them; the frozen
+/// body lives behind the client call.
 #[allow(clippy::too_many_arguments)]
 async fn run_responses_attempt(
     init: Result<

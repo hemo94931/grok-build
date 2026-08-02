@@ -1954,8 +1954,8 @@ impl SamplingClient {
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses checkpoint"))?;
 
         // Typed normal only: checkpoint-bearing requests must arrive as an
-        // opaque resolved request or a legacy replay permit so the POST layer
-        // can prove the body came from a validating constructor.
+        // opaque resolved request so the POST layer can prove the body came
+        // from a validating constructor.
         let wrapper = CreateResponseWrapper::try_normal(&request)
             .map_err(|_| SamplingError::InvalidConfiguration("invalid Responses request"))?;
 
@@ -1980,27 +1980,6 @@ impl SamplingClient {
             ));
         }
         let wrapper = CreateResponseWrapper::from_resolved(resolved);
-        self.create_response_stream(wrapper).await
-    }
-
-    /// Send a temporary V1 replay permit (migration gray window). Issued by
-    /// the shell only after the checkpoint gate proved replayability; the
-    /// frozen body is sent verbatim on every retry.
-    #[allow(clippy::type_complexity)]
-    pub async fn legacy_replay_stream_responses(
-        &self,
-        permit: xai_grok_sampling_types::ValidatedLegacyReplayV1,
-    ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
-        Option<ResponseModelMetadata>,
-        Option<crate::doom_loop::DoomLoopSignalCollector>,
-    )> {
-        if self.defaults.api_backend != ApiBackend::Responses {
-            return Err(SamplingError::InvalidConfiguration(
-                "legacy replay requires the Responses backend",
-            ));
-        }
-        let wrapper = CreateResponseWrapper::from_legacy_v1(permit);
         self.create_response_stream(wrapper).await
     }
 

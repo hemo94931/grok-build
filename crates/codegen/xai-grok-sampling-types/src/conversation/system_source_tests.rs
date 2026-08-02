@@ -12,8 +12,7 @@ use super::*;
 const LEGACY_SYSTEM_JSON: &str = r#"{"type":"system","content":"base instructions"}"#;
 /// The same item in canonical (key-sorted) form, as hashed by
 /// `portable_history_digest`.
-const LEGACY_SYSTEM_CANONICAL: &str =
-    r#"{"content":"base instructions","type":"system"}"#;
+const LEGACY_SYSTEM_CANONICAL: &str = r#"{"content":"base instructions","type":"system"}"#;
 
 #[test]
 fn legacy_system_json_roundtrips_byte_identical() {
@@ -53,10 +52,9 @@ fn legacy_portable_history_digest_is_stable() {
     assert_eq!(first, canonical_of(&reparsed));
 
     // And the canonical bytes equal the historical ones verbatim.
-    let expected = canonical_json_bytes(
-        &serde_json::from_str::<serde_json::Value>(legacy_json).unwrap(),
-    )
-    .unwrap();
+    let expected =
+        canonical_json_bytes(&serde_json::from_str::<serde_json::Value>(legacy_json).unwrap())
+            .unwrap();
     assert_eq!(first, expected);
 }
 
@@ -80,10 +78,7 @@ fn explicit_sources_serialize_and_roundtrip() {
         ),
     ] {
         let json = serde_json::to_string(&item).unwrap();
-        assert!(
-            json.contains(fragment),
-            "expected {fragment} in {json}"
-        );
+        assert!(json.contains(fragment), "expected {fragment} in {json}");
         let parsed: ConversationItem = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.system_source(), Some(source));
     }
@@ -92,5 +87,8 @@ fn explicit_sources_serialize_and_roundtrip() {
 #[test]
 fn default_source_is_never_serialized() {
     let json = serde_json::to_string(&ConversationItem::system("s")).unwrap();
-    assert!(!json.contains("source"), "default source leaked into {json}");
+    assert!(
+        !json.contains("source"),
+        "default source leaked into {json}"
+    );
 }

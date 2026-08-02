@@ -208,16 +208,14 @@ pub enum ResponsesRequestBuildError {
 }
 
 /// Canonical bytes of a portable history: the digest payload shared by the
-/// checkpoint sidecar writer, the recovery scanner and the replay permit.
+/// checkpoint sidecar writer, recovery scanner and replay verifier.
 pub fn portable_history_bytes(history: &[ConversationItem]) -> Result<Vec<u8>, serde_json::Error> {
     let value = serde_json::to_value(history)?;
     canonical_json_bytes(&value)
 }
 
 /// Hex SHA-256 over [`portable_history_bytes`].
-pub fn portable_history_digest(
-    history: &[ConversationItem],
-) -> Result<String, serde_json::Error> {
+pub fn portable_history_digest(history: &[ConversationItem]) -> Result<String, serde_json::Error> {
     use sha2::Digest as _;
     Ok(format!(
         "{:x}",
@@ -227,9 +225,7 @@ pub fn portable_history_digest(
 
 /// Hex SHA-256 over the canonical bytes of an arbitrary JSON value. Shared
 /// by the canonical-envelope and cache-routing fingerprints.
-pub fn canonical_value_digest(
-    value: &serde_json::Value,
-) -> Result<String, serde_json::Error> {
+pub fn canonical_value_digest(value: &serde_json::Value) -> Result<String, serde_json::Error> {
     use sha2::Digest as _;
     Ok(format!(
         "{:x}",
@@ -237,10 +233,9 @@ pub fn canonical_value_digest(
     ))
 }
 
-/// Immutable normal Responses request immediately before transport defaults/headers.
-///
-/// A checkpoint-bearing request is serialized by preserving the raw canonical
-/// prefix and converting only the typed live tail.
+/// Immutable Responses request immediately before transport defaults/headers.
+/// Checkpoint-bearing bodies are only created internally by validated resolved
+/// replay/recompaction constructors.
 #[derive(Debug, Clone)]
 pub struct FinalResponsesRequest {
     body: serde_json::Value,
@@ -266,9 +261,8 @@ impl TryFrom<&ConversationRequest> for FinalResponsesRequest {
     /// Typed conversion for ordinary requests. Checkpoint wrappers are
     /// rejected: replay bodies are built exclusively through validated
     /// replay constructors, never by silently flattening a wrapper. This
-    /// guarantees every publicly obtainable `FinalResponsesRequest` is
-    /// checkpoint-free, which is what seals the compact POST gate
-    /// (`ResponsesCompactRequest::from_final`).
+    /// guarantees the public typed conversion is checkpoint-free and keeps
+    /// the transport gate sealed.
     fn try_from(request: &ConversationRequest) -> Result<Self, Self::Error> {
         if request
             .items
@@ -317,36 +311,13 @@ impl FinalResponsesRequest {
         Ok(Self { body })
     }
 
-    /// Flattened legacy-replay body: `checkpoint_output ++ tail items`.
-    ///
-    /// `pub(crate)`: only [`crate::conversation::resolved::ValidatedLegacyReplayV1`]
-    /// may build a flattened body, and only after its material proof
-    /// (digest + leading-item equality) validated.
-    pub(crate) fn from_legacy_replay(
-        request: &ConversationRequest,
-        checkpoint_output: Vec<serde_json::Value>,
-    ) -> Result<Self, ResponsesRequestBuildError> {
-        let mut tail_request = request.clone();
-        tail_request.items.remove(0);
-        let mut this = Self::from_typed_items(&tail_request)?;
-        let tail = this
-            .body
-            .get_mut("input")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or(ResponsesRequestBuildError::MissingInput)?;
-        let mut input = checkpoint_output;
-        input.append(tail);
-        this.body["input"] = serde_json::Value::Array(input);
-        Ok(this)
-    }
-
     /// Replay/recompact body from explicit parts: `output prefix ++
-    /// serialized typed items`. `typed_items` must already be checkpoint-
-    /// free and have instruction-lifted systems removed (V2 wire rule);
-    /// `request` supplies the envelope context (model, tools, cache
-    /// fields, pre-composed instructions).
+    /// serialized typed items`. `typed_items` must already be checkpoint-free
+    /// and have instruction-lifted systems removed; `request` supplies the
+    /// envelope context (model, tools, cache fields, pre-composed
+    /// instructions).
     ///
-    /// `pub(crate)`: only the validated V2 constructors in
+    /// `pub(crate)`: only validated constructors in
     /// [`crate::conversation::resolved`] may call this.
     pub(crate) fn from_replay_parts(
         request: &ConversationRequest,
@@ -367,56 +338,6 @@ impl FinalResponsesRequest {
             this.body["input"] = serde_json::Value::Array(input);
         }
         Ok(this)
-    }
-
-    /// Flattened provider-visible body of a request as raw JSON, strictly
-    /// for continuity/identity projection computation in the shell's replay
-    /// gate. This is **not** a sendable request: every POST gate accepts
-    /// only sealed types, and raw JSON cannot re-enter them.
-    pub fn replay_projection_body(
-        request: &ConversationRequest,
-    ) -> Result<serde_json::Value, ResponsesRequestBuildError> {
-        match request.items.first() {
-            Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) => {
-                request.validate_for_backend(&crate::ApiBackend::Responses)?;
-                let this = Self::from_legacy_replay(request, checkpoint.output.clone())?;
-                Ok(this.body)
-            }
-            // V2 wrappers build projection bodies exclusively through
-            // `ValidatedResponsesReplayV2`, which verifies the replay
-            // material before any body exists.
-            Some(ConversationItem::ResponsesCompactionCheckpointV2(_)) => {
-                Err(ResponsesRequestBuildError::CheckpointRequiresReplayPath)
-            }
-            _ => Ok(Self::from_typed_items(request)?.body),
-        }
-    }
-
-    /// Validated recompaction body: the only public constructor that may
-    /// flatten a checkpoint into a sendable [`FinalResponsesRequest`].
-    ///
-    /// The checkpoint must pass `validate_for_backend` (unique, schema-1,
-    /// non-empty output, at index 0); the shell's compaction writer
-    /// additionally proves the wrapper against its sidecar before reaching
-    /// this point. Together with [`TryFrom`] (checkpoint-free only), this
-    /// keeps the compact POST gate sealed: `ResponsesCompactRequest` can
-    /// only be built from one of these two validated shapes.
-    pub fn for_compact_request(
-        request: &ConversationRequest,
-    ) -> Result<Self, ResponsesRequestBuildError> {
-        match request.items.first() {
-            Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) => {
-                request.validate_for_backend(&crate::ApiBackend::Responses)?;
-                Self::from_legacy_replay(request, checkpoint.output.clone())
-            }
-            // RecompactV2 goes through
-            // `ResolvedCompactRequest::from_validated_recompact`, never the
-            // V1 flattening path.
-            Some(ConversationItem::ResponsesCompactionCheckpointV2(_)) => {
-                Err(ResponsesRequestBuildError::CheckpointRequiresReplayPath)
-            }
-            _ => Self::from_typed_items(request),
-        }
     }
 }
 
@@ -533,9 +454,8 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }
             }]
         }
-        ConversationItem::ResponsesCompactionCheckpoint(_)
-        | ConversationItem::ResponsesCompactionCheckpointV2(_) => {
-            unreachable!("checkpoint input must be flattened by FinalResponsesRequest")
+        ConversationItem::ResponsesCompactionCheckpoint(_) => {
+            unreachable!("checkpoint input must be flattened by a validated resolved request")
         }
     }
 }

@@ -86,9 +86,6 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
         ConversationItem::ResponsesCompactionCheckpoint(checkpoint) => {
             checkpoint.checkpoint_token_seed
         }
-        ConversationItem::ResponsesCompactionCheckpointV2(checkpoint) => {
-            checkpoint.checkpoint_token_seed
-        }
     }
 }
 

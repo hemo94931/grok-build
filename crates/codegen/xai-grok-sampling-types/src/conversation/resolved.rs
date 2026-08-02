@@ -11,7 +11,7 @@
 //! `Deserialize`: deserialization can never imply validation.
 
 use super::responses::{FinalResponsesRequest, ResponsesRequestBuildError};
-use super::{ConversationItem, ConversationRequest, ConversationValidationError};
+use super::{ConversationItem, ConversationRequest};
 use crate::TraceContext;
 
 /// Correlation headers frozen into a resolved request so retries reuse the
@@ -41,7 +41,7 @@ impl ResponsesCorrelation {
     }
 }
 
-/// Checkpoint binding frozen into a validated replay/legacy permit.
+/// Checkpoint binding frozen into a validated replay request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCheckpointBinding {
     pub checkpoint_id: String,
@@ -65,8 +65,8 @@ pub enum ResolvedRequestError {
 ///
 /// * [`ResolvedResponsesRequest::try_normal`] — typed normal request that
 ///   structurally cannot contain a checkpoint;
-/// * replay constructors (added with the V2 checkpoint contract) that carry
-///   a [`ResolvedCheckpointBinding`].
+/// * validated replay constructors that carry a
+///   [`ResolvedCheckpointBinding`].
 #[derive(Debug, Clone)]
 pub struct ResolvedResponsesRequest {
     body: FinalResponsesRequest,
@@ -79,13 +79,13 @@ pub struct ResolvedResponsesRequest {
 }
 
 impl ResolvedResponsesRequest {
-    /// Build a typed normal resolved request. Rejects every checkpoint
-    /// variant; checkpoints must go through validated replay construction.
+    /// Build a typed normal resolved request. Rejects checkpoints, which must
+    /// go through validated replay construction.
     pub fn try_normal(request: &ConversationRequest) -> Result<Self, ResolvedRequestError> {
         if request
             .items
             .iter()
-            .any(|item| matches!(item, ConversationItem::ResponsesCompactionCheckpoint(_)))
+            .any(ConversationItem::is_responses_checkpoint)
         {
             return Err(ResolvedRequestError::CheckpointInNormalRequest);
         }
@@ -133,137 +133,14 @@ impl ResolvedResponsesRequest {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum LegacyReplayPermitError {
-    #[error("legacy replay requires exactly one leading V1 responses checkpoint")]
-    MissingCheckpoint,
-    #[error("portable history digest does not match the live checkpoint wrapper")]
-    DigestMismatch,
-    #[error(transparent)]
-    Validation(#[from] ConversationValidationError),
-    #[error(transparent)]
-    Build(#[from] ResponsesRequestBuildError),
-}
-
-/// Temporary V1 replay permit for the migration gray window.
-///
-/// Only the shell's checkpoint gate issues this permit, after
-/// `ensure_checkpoint_replayable_for_request` returned
-/// `CheckpointReplayStatus::Replayable` and the live wrapper + sidecar
-/// validated successfully. The body is produced exclusively by the typed
-/// [`FinalResponsesRequest`] conversion; the frozen body is reused verbatim
-/// across sampler retries (plan-once, body-frozen retry).
-///
-/// This type never creates new V1 checkpoints and is deleted once V1
-/// migration reaches 100%.
-#[derive(Debug, Clone)]
-pub struct ValidatedLegacyReplayV1 {
-    body: FinalResponsesRequest,
-    model: String,
-    checkpoint_id: String,
-    operation_id: String,
-    branch_id: String,
-    history_revision: Option<u64>,
-    request_identity_generation: u64,
-    correlation: ResponsesCorrelation,
-    trace: Option<Box<dyn TraceContext>>,
-}
-
-impl ValidatedLegacyReplayV1 {
-    /// Validate a V1 replay request and freeze its flattened body.
-    ///
-    /// The constructor consumes the full material proof:
-    ///
-    /// * `portable_history` must hash to the live wrapper's
-    ///   `portable_history_sha256` — only the shell gate reads the sidecar,
-    ///   so ungated callers cannot satisfy this;
-    /// * `request_identity_generation` must come from the
-    ///   `bind_request_identity_at_revision` call that proved replayability.
-    ///
-    /// Continuity between the checkpoint output and the live tail is
-    /// structural: the wrapper sits at index 0 of the live chat-state
-    /// history and the tail is whatever the actor appended after the
-    /// compaction commit, so the flattened body is coherent by
-    /// construction.
-    pub fn try_new(
-        request: &ConversationRequest,
-        portable_history: &[ConversationItem],
-        request_identity_generation: u64,
-    ) -> Result<Self, LegacyReplayPermitError> {
-        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) = request.items.first()
-        else {
-            return Err(LegacyReplayPermitError::MissingCheckpoint);
-        };
-        // Exactly one schema-1 checkpoint at index 0 with non-empty output.
-        request.validate_for_backend(&crate::ApiBackend::Responses)?;
-        let digest = super::responses::portable_history_digest(portable_history)
-            .map_err(ResponsesRequestBuildError::Serialization)?;
-        if digest != wrapper.portable_history_sha256 {
-            return Err(LegacyReplayPermitError::DigestMismatch);
-        }
-        Ok(Self {
-            body: FinalResponsesRequest::from_legacy_replay(request, wrapper.output.clone())?,
-            model: request.model.clone().unwrap_or_default(),
-            checkpoint_id: wrapper.checkpoint_id.clone(),
-            operation_id: wrapper.operation_id.clone(),
-            branch_id: wrapper.branch_id.clone(),
-            history_revision: request.history_revision,
-            request_identity_generation,
-            correlation: ResponsesCorrelation::from_request(request),
-            trace: request.trace.clone(),
-        })
-    }
-
-    pub fn body(&self) -> &serde_json::Value {
-        self.body.body()
-    }
-
-    pub(crate) fn into_body(self) -> serde_json::Value {
-        self.body.into_body()
-    }
-
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub fn checkpoint_id(&self) -> &str {
-        &self.checkpoint_id
-    }
-
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
-    pub fn branch_id(&self) -> &str {
-        &self.branch_id
-    }
-
-    pub fn history_revision(&self) -> Option<u64> {
-        self.history_revision
-    }
-
-    pub fn request_identity_generation(&self) -> u64 {
-        self.request_identity_generation
-    }
-
-    pub fn correlation(&self) -> &ResponsesCorrelation {
-        &self.correlation
-    }
-
-    pub fn take_trace(&mut self) -> Option<Box<dyn TraceContext>> {
-        self.trace.take()
-    }
-}
-
 /// Sealed body of a [`crate::CreateResponseWrapper`]. The `Typed` variant
-/// serializes `wrapper.inner`; every other variant carries a body that can
-/// only have come from a validating constructor above.
+/// serializes `wrapper.inner`; `Resolved` carries a body that can only have
+/// come from a validating constructor above.
 #[derive(Debug, Clone, Default)]
 pub(crate) enum SealedResponsesBody {
     #[default]
     Typed,
     Resolved(Box<ResolvedResponsesRequest>),
-    LegacyV1(Box<ValidatedLegacyReplayV1>),
 }
 
 impl SealedResponsesBody {
@@ -272,7 +149,6 @@ impl SealedResponsesBody {
         match self {
             Self::Typed => None,
             Self::Resolved(resolved) => Some(resolved.body()),
-            Self::LegacyV1(permit) => Some(permit.body()),
         }
     }
 
@@ -281,25 +157,23 @@ impl SealedResponsesBody {
         match self {
             Self::Typed => None,
             Self::Resolved(resolved) => Some(resolved.into_body()),
-            Self::LegacyV1(permit) => Some(permit.into_body()),
         }
     }
 }
 
 // ============================================================================
-// V2 replay contract (reader-first)
+// Responses compaction replay contract
 // ============================================================================
 
 use serde::{Deserialize, Serialize};
 
 use super::responses::portable_history_digest;
-use super::v2::{
-    RESPONSES_CHECKPOINT_SCHEMA_V2, RESPONSES_COMPACTION_CONTRACT_V2, ServerResponsesCheckpointV2,
-    TrustedPromptEnvelopeV2, wrapper_digest_v2,
+use super::responses_compaction::{
+    RESPONSES_COMPACTION_CONTRACT, ServerResponsesCheckpoint, TrustedPromptEnvelope,
 };
 
 /// Separator between base instructions and memory context inside the
-/// composed top-level `instructions` field (V2 wire rule).
+/// composed top-level `instructions` field.
 pub const INSTRUCTIONS_MEMORY_SEPARATOR: &str = "\n\n";
 
 /// Delimiter for compact-only user context appended to the compact
@@ -307,12 +181,12 @@ pub const INSTRUCTIONS_MEMORY_SEPARATOR: &str = "\n\n";
 /// it for its legacy compact request type.
 pub const USER_CONTEXT_DELIMITER: &str = "\n\n--- user-provided compaction context ---\n";
 
-/// Compose the V2 top-level instructions from conversation items: every
+/// Compose top-level instructions from conversation items: every
 /// `BaseInstructions` item in order, then every `MemoryContext` item,
 /// joined by the fixed separator. Only sources that
 /// [`SystemSource::lifts_into_instructions`] participate; every other
 /// System stays in `input` at its original position.
-pub fn compose_instructions_v2(items: &[ConversationItem]) -> Option<String> {
+pub fn compose_instructions(items: &[ConversationItem]) -> Option<String> {
     let mut parts = Vec::new();
     for item in items {
         let ConversationItem::System(system) = item else {
@@ -339,7 +213,7 @@ fn lifted_into_instructions(item: &ConversationItem) -> bool {
 
 /// Replay/recompact input items: typed items with instruction-lifted
 /// systems removed *by source*.
-pub fn replay_input_tail_v2(typed_items: &[ConversationItem]) -> Vec<ConversationItem> {
+pub fn replay_input_tail(typed_items: &[ConversationItem]) -> Vec<ConversationItem> {
     typed_items
         .iter()
         .filter(|item| !lifted_into_instructions(item))
@@ -347,12 +221,13 @@ pub fn replay_input_tail_v2(typed_items: &[ConversationItem]) -> Vec<Conversatio
         .collect()
 }
 
-/// Persistable V2 replay material. `Deserialize` yields an **unvalidated**
-/// value: after reading the V3 sidecar, `ValidatedResponsesReplayV2::verify`
-/// must recompute every digest before the material may influence a request.
+/// Persistable replay material. `Deserialize` yields an **unvalidated**
+/// value: after reading the portable-history sidecar,
+/// [`ValidatedResponsesReplay::verify`] must recompute every digest before
+/// the material may influence a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointReplayMaterialV2 {
-    trusted_envelope: TrustedPromptEnvelopeV2,
+pub struct CheckpointReplayMaterial {
+    trusted_envelope: TrustedPromptEnvelope,
     portable_history_sha256: String,
     wrapper_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,12 +246,12 @@ pub enum ReplayMaterialError {
     Serialization(#[from] serde_json::Error),
 }
 
-impl CheckpointReplayMaterialV2 {
+impl CheckpointReplayMaterial {
     /// Construct material bound to a wrapper and its portable history,
     /// computing both digests from the actual data.
     pub fn try_new(
-        checkpoint: &ServerResponsesCheckpointV2,
-        trusted_envelope: TrustedPromptEnvelopeV2,
+        checkpoint: &ServerResponsesCheckpoint,
+        trusted_envelope: TrustedPromptEnvelope,
         portable_history: &[ConversationItem],
     ) -> Result<Self, ReplayMaterialError> {
         let portable_history_sha256 = portable_history_digest(portable_history)?;
@@ -390,11 +265,11 @@ impl CheckpointReplayMaterialV2 {
             memory_revision: checkpoint.memory_revision,
             branch_id: checkpoint.branch_id.clone(),
             prior_checkpoint_id: checkpoint.prior_checkpoint_id.clone(),
-            contract_version: RESPONSES_COMPACTION_CONTRACT_V2.into(),
+            contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
         })
     }
 
-    pub fn trusted_envelope(&self) -> &TrustedPromptEnvelopeV2 {
+    pub fn trusted_envelope(&self) -> &TrustedPromptEnvelope {
         &self.trusted_envelope
     }
 
@@ -425,8 +300,6 @@ impl CheckpointReplayMaterialV2 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayVerificationError {
-    #[error("unsupported V2 checkpoint schema {0}")]
-    UnsupportedSchema(u8),
     #[error("contract version mismatch")]
     ContractMismatch,
     #[error("portable history digest mismatch")]
@@ -443,11 +316,11 @@ pub enum ReplayVerificationError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// A V2 replay that passed full material verification. Pure data proof —
-/// the shell additionally re-checks revision/identity freshness adjacent
-/// to dispatch. Never implements `Deserialize`.
+/// A replay that passed full material verification. Pure data proof — the
+/// caller additionally re-checks revision/identity freshness adjacent to
+/// dispatch. Never implements `Deserialize`.
 #[derive(Debug, Clone)]
-pub struct ValidatedResponsesReplayV2 {
+pub struct ValidatedResponsesReplay {
     checkpoint_id: String,
     operation_id: String,
     branch_id: String,
@@ -461,9 +334,9 @@ pub struct ValidatedResponsesReplayV2 {
     request_identity_generation: u64,
 }
 
-impl ValidatedResponsesReplayV2 {
-    /// Verify a V2 checkpoint against its replay material, the portable
-    /// history and the *current* compatibility envelope.
+impl ValidatedResponsesReplay {
+    /// Verify a checkpoint against its replay material, the portable history
+    /// and the *current* compatibility envelope.
     ///
     /// Pure data validation (no I/O): recomputes the portable and wrapper
     /// digests, checks identity/compatibility fields and the typed tail.
@@ -475,21 +348,16 @@ impl ValidatedResponsesReplayV2 {
     /// branch keeps replaying when every other immutable wrapper field
     /// matches (the digest is recomputed with the compaction-time branch).
     pub fn verify(
-        checkpoint: &ServerResponsesCheckpointV2,
-        material: &CheckpointReplayMaterialV2,
+        checkpoint: &ServerResponsesCheckpoint,
+        material: &CheckpointReplayMaterial,
         portable_history: &[ConversationItem],
-        current_envelope: &TrustedPromptEnvelopeV2,
+        current_envelope: &TrustedPromptEnvelope,
         typed_tail: &[ConversationItem],
         history_revision: u64,
         request_identity_generation: u64,
     ) -> Result<Self, ReplayVerificationError> {
-        if checkpoint.schema_version != RESPONSES_CHECKPOINT_SCHEMA_V2 {
-            return Err(ReplayVerificationError::UnsupportedSchema(
-                checkpoint.schema_version,
-            ));
-        }
-        if material.contract_version != RESPONSES_COMPACTION_CONTRACT_V2
-            || checkpoint.identity.contract_version != RESPONSES_COMPACTION_CONTRACT_V2
+        if material.contract_version != RESPONSES_COMPACTION_CONTRACT
+            || checkpoint.identity.contract_version != RESPONSES_COMPACTION_CONTRACT
         {
             return Err(ReplayVerificationError::ContractMismatch);
         }
@@ -502,15 +370,7 @@ impl ValidatedResponsesReplayV2 {
         let strict = checkpoint.wrapper_digest() == material.wrapper_digest;
         let rotation_ok = !strict
             && checkpoint.branch_id != material.branch_id
-            && wrapper_digest_v2(
-                &checkpoint.checkpoint_id,
-                &checkpoint.operation_id,
-                checkpoint.prompt_index,
-                &material.branch_id,
-                &checkpoint.identity,
-                &checkpoint.portable_history_sha256,
-                checkpoint.prior_checkpoint_id.as_deref(),
-            ) == material.wrapper_digest;
+            && checkpoint.wrapper_digest_for_branch(&material.branch_id) == material.wrapper_digest;
         if !strict && !rotation_ok {
             return Err(ReplayVerificationError::WrapperDigestMismatch);
         }
@@ -522,17 +382,24 @@ impl ValidatedResponsesReplayV2 {
             ));
         }
         if material.memory_revision() != checkpoint.memory_revision {
-            return Err(ReplayVerificationError::IdentityMismatch(
-                "memory_revision",
-            ));
+            return Err(ReplayVerificationError::IdentityMismatch("memory_revision"));
         }
         if checkpoint.output.is_empty() {
             return Err(ReplayVerificationError::IdentityMismatch("empty_output"));
         }
+        if checkpoint.server_output_item_count != checkpoint.output.len() {
+            return Err(ReplayVerificationError::IdentityMismatch(
+                "server_output_item_count",
+            ));
+        }
+        if checkpoint.checkpoint_token_seed == 0 {
+            return Err(ReplayVerificationError::IdentityMismatch(
+                "checkpoint_token_seed",
+            ));
+        }
         // Compatibility envelope: base instructions and the canonical
         // envelope fingerprint must match; memory content is excluded.
-        if current_envelope.base_instructions_sha256
-            != checkpoint.identity.base_instructions_sha256
+        if current_envelope.base_instructions_sha256 != checkpoint.identity.base_instructions_sha256
             || current_envelope.base_instructions_sha256
                 != material.trusted_envelope().base_instructions_sha256
         {
@@ -544,9 +411,7 @@ impl ValidatedResponsesReplayV2 {
             || current_envelope.envelope_fingerprint
                 != material.trusted_envelope().envelope_fingerprint
         {
-            return Err(ReplayVerificationError::EnvelopeMismatch(
-                "prompt_envelope",
-            ));
+            return Err(ReplayVerificationError::EnvelopeMismatch("prompt_envelope"));
         }
         if typed_tail.iter().any(|item| item.is_responses_checkpoint()) {
             return Err(ReplayVerificationError::CheckpointInTail);
@@ -617,18 +482,18 @@ impl ValidatedResponsesReplayV2 {
 }
 
 impl ResolvedResponsesRequest {
-    /// Build a frozen replay request from a verified V2 replay.
+    /// Build a frozen replay request from a verified replay.
     ///
     /// `request` supplies the envelope context (model, tools, cache fields,
     /// correlation) with `instructions` pre-composed via
-    /// [`compose_instructions_v2`]; the body is
+    /// [`compose_instructions`]; the body is
     /// `opaque output ++ serialized typed tail` with instruction-lifted
     /// systems removed by source.
     pub fn from_validated_replay(
-        replay: &ValidatedResponsesReplayV2,
+        replay: &ValidatedResponsesReplay,
         request: &ConversationRequest,
     ) -> Result<Self, ResolvedRequestError> {
-        let tail = replay_input_tail_v2(replay.typed_tail());
+        let tail = replay_input_tail(replay.typed_tail());
         let body =
             FinalResponsesRequest::from_replay_parts(request, replay.output().to_vec(), &tail)?;
         Ok(Self {
@@ -647,7 +512,7 @@ impl ResolvedResponsesRequest {
 /// [`ResolvedCompactRequest::try_normal`] (first compact on a
 /// checkpoint-free conversation) or
 /// [`ResolvedCompactRequest::from_validated_recompact`] (continuous compact
-/// on a verified V2 checkpoint).
+/// on a verified checkpoint).
 #[derive(Debug, Clone)]
 pub struct ResolvedCompactRequest {
     body: serde_json::Value,
@@ -672,9 +537,8 @@ pub enum ResolvedCompactError {
 }
 
 /// Project a flattened full-request body onto the compact endpoint's field
-/// allowlist, applying the V2 instructions semantics (composed
-/// instructions already present in the body) and the compact-only user
-/// context suffix.
+/// allowlist, applying the composed-instructions semantics already present
+/// in the body and the compact-only user-context suffix.
 fn compact_body_from_final(
     final_body: serde_json::Value,
     user_context: Option<&str>,
@@ -714,7 +578,7 @@ fn compact_body_from_final(
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::Value::String(model));
     body.insert("input".into(), serde_json::Value::Array(input));
-    // `parallel_tool_calls` comes from the canonical context explicitly —
+    // `parallel_tool_calls` comes from the typed request explicitly —
     // never an invented default.
     if let Some(value) = final_body.get("parallel_tool_calls") {
         body.insert("parallel_tool_calls".into(), value.clone());
@@ -734,7 +598,10 @@ fn compact_body_from_final(
             "prompt_cache_key",
             string_field("prompt_cache_key").map(serde_json::Value::String),
         ),
-        ("prompt_cache_options", optional_value("prompt_cache_options")),
+        (
+            "prompt_cache_options",
+            optional_value("prompt_cache_options"),
+        ),
         (
             "prompt_cache_retention",
             string_field("prompt_cache_retention").map(serde_json::Value::String),
@@ -782,7 +649,7 @@ impl ResolvedCompactRequest {
             return Err(ResolvedCompactError::CheckpointInNormalRequest);
         }
         // Input excludes instruction-lifted systems by source.
-        let input_items = replay_input_tail_v2(&request.items);
+        let input_items = replay_input_tail(&request.items);
         let final_body =
             FinalResponsesRequest::from_replay_parts(request, Vec::new(), &input_items)?
                 .into_body();
@@ -796,15 +663,15 @@ impl ResolvedCompactRequest {
         )
     }
 
-    /// Continuous compact on a verified V2 checkpoint:
+    /// Continuous compact on a verified checkpoint:
     /// `input = prior opaque output ++ serialized typed tail`, with
     /// instruction-lifted systems removed by source.
     pub fn from_validated_recompact(
-        replay: &ValidatedResponsesReplayV2,
+        replay: &ValidatedResponsesReplay,
         request: &ConversationRequest,
         user_context: Option<&str>,
     ) -> Result<Self, ResolvedCompactError> {
-        let tail = replay_input_tail_v2(replay.typed_tail());
+        let tail = replay_input_tail(replay.typed_tail());
         let final_body =
             FinalResponsesRequest::from_replay_parts(request, replay.output().to_vec(), &tail)?
                 .into_body();
@@ -849,6 +716,10 @@ impl ResolvedCompactRequest {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ResponsesCompactionMode,
+        ServerResponsesCheckpoint, TokenSeedSource,
+    };
     use super::*;
 
     fn normal_request() -> ConversationRequest {
@@ -864,27 +735,28 @@ mod tests {
     }
 
     fn checkpointed_request() -> ConversationRequest {
-        let wrapper = Box::new(super::super::ServerResponsesCheckpointV1 {
-            schema_version: 1,
+        let wrapper = Box::new(ServerResponsesCheckpoint {
             checkpoint_id: "cp".into(),
             operation_id: "op".into(),
             prompt_index: 0,
             created_at: chrono::Utc::now(),
             auto_continue: false,
-            mode: super::super::ResponsesCompactionModeV1 {
+            mode: ResponsesCompactionMode {
                 name: "default".into(),
                 detail: None,
             },
             branch_id: "branch".into(),
-            identity: super::super::CheckpointIdentityV1 {
+            identity: CheckpointIdentity {
                 provider_id: "xai".into(),
                 api: "responses".into(),
                 endpoint_fingerprint: "ep".into(),
                 model: "grok-test".into(),
                 auth_principal_fingerprint: "principal".into(),
-                contract_version: "responses-compact-codex-v1".into(),
+                contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
                 prompt_envelope_fingerprint: "envelope".into(),
-                canonical_prompt_projection: None,
+                base_instructions_sha256: "base".into(),
+                prior_checkpoint_id: None,
+                cache_route_fingerprint: None,
             },
             output: vec![serde_json::json!({
                 "type": "compaction",
@@ -894,8 +766,10 @@ mod tests {
             portable_history_sha256: "digest".into(),
             portable_history_bytes: 1,
             checkpoint_token_seed: 1,
-            token_seed_source: super::super::TokenSeedSource::UsageOutputTokens,
+            token_seed_source: TokenSeedSource::UsageOutputTokens,
             server_output_item_count: 1,
+            prior_checkpoint_id: None,
+            memory_revision: None,
         });
         ConversationRequest {
             items: vec![
@@ -909,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn try_normal_rejects_checkpoints() {
+    fn try_normal_rejects_checkpoint() {
         let request = checkpointed_request();
         assert!(matches!(
             ResolvedResponsesRequest::try_normal(&request),
@@ -931,86 +805,5 @@ mod tests {
             Some("grok-test")
         );
         assert!(resolved.checkpoint_binding().is_none());
-    }
-
-    #[test]
-    fn legacy_permit_requires_checkpoint() {
-        let request = normal_request();
-        assert!(matches!(
-            ValidatedLegacyReplayV1::try_new(&request, &[], 1),
-            Err(LegacyReplayPermitError::MissingCheckpoint)
-        ));
-    }
-
-    /// Portable history whose digest matches `checkpointed_request()`'s
-    /// wrapper. Computed once via `portable_history_digest`.
-    fn matching_portable_history() -> Vec<ConversationItem> {
-        vec![
-            ConversationItem::system("base"),
-            ConversationItem::user("compacted away"),
-        ]
-    }
-
-    fn checkpointed_request_with_digest() -> ConversationRequest {
-        let mut request = checkpointed_request();
-        let digest = super::super::responses::portable_history_digest(
-            &matching_portable_history(),
-        )
-        .unwrap();
-        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
-            request.items.first_mut()
-        else {
-            unreachable!();
-        };
-        wrapper.portable_history_sha256 = digest;
-        request
-    }
-
-    #[test]
-    fn legacy_permit_freezes_wrapper_binding() {
-        let request = checkpointed_request_with_digest();
-        let permit =
-            ValidatedLegacyReplayV1::try_new(&request, &matching_portable_history(), 3).unwrap();
-        assert_eq!(permit.checkpoint_id(), "cp");
-        assert_eq!(permit.operation_id(), "op");
-        assert_eq!(permit.branch_id(), "branch");
-        assert_eq!(permit.history_revision(), Some(7));
-        assert_eq!(permit.request_identity_generation(), 3);
-        // The flattened body starts with the checkpoint output prefix.
-        let input = permit
-            .body()
-            .get("input")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        assert_eq!(
-            input[0].get("type").and_then(|v| v.as_str()),
-            Some("compaction")
-        );
-    }
-
-    #[test]
-    fn legacy_permit_rejects_digest_mismatch() {
-        let request = checkpointed_request();
-        // The wrapper still carries the placeholder digest "digest": no
-        // caller can build a permit without the real sidecar material.
-        assert!(matches!(
-            ValidatedLegacyReplayV1::try_new(&request, &matching_portable_history(), 1),
-            Err(LegacyReplayPermitError::DigestMismatch)
-        ));
-    }
-
-    #[test]
-    fn legacy_permit_rejects_empty_output_checkpoint() {
-        let mut request = checkpointed_request_with_digest();
-        let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
-            request.items.first_mut()
-        else {
-            unreachable!();
-        };
-        wrapper.output.clear();
-        assert!(matches!(
-            ValidatedLegacyReplayV1::try_new(&request, &matching_portable_history(), 1),
-            Err(LegacyReplayPermitError::Validation(_))
-        ));
     }
 }

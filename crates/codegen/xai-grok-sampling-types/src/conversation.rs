@@ -9,33 +9,30 @@ mod chat_completions;
 mod messages;
 mod resolved;
 mod responses;
-mod v2;
+mod responses_compaction;
 
 pub use canonical::{
-    CanonicalResponsesContext, aux_cache_namespace, cache_route_fingerprint,
-    model_cache_family, new_logical_cache_namespace_id, normalize_base_url_for_routing,
-    prompt_cache_key_for_namespace,
+    aux_cache_namespace, cache_route_fingerprint, model_cache_family,
+    new_logical_cache_namespace_id, normalize_base_url_for_routing, prompt_cache_key_for_namespace,
 };
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
 pub(crate) use resolved::SealedResponsesBody;
 pub use resolved::{
-    CheckpointReplayMaterialV2, INSTRUCTIONS_MEMORY_SEPARATOR, LegacyReplayPermitError,
-    ReplayMaterialError, ReplayVerificationError, ResolvedCheckpointBinding, ResolvedCompactError,
+    CheckpointReplayMaterial, INSTRUCTIONS_MEMORY_SEPARATOR, ReplayMaterialError,
+    ReplayVerificationError, ResolvedCheckpointBinding, ResolvedCompactError,
     ResolvedCompactRequest, ResolvedRequestError, ResolvedResponsesRequest, ResponsesCorrelation,
-    USER_CONTEXT_DELIMITER, ValidatedLegacyReplayV1, ValidatedResponsesReplayV2,
-    compose_instructions_v2, replay_input_tail_v2,
+    USER_CONTEXT_DELIMITER, ValidatedResponsesReplay, compose_instructions, replay_input_tail,
 };
 pub use responses::{
-    FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes, canonical_value_digest,
-    extra_tool_entries, patch_reasoning_text_types, portable_history_bytes, portable_history_digest,
-    response_to_conversation_items,
+    FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes,
+    canonical_value_digest, extra_tool_entries, patch_reasoning_text_types, portable_history_bytes,
+    portable_history_digest, response_to_conversation_items,
 };
-pub use v2::{
-    CheckpointIdentityV2, RESPONSES_CHECKPOINT_SCHEMA_V2, RESPONSES_COMPACTION_CONTRACT_V2,
-    ResponsesCheckpointRef, ServerResponsesCheckpointV2, TrustedPromptEnvelopeV2,
-    base_instructions_sha256_v2, canonical_envelope_fingerprint_v2, wire_prompt_sha256_v2,
-    wrapper_digest_v2,
+pub use responses_compaction::{
+    CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ServerResponsesCheckpoint,
+    TrustedPromptEnvelope, base_instructions_sha256, canonical_envelope_fingerprint,
+    wire_prompt_sha256, wrapper_digest_for_branch,
 };
 
 use std::sync::Arc;
@@ -123,38 +120,16 @@ pub enum ConversationItem {
     Reasoning(rs::ReasoningItem),
     /// Local-only wrapper for a canonical Responses compaction window.
     ///
-    /// This item is never converted through a typed provider item. Responses
-    /// requests flatten its raw `output` before serializing the typed live
-    /// tail; all other backends reject it via [`ConversationRequest::validate_for_backend`].
-    ResponsesCompactionCheckpoint(Box<ServerResponsesCheckpointV1>),
-    /// V2 checkpoint wrapper (reader-first; writers gated behind the V2
-    /// write flag). Same local-only semantics as V1, with an explicit
-    /// trusted prompt envelope and recompact chain binding.
-    ResponsesCompactionCheckpointV2(Box<ServerResponsesCheckpointV2>),
-}
-
-/// Frozen Codex v1 standalone `/responses/compact` contract version.
-pub const RESPONSES_COMPACTION_CONTRACT_V1: &str = "responses-compact-codex-v1";
-
-/// Identity that must match before replaying a server compaction checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointIdentityV1 {
-    pub provider_id: String,
-    pub api: String,
-    pub endpoint_fingerprint: String,
-    pub model: String,
-    pub auth_principal_fingerprint: String,
-    pub contract_version: String,
-    pub prompt_envelope_fingerprint: String,
-    /// Canonical system/developer prompt projection used by wrapper-aware
-    /// `ReplaceSystemHead`. Missing projections fail closed into migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_prompt_projection: Option<serde_json::Value>,
+    /// This item is never converted through a typed provider item. Replay and
+    /// recompaction flatten its opaque `output` only through validated resolved
+    /// constructors; all other backends reject it via
+    /// [`ConversationRequest::validate_for_backend`].
+    ResponsesCompactionCheckpoint(Box<ServerResponsesCheckpoint>),
 }
 
 /// Persisted mode metadata needed to repair a checkpoint marker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResponsesCompactionModeV1 {
+pub struct ResponsesCompactionMode {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
@@ -168,49 +143,13 @@ pub enum TokenSeedSource {
     EstimatedCanonicalOutput,
 }
 
-/// Versioned checkpoint identity used for request-identity binding. The
-/// chat-state actor stores this opaquely and compares it against the live
-/// wrapper's identity of the matching variant; a cross-variant comparison
-/// is always `MigrationRequired`/`InvalidCheckpoint`, never a silent match.
-///
-/// Serde is untagged with V2 first: V1 JSON lacks the V2-required
-/// `base_instructions_sha256`, so old bare-V1 snapshots parse as V1 while
-/// V2 data never collapses into the V1 shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CheckpointIdentity {
-    V2(v2::CheckpointIdentityV2),
-    V1(CheckpointIdentityV1),
-}
-
-/// Local wrapper for the canonical output of `POST /responses/compact`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerResponsesCheckpointV1 {
-    pub schema_version: u8,
-    pub checkpoint_id: String,
-    pub operation_id: String,
-    pub prompt_index: usize,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub auto_continue: bool,
-    pub mode: ResponsesCompactionModeV1,
-    pub branch_id: String,
-    pub identity: CheckpointIdentityV1,
-    pub output: Vec<serde_json::Value>,
-    pub portable_history_path: String,
-    pub portable_history_sha256: String,
-    pub portable_history_bytes: u64,
-    pub checkpoint_token_seed: u64,
-    pub token_seed_source: TokenSeedSource,
-    pub server_output_item_count: usize,
-}
-
 /// System message content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemItem {
     pub content: Arc<str>,
     /// Where this system item originated. Digest-stable: the
-    /// `LegacyUnclassified` default is never serialized, so historical V1
-    /// items deserialize and re-serialize to byte-identical canonical JSON.
+    /// `LegacyUnclassified` default is never serialized, so historical items
+    /// deserialize and re-serialize to byte-identical canonical JSON.
     #[serde(default, skip_serializing_if = "SystemSource::is_default")]
     pub source: SystemSource,
 }
@@ -778,9 +717,9 @@ pub struct ConversationRequest {
     pub prompt_cache_retention: Option<String>,
     /// Provider service tier, passed through without inventing defaults.
     pub service_tier: Option<String>,
-    /// Explicit parallel-tool-calls flag for canonical-envelope request
-    /// kinds (compact/recompact per plan 阶段 6: "never `unwrap_or(true)`;
-    /// must be provided by the canonical context explicitly"). Absent on
+    /// Explicit parallel-tool-calls flag for compact/recompact request
+    /// kinds (never `unwrap_or(true)`; it must come from the typed request).
+    /// Absent on
     /// ordinary requests so their wire shape is unchanged; compact-bound
     /// requests set it explicitly and the compact constructors require it.
     pub parallel_tool_calls: Option<bool>,
@@ -791,8 +730,6 @@ pub struct ConversationRequest {
 pub enum ConversationValidationError {
     #[error("a responses compaction checkpoint must be the unique item at index 0")]
     InvalidCheckpointLayout,
-    #[error("unsupported responses compaction checkpoint schema version {0}")]
-    UnsupportedCheckpointSchema(u8),
     #[error("a responses compaction checkpoint must contain non-empty output")]
     EmptyCheckpointOutput,
     #[error("responses compaction checkpoints cannot be sent to {0:?}")]
@@ -805,12 +742,13 @@ impl ConversationRequest {
         &self,
         backend: &crate::ApiBackend,
     ) -> Result<(), ConversationValidationError> {
-        let checkpoints: Vec<(usize, ResponsesCheckpointRef<'_>)> = self
+        let checkpoints: Vec<(usize, &ServerResponsesCheckpoint)> = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                item.as_responses_checkpoint().map(|checkpoint| (index, checkpoint))
+                item.as_responses_checkpoint()
+                    .map(|checkpoint| (index, checkpoint))
             })
             .collect();
         let Some((index, checkpoint)) = checkpoints.first().copied() else {
@@ -819,18 +757,7 @@ impl ConversationRequest {
         if checkpoints.len() != 1 || index != 0 {
             return Err(ConversationValidationError::InvalidCheckpointLayout);
         }
-        let supported = match checkpoint {
-            ResponsesCheckpointRef::V1(wrapper) => wrapper.schema_version == 1,
-            ResponsesCheckpointRef::V2(wrapper) => {
-                wrapper.schema_version == RESPONSES_CHECKPOINT_SCHEMA_V2
-            }
-        };
-        if !supported {
-            return Err(ConversationValidationError::UnsupportedCheckpointSchema(
-                checkpoint.schema_version(),
-            ));
-        }
-        if checkpoint.output().is_empty() {
+        if checkpoint.output.is_empty() {
             return Err(ConversationValidationError::EmptyCheckpointOutput);
         }
         if !matches!(backend, crate::ApiBackend::Responses) {
@@ -1522,7 +1449,6 @@ impl ConversationItem {
             // system boundary only for legacy read-only callers; converters
             // reject or flatten it explicitly.
             Self::ResponsesCompactionCheckpoint(_) => Role::System,
-            Self::ResponsesCompactionCheckpointV2(_) => Role::System,
         }
     }
 
@@ -1553,7 +1479,6 @@ impl ConversationItem {
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
             Self::ResponsesCompactionCheckpoint(_) => String::new(),
-            Self::ResponsesCompactionCheckpointV2(_) => String::new(),
         }
     }
 }
@@ -2243,7 +2168,6 @@ pub fn transform_conversation_cwd(
             }
             // The canonical provider prefix is opaque and must never be rewritten.
             ConversationItem::ResponsesCompactionCheckpoint(_) => {}
-            ConversationItem::ResponsesCompactionCheckpointV2(_) => {}
         }
     }
 }
@@ -2626,8 +2550,8 @@ mod messages_tests;
 mod system_source_tests;
 
 #[cfg(test)]
-#[path = "conversation/v2_tests.rs"]
-mod v2_tests;
+#[path = "conversation/responses_compaction_tests.rs"]
+mod responses_compaction_tests;
 
 #[cfg(test)]
 mod tests {

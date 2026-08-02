@@ -309,31 +309,32 @@ mod install_system_prompt_tests {
     fn checkpoint_resume_never_inserts_before_wrapper() {
         use chrono::Utc;
         use xai_grok_sampling_types::{
-            CheckpointIdentityV1, ResponsesCompactionModeV1, ServerResponsesCheckpointV1,
-            TokenSeedSource,
+            CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ResponsesCompactionMode,
+            ServerResponsesCheckpoint, TokenSeedSource,
         };
         let mut conv = vec![ConversationItem::ResponsesCompactionCheckpoint(Box::new(
-            ServerResponsesCheckpointV1 {
-                schema_version: 1,
+            ServerResponsesCheckpoint {
                 checkpoint_id: "checkpoint".into(),
                 operation_id: "operation".into(),
                 prompt_index: 1,
                 created_at: Utc::now(),
                 auto_continue: false,
-                mode: ResponsesCompactionModeV1 {
+                mode: ResponsesCompactionMode {
                     name: "summary".into(),
                     detail: None,
                 },
                 branch_id: "branch".into(),
-                identity: CheckpointIdentityV1 {
+                identity: CheckpointIdentity {
                     provider_id: "provider".into(),
                     api: "responses".into(),
                     endpoint_fingerprint: "endpoint".into(),
                     model: "model".into(),
                     auth_principal_fingerprint: "principal".into(),
-                    contract_version: "responses-compact-codex-v1".into(),
+                    contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
                     prompt_envelope_fingerprint: "prompt".into(),
-                    canonical_prompt_projection: None,
+                    base_instructions_sha256: "base".into(),
+                    prior_checkpoint_id: None,
+                    cache_route_fingerprint: None,
                 },
                 output: vec![serde_json::json!({
                     "type": "compaction",
@@ -345,6 +346,8 @@ mod install_system_prompt_tests {
                 checkpoint_token_seed: 1,
                 token_seed_source: TokenSeedSource::UsageOutputTokens,
                 server_output_item_count: 1,
+                prior_checkpoint_id: None,
+                memory_revision: None,
             },
         ))];
         let mut prefix = None;

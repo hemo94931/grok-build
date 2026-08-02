@@ -303,7 +303,7 @@ pub enum PersistenceMsg {
             Result<xai_chat_state::StrictAppendAck, xai_chat_state::StrictAppendError>,
         >,
     },
-    AppendChatTailV2AndAck {
+    AppendChatTailAndAck {
         append: xai_chat_state::TailAppend,
         respond_to: tokio::sync::oneshot::Sender<Result<(), xai_chat_state::HistoryReplaceError>>,
     },
@@ -373,40 +373,21 @@ pub enum PersistenceMsg {
     },
     /// Persist a compaction checkpoint file to `compaction_checkpoints/{id}.json`.
     CompactionCheckpoint(crate::extensions::notification::CompactionCheckpointFile),
-    /// Durably persist a Responses schema-v2 checkpoint before history commit.
-    ResponsesCompactionCheckpointV2 {
+    /// Durably persist the current Responses checkpoint sidecar before
+    /// committing history.
+    ResponsesCompactionCheckpoint {
         relative_path: String,
-        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV2,
+        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFile,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
-    /// Durably persist a Responses schema-v3 (V2 contract) checkpoint
-    /// sidecar before history commit.
-    ResponsesCompactionCheckpointV3 {
-        relative_path: String,
-        checkpoint: crate::session::storage::responses_compaction::CompactionCheckpointFileV3,
-        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
-    },
-    /// Stage a server Responses segment without allocating a formal index.
+    /// Stage a strongly bound server Responses segment without allocating a
+    /// formal index.
     ResponsesCompactionSegmentStage {
-        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV1,
-        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
-    },
-    /// Stage a V2-contract server Responses segment (strong operation/branch/
-    /// wrapper-digest binding) without allocating a formal index.
-    ResponsesCompactionSegmentStageV2 {
-        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStagingV2,
+        staging: crate::session::storage::responses_compaction::ResponsesCompactionSegmentStaging,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
     /// Publish a committed staged server Responses segment idempotently.
     ResponsesCompactionSegmentPublish {
-        checkpoint_id: String,
-        respond_to: tokio::sync::oneshot::Sender<
-            io::Result<crate::session::storage::responses_compaction::PublishedCompactionSegment>,
-        >,
-    },
-    /// Publish a committed staged V2-contract server Responses segment
-    /// idempotently, binding through the operation id and wrapper digest.
-    ResponsesCompactionSegmentPublishV2 {
         checkpoint_id: String,
         operation_id: String,
         wrapper_digest: String,
@@ -1914,7 +1895,7 @@ impl SessionPersistence {
     ) -> Result<(), xai_chat_state::HistoryReplaceError> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         use crate::session::storage::responses_compaction::{
-            ConversationAppendCommittedV2, ConversationAppendPreparedV2, TailV2,
+            ConversationAppendCommitted, ConversationAppendPrepared, PersistedTail,
         };
         use crate::session::storage::{AppendTailError, AppendUpdateError};
 
@@ -1926,7 +1907,7 @@ impl SessionPersistence {
                 xai_chat_state::HistoryReplaceError::NotCommitted(error)
             }
         })?;
-        let prepared = ConversationAppendPreparedV2 {
+        let prepared = ConversationAppendPrepared {
             operation_id: append.operation_id.clone(),
             checkpoint_id: append.checkpoint_id.clone(),
             branch_id: append.branch_id.clone(),
@@ -1934,9 +1915,9 @@ impl SessionPersistence {
             prompt_index: append.prompt_index,
             item: append.item.clone(),
         };
-        let prepared_update = self.typed_tail_update(
-            XaiSessionUpdate::ConversationAppendPreparedV2(Box::new(prepared.clone())),
-        );
+        let prepared_update = self.typed_tail_update(XaiSessionUpdate::ConversationAppendPrepared(
+            Box::new(prepared.clone()),
+        ));
         match self
             .storage
             .append_update_durable_commit_aware(&self.info, &prepared_update)
@@ -1951,7 +1932,7 @@ impl SessionPersistence {
             }
         }
 
-        let tail = TailV2 {
+        let tail = PersistedTail {
             operation_id: append.operation_id,
             checkpoint_id: append.checkpoint_id,
             branch_id: append.branch_id,
@@ -1961,7 +1942,7 @@ impl SessionPersistence {
         };
         match self
             .storage
-            .append_chat_tail_v2_durable(&self.info, &tail)
+            .append_chat_tail_durable(&self.info, &tail)
             .await
         {
             Ok(_) => {}
@@ -1973,9 +1954,9 @@ impl SessionPersistence {
             }
         }
 
-        let committed = ConversationAppendCommittedV2::from(&prepared);
+        let committed = ConversationAppendCommitted::from(&prepared);
         let committed_update =
-            self.typed_tail_update(XaiSessionUpdate::ConversationAppendCommittedV2(committed));
+            self.typed_tail_update(XaiSessionUpdate::ConversationAppendCommitted(committed));
         match self
             .storage
             .append_update_durable_commit_aware(&self.info, &committed_update)
@@ -2097,7 +2078,7 @@ impl SessionPersistence {
                         });
                     let _ = respond_to.send(result);
                 }
-                PersistenceMsg::AppendChatTailV2AndAck { append, respond_to } => {
+                PersistenceMsg::AppendChatTailAndAck { append, respond_to } => {
                     let result = self.append_typed_tail(append).await;
                     let _ = respond_to.send(result);
                 }
@@ -2365,29 +2346,14 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to write compaction checkpoint file");
                     }
                 }
-                PersistenceMsg::ResponsesCompactionCheckpointV2 {
+                PersistenceMsg::ResponsesCompactionCheckpoint {
                     relative_path,
                     checkpoint,
                     respond_to,
                 } => {
                     let result = self
                         .storage
-                        .write_responses_compaction_checkpoint_v2(
-                            &self.info,
-                            &relative_path,
-                            &checkpoint,
-                        )
-                        .await;
-                    let _ = respond_to.send(result);
-                }
-                PersistenceMsg::ResponsesCompactionCheckpointV3 {
-                    relative_path,
-                    checkpoint,
-                    respond_to,
-                } => {
-                    let result = self
-                        .storage
-                        .write_responses_compaction_checkpoint_v3(
+                        .write_responses_compaction_checkpoint(
                             &self.info,
                             &relative_path,
                             &checkpoint,
@@ -2405,27 +2371,7 @@ impl SessionPersistence {
                         .await;
                     let _ = respond_to.send(result);
                 }
-                PersistenceMsg::ResponsesCompactionSegmentStageV2 {
-                    staging,
-                    respond_to,
-                } => {
-                    let result = self
-                        .storage
-                        .stage_responses_compaction_segment_v2(&self.info, &staging)
-                        .await;
-                    let _ = respond_to.send(result);
-                }
                 PersistenceMsg::ResponsesCompactionSegmentPublish {
-                    checkpoint_id,
-                    respond_to,
-                } => {
-                    let result = self
-                        .storage
-                        .publish_responses_compaction_segment(&self.info, &checkpoint_id)
-                        .await;
-                    let _ = respond_to.send(result);
-                }
-                PersistenceMsg::ResponsesCompactionSegmentPublishV2 {
                     checkpoint_id,
                     operation_id,
                     wrapper_digest,
@@ -2433,7 +2379,7 @@ impl SessionPersistence {
                 } => {
                     let result = self
                         .storage
-                        .publish_responses_compaction_segment_v2(
+                        .publish_responses_compaction_segment(
                             &self.info,
                             &checkpoint_id,
                             &operation_id,

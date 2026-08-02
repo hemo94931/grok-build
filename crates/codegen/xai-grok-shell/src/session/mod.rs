@@ -330,7 +330,6 @@ pub(crate) mod image_normalize;
 pub mod inference_metrics;
 pub use xai_grok_shared::session::info;
 pub(crate) mod cache_routing;
-pub mod checkpoint_recovery;
 pub(crate) mod compaction_gc;
 pub mod managed_mcp;
 pub(crate) mod mcp_descriptors;

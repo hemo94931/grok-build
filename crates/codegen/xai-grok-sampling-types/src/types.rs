@@ -1116,8 +1116,8 @@ impl CreateResponseWrapper {
     }
 
     /// Wrapper whose body comes from the typed conversion of a
-    /// checkpoint-free conversation request. Rejects every checkpoint
-    /// variant; checkpoints must use validated replay dispatch.
+    /// checkpoint-free conversation request. Checkpoints must use validated
+    /// replay dispatch.
     pub fn try_normal(
         request: &crate::ConversationRequest,
     ) -> Result<Self, crate::conversation::ResolvedRequestError> {
@@ -1137,18 +1137,6 @@ impl CreateResponseWrapper {
         wrapper.apply_correlation(resolved.correlation());
         wrapper.trace = resolved.take_trace();
         wrapper.body = crate::conversation::SealedResponsesBody::Resolved(Box::new(resolved));
-        wrapper
-    }
-
-    /// Wrapper around a temporary V1 replay permit (migration gray window).
-    pub fn from_legacy_v1(mut permit: crate::conversation::ValidatedLegacyReplayV1) -> Self {
-        let mut wrapper = Self::new(crate::rs::CreateResponse {
-            model: (!permit.model().is_empty()).then(|| permit.model().to_string()),
-            ..Default::default()
-        });
-        wrapper.apply_correlation(permit.correlation());
-        wrapper.trace = permit.take_trace();
-        wrapper.body = crate::conversation::SealedResponsesBody::LegacyV1(Box::new(permit));
         wrapper
     }
 

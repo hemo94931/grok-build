@@ -34,10 +34,9 @@ pub struct CompactCorrelationHeaders {
 
 /// Standalone `/responses/compact` request body.
 ///
-/// Fields are private: the only way to build one is the typed
-/// [`ResponsesCompactRequest::from_canonical`] (canonical envelope) or
-/// [`ResponsesCompactRequest::from_resolved`] (frozen V2 body), so the
-/// compact POST point can trust that no caller injected arbitrary raw JSON.
+/// Fields are private: the only construction path consumes a frozen
+/// [`xai_grok_sampling_types::ResolvedCompactRequest`], so the compact POST
+/// point cannot accept caller-supplied raw checkpoint JSON.
 #[derive(Clone, Serialize)]
 pub struct ResponsesCompactRequest {
     model: String,
@@ -74,7 +73,10 @@ impl std::fmt::Debug for ResponsesCompactRequest {
             .field("has_reasoning", &self.reasoning.is_some())
             .field("has_service_tier", &self.service_tier.is_some())
             .field("has_prompt_cache_key", &self.prompt_cache_key.is_some())
-            .field("has_prompt_cache_options", &self.prompt_cache_options.is_some())
+            .field(
+                "has_prompt_cache_options",
+                &self.prompt_cache_options.is_some(),
+            )
             .field(
                 "has_prompt_cache_retention",
                 &self.prompt_cache_retention.is_some(),
@@ -85,77 +87,8 @@ impl std::fmt::Debug for ResponsesCompactRequest {
 }
 
 impl ResponsesCompactRequest {
-    /// Build the compact endpoint body from the canonical envelope (Plan
-    /// 阶段 6). Every allowlisted field is derived from the canonical
-    /// context — the compact body and the normal body are the same source:
-    ///
-    /// - `model`, `instructions` (`context.instructions()`, `None` when
-    ///   empty), `tools`, `reasoning`, `text`, `parallel_tool_calls`
-    ///   (explicit — never defaulted), `prompt_cache_key`, `service_tier`
-    ///   come straight from the context.
-    /// - `prompt_cache_options` / `prompt_cache_retention` are included
-    ///   only when the context carries them; the caller decides whether the
-    ///   provider supports them by setting/clearing the context fields.
-    /// - `tool_choice` is create-only and is NEVER sent to the compact
-    ///   endpoint, but it stays part of the canonical envelope's
-    ///   compatibility identity.
-    /// - `compact_user_context` is a compact-only suffix appended to
-    ///   `instructions` behind [`USER_CONTEXT_DELIMITER`] (plan priority 2:
-    ///   no separate provider field exists today). It only affects this
-    ///   request body's instructions — it never enters any stored identity;
-    ///   callers record [`compact_directive_hash`] instead.
-    ///
-    /// `input` must be non-empty; items with `role == "system"` are
-    /// rejected because canonical instructions already carry system
-    /// content, so a system item in compact input indicates a caller bug.
-    pub fn from_canonical(
-        context: &xai_grok_sampling_types::CanonicalResponsesContext,
-        input: Vec<Value>,
-        compact_user_context: Option<&str>,
-    ) -> Result<Self, ResponsesCompactError> {
-        if input.is_empty() {
-            return Err(ResponsesCompactError::new(
-                ResponsesCompactFailure::InvalidResponse,
-            ));
-        }
-        if input
-            .iter()
-            .any(|item| item.get("role").and_then(Value::as_str) == Some("system"))
-        {
-            return Err(ResponsesCompactError::new(
-                ResponsesCompactFailure::InvalidResponse,
-            ));
-        }
-        let mut instructions = {
-            let joined = context.instructions();
-            (!joined.trim().is_empty()).then_some(joined)
-        };
-        if let Some(user_context) = compact_user_context.filter(|context| !context.is_empty()) {
-            let value = instructions.get_or_insert_with(String::new);
-            value.push_str(USER_CONTEXT_DELIMITER);
-            value.push_str(user_context);
-        }
-        let tools = (!context.tools.is_null()
-            && !context.tools.as_array().is_some_and(Vec::is_empty))
-        .then(|| context.tools.clone());
-        Ok(Self {
-            model: context.model.clone(),
-            input,
-            parallel_tool_calls: context.parallel_tool_calls,
-            instructions,
-            tools,
-            reasoning: context.reasoning.clone(),
-            service_tier: context.service_tier.clone(),
-            prompt_cache_key: context.prompt_cache_key.clone(),
-            prompt_cache_options: context.prompt_cache_options.clone(),
-            prompt_cache_retention: context.prompt_cache_retention.clone(),
-            text: context.text.clone(),
-            correlation: CompactCorrelationHeaders::default(),
-        })
-    }
-
     /// Build a compact request from a sealed [`ResolvedCompactRequest`]
-    /// (V2 contract: first compact via `try_normal`, continuous compact via
+    /// (first compact via `try_normal`, continuous compact via
     /// `from_validated_recompact`). The frozen body is reused verbatim so
     /// sampler retries never re-read session state.
     pub fn from_resolved(

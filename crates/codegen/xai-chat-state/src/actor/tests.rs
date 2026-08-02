@@ -1423,7 +1423,7 @@ async fn build_request_includes_all_messages() {
     assert_eq!(
         request.parallel_tool_calls,
         Some(true),
-        "normal and compact V2 envelopes must bind identical tool semantics"
+        "normal and compact envelopes must bind identical tool semantics"
     );
 }
 

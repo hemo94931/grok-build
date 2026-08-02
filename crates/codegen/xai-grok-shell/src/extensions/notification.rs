@@ -617,21 +617,14 @@ pub enum SessionUpdate {
     /// The actual compacted conversation is stored in a separate file under
     /// `compaction_checkpoints/{checkpoint_id}.json` to keep `updates.jsonl` lean.
     CompactionCheckpoint(Box<CompactionCheckpointInfo>),
-    /// Persist-only first phase for one provider-visible v2 checkpoint tail item.
-    ConversationAppendPreparedV2(
-        Box<crate::session::storage::responses_compaction::ConversationAppendPreparedV2>,
+    /// Persist-only first phase for one provider-visible checkpoint tail item.
+    ConversationAppendPrepared(
+        Box<crate::session::storage::responses_compaction::ConversationAppendPrepared>,
     ),
     /// Persist-only confirmation that the matching typed tail is authoritative.
-    ConversationAppendCommittedV2(
-        crate::session::storage::responses_compaction::ConversationAppendCommittedV2,
+    ConversationAppendCommitted(
+        crate::session::storage::responses_compaction::ConversationAppendCommitted,
     ),
-    /// Persist-only recovery bookkeeping for one Responses server checkpoint.
-    ///
-    /// Records the graded recovery classification (lossless / salvage /
-    /// unrecoverable) and the recovery-source fingerprint so a checkpoint in
-    /// a terminal state is not re-scanned — let alone re-migrated — on every
-    /// user turn. Keyed by `checkpoint_id` + `checkpoint_operation_id`.
-    CheckpointRecovery(Box<crate::session::checkpoint_recovery::CheckpointRecoveryRecord>),
     /// A rewind marker written to `updates.jsonl` when a rewind occurs.
     ///
     /// This is **persist-only** — it is never sent to the gateway/UI. Because
@@ -1267,13 +1260,32 @@ impl From<FeedbackRequestData> for FeedbackRequestNotification {
 
 // ── Compaction checkpoint types ────────────────────────────────────────
 
+/// Semantic kind of a compaction checkpoint artifact.
+///
+/// This is a format discriminator, not a version. Removed or unknown formats
+/// are rejected instead of being routed through compatibility readers.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionCheckpointKind {
+    Builtin,
+    ResponsesServer,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// Metadata stored in `updates.jsonl` as a `CompactionCheckpoint` session update.
 ///
 /// This is a lightweight reference; the full compacted conversation lives in a
 /// separate file (`compaction_checkpoints/{checkpoint_id}.json`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", from = "CompactionCheckpointInfoWire")]
 pub struct CompactionCheckpointInfo {
+    /// Selects the one concrete checkpoint representation without numeric
+    /// schema dispatch. Missing/unknown kinds deserialize as `Unknown` and
+    /// fail closed at replay/copy boundaries.
+    #[serde(default)]
+    pub kind: CompactionCheckpointKind,
     /// Unique checkpoint identifier (UUID).
     pub checkpoint_id: String,
     /// The prompt index at the time compaction completed.
@@ -1286,33 +1298,87 @@ pub struct CompactionCheckpointInfo {
     /// auto-continue prompt that was injected after compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_continue: Option<AutoContinueInfo>,
-    /// Schema version for forward compatibility.
-    pub schema_version: u32,
-    /// Server-checkpoint operation ID (schema v2 only).
+    /// Server-checkpoint operation ID (Responses server markers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
-    /// Active typed-tail branch (schema v2 only).
+    /// Active typed-tail branch (Responses server markers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<String>,
-    /// Portable-history digest used to validate the v2 sidecar.
+    /// Portable-history digest used to validate the current sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portable_history_sha256: Option<String>,
-    /// Mode repair payload for a missing schema-v2 marker.
+    /// Mode repair payload for a missing Responses marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub responses_mode: Option<xai_grok_sampling_types::ResponsesCompactionModeV1>,
+    pub responses_mode: Option<xai_grok_sampling_types::ResponsesCompactionMode>,
     /// Whether the server checkpoint was followed by auto-continue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_auto_continue: Option<bool>,
-    /// Wrapper digest binding this marker to a V2 server checkpoint
-    /// (schema v3 only).
+    /// Wrapper digest binding this marker to its server checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapper_digest: Option<String>,
-    /// Recompact chain link: the checkpoint this one was built on
-    /// (schema v3 only).
+    /// Recompact chain link: the checkpoint this one was built on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_checkpoint_id: Option<String>,
     /// ISO 8601 timestamp of when the checkpoint was created.
     pub created_at: String,
+}
+
+/// Deserialization boundary for checkpoint markers. Unknown fields are
+/// retained long enough to classify the entire marker as `Unknown`, avoiding
+/// both silent forward compatibility and parse errors that callers might
+/// otherwise skip while streaming `updates.jsonl`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CompactionCheckpointInfoWire {
+    #[serde(default)]
+    kind: CompactionCheckpointKind,
+    checkpoint_id: String,
+    prompt_index_at_compaction: usize,
+    checkpoint_file: String,
+    #[serde(default)]
+    auto_continue: Option<AutoContinueInfo>,
+    #[serde(default)]
+    operation_id: Option<String>,
+    #[serde(default)]
+    branch_id: Option<String>,
+    #[serde(default)]
+    portable_history_sha256: Option<String>,
+    #[serde(default)]
+    responses_mode: Option<xai_grok_sampling_types::ResponsesCompactionMode>,
+    #[serde(default)]
+    responses_auto_continue: Option<bool>,
+    #[serde(default)]
+    wrapper_digest: Option<String>,
+    #[serde(default)]
+    prior_checkpoint_id: Option<String>,
+    created_at: String,
+    #[serde(flatten)]
+    unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl From<CompactionCheckpointInfoWire> for CompactionCheckpointInfo {
+    fn from(wire: CompactionCheckpointInfoWire) -> Self {
+        let kind = if wire.unknown_fields.is_empty() {
+            wire.kind
+        } else {
+            CompactionCheckpointKind::Unknown
+        };
+        Self {
+            kind,
+            checkpoint_id: wire.checkpoint_id,
+            prompt_index_at_compaction: wire.prompt_index_at_compaction,
+            checkpoint_file: wire.checkpoint_file,
+            auto_continue: wire.auto_continue,
+            operation_id: wire.operation_id,
+            branch_id: wire.branch_id,
+            portable_history_sha256: wire.portable_history_sha256,
+            responses_mode: wire.responses_mode,
+            responses_auto_continue: wire.responses_auto_continue,
+            wrapper_digest: wire.wrapper_digest,
+            prior_checkpoint_id: wire.prior_checkpoint_id,
+            created_at: wire.created_at,
+        }
+    }
 }
 
 /// Information about the auto-continue prompt injected after auto-compaction.
@@ -1329,23 +1395,23 @@ pub struct AutoContinueInfo {
 /// Contains the full compacted conversation history so the replay pipeline can
 /// deterministically reconstruct the model's view without re-running compaction.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct CompactionCheckpointFile {
+    /// Semantic artifact discriminator. Only `Builtin` is valid here.
+    pub kind: CompactionCheckpointKind,
     /// Unique checkpoint identifier (matches [`CompactionCheckpointInfo::checkpoint_id`]).
     pub checkpoint_id: String,
     /// The prompt index at the time compaction completed.
     pub prompt_index_at_compaction: usize,
     /// The exact compacted conversation used by the model.
     pub compacted_history: Vec<crate::sampling::ConversationItem>,
-    /// Schema version for forward compatibility.
-    pub schema_version: u32,
     /// ISO 8601 timestamp of when the checkpoint was created.
     pub created_at: String,
     /// The original User(user_info) text from before compaction.
     /// Used during cross-compaction rewind to restore the correct user_info
     /// that the model originally saw for pre-compaction turns, rather than
     /// the rebuilt user_info from the compacted conversation.
-    /// `None` in older checkpoints (schema_version 1 without this field).
+    /// `None` when no original user-info text was captured.
     #[serde(default)]
     pub original_user_info: Option<String>,
     /// File paths that were re-read and injected after compaction.

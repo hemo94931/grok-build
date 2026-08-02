@@ -25,7 +25,6 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
         ConversationItem::Reasoning(_) => "reasoning",
         ConversationItem::ResponsesCompactionCheckpoint(_) => "responses_compaction_checkpoint",
-        ConversationItem::ResponsesCompactionCheckpointV2(_) => "responses_compaction_checkpoint_v2",
     }
 }
 
@@ -458,7 +457,6 @@ impl ChatStateActor {
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
                 }
                 ConversationItem::ResponsesCompactionCheckpoint(_) => 0,
-                ConversationItem::ResponsesCompactionCheckpointV2(_) => 0,
             })
             .sum()
     }
@@ -567,32 +565,17 @@ impl ChatStateActor {
             .conversation
             .first()
             .and_then(|item| item.as_responses_checkpoint());
-        let checkpoint_status = match (first_checkpoint, &identity) {
-            (Some(xai_grok_sampling_types::ResponsesCheckpointRef::V1(checkpoint)),
-             xai_grok_sampling_types::CheckpointIdentity::V1(identity))
-                if checkpoint_count == 1 && checkpoint.schema_version == 1 =>
-            {
-                if checkpoint.identity == *identity {
+        let checkpoint_status = match first_checkpoint {
+            Some(checkpoint) if checkpoint_count == 1 => {
+                if checkpoint.identity == identity {
                     CheckpointReplayStatus::Replayable
                 } else {
                     CheckpointReplayStatus::MigrationRequired
                 }
             }
-            (Some(xai_grok_sampling_types::ResponsesCheckpointRef::V2(checkpoint)),
-             xai_grok_sampling_types::CheckpointIdentity::V2(identity))
-                if checkpoint_count == 1
-                    && checkpoint.schema_version
-                        == xai_grok_sampling_types::RESPONSES_CHECKPOINT_SCHEMA_V2 =>
-            {
-                if checkpoint.identity == *identity {
-                    CheckpointReplayStatus::Replayable
-                } else {
-                    CheckpointReplayStatus::MigrationRequired
-                }
-            }
-            (Some(_), _) => CheckpointReplayStatus::InvalidCheckpoint,
-            (None, _) if checkpoint_count == 0 => CheckpointReplayStatus::NoCheckpoint,
-            _ => CheckpointReplayStatus::InvalidCheckpoint,
+            Some(_) => CheckpointReplayStatus::InvalidCheckpoint,
+            None if checkpoint_count == 0 => CheckpointReplayStatus::NoCheckpoint,
+            None => CheckpointReplayStatus::InvalidCheckpoint,
         };
         RequestIdentityBinding {
             request_identity_generation: self.state.request_identity_generation,
@@ -621,7 +604,10 @@ impl ChatStateActor {
             history_revision: self.state.history_revision,
             request_identity_generation: self.state.request_identity_generation,
             prompt_index: self.state.prompt_index,
-            total_tokens: self.state.total_tokens,
+            total_tokens: self
+                .state
+                .total_tokens
+                .saturating_add(self.state.estimated_tokens_since_model),
             conversation: self.state.conversation.clone(),
             sampling_config: self.state.sampling_config.clone(),
             bound_request_identity: self.state.bound_request_identity.clone(),
@@ -791,43 +777,14 @@ impl ChatStateActor {
     /// in-flight turn-capture tail from `state.conversation` before swapping,
     /// so the state must stay intact until then.
     pub(super) fn replace_system_head(&mut self, prompt: &str) -> ReplaceSystemHeadResult {
-        if let Some(ConversationItem::ResponsesCompactionCheckpointV2(checkpoint)) =
-            self.state.conversation.first()
-        {
-            // V2: compatibility is the base-instructions hash, not the V1
-            // prompt projection. A head change post-checkpoint makes the
-            // checkpoint incompatible → migration, exactly like V1.
-            let matches = xai_grok_sampling_types::base_instructions_sha256_v2(prompt.trim())
-                == checkpoint.identity.base_instructions_sha256;
-            if matches {
-                return ReplaceSystemHeadResult::Unchanged;
-            }
-            self.state.invalidate_request_identity();
-            return ReplaceSystemHeadResult::MigrationRequired;
-        }
         if let Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) =
             self.state.conversation.first()
         {
-            let matches = checkpoint
-                .identity
-                .canonical_prompt_projection
-                .as_ref()
-                .and_then(|projection| {
-                    projection
-                        .get("system")
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| {
-                            projection.as_array()?.iter().find_map(|item| {
-                                (item.get("role").and_then(serde_json::Value::as_str)
-                                    == Some("system"))
-                                .then(|| item.get("content").and_then(serde_json::Value::as_str))
-                                .flatten()
-                            })
-                        })
-                })
-                .is_some_and(|stored| {
-                    crate::conversation_util::canonical_system_prompt_eq(stored, prompt)
-                });
+            // Checkpoint compatibility is bound to the base-instructions hash.
+            // A different system head requires migration without mutating the
+            // active checkpoint or its typed tail.
+            let matches = xai_grok_sampling_types::base_instructions_sha256(prompt.trim())
+                == checkpoint.identity.base_instructions_sha256;
             if matches {
                 return ReplaceSystemHeadResult::Unchanged;
             }

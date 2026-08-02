@@ -1,8 +1,8 @@
 use super::support::create_test_actor;
 
 use crate::extensions::notification::{
-    CompactionCheckpointFile, CompactionCheckpointInfo, SessionNotification as XaiNotification,
-    SessionUpdate as XaiSessionUpdate,
+    CompactionCheckpointFile, CompactionCheckpointInfo, CompactionCheckpointKind,
+    SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
 };
 use crate::sampling::ConversationItem;
 use crate::session::storage::{SessionUpdate, SessionUpdateEnvelope};
@@ -38,11 +38,11 @@ fn checkpoint_update(id: &str, prompt_index_at_compaction: usize) -> SessionUpda
     SessionUpdate::Xai(Box::new(XaiNotification {
         session_id: acp::SessionId::new("s"),
         update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+            kind: CompactionCheckpointKind::Builtin,
             checkpoint_id: id.to_string(),
             prompt_index_at_compaction,
             checkpoint_file: format!("compaction_checkpoints/{id}.json"),
             auto_continue: None,
-            schema_version: 1,
             operation_id: None,
             branch_id: None,
             portable_history_sha256: None,
@@ -63,13 +63,13 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
     std::fs::create_dir_all(session_dir.join("compaction_checkpoints")).unwrap();
 
     let ckpt_file = CompactionCheckpointFile {
+        kind: CompactionCheckpointKind::Builtin,
         checkpoint_id: ckpt_id.to_string(),
         prompt_index_at_compaction: 5,
         compacted_history: vec![
             ConversationItem::system("SYS"),
             ConversationItem::user("SUMMARY"),
         ],
-        schema_version: 1,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         original_user_info: Some("UI0".to_string()),
         reread_file_paths: vec![],

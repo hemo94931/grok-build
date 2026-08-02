@@ -137,9 +137,9 @@ impl SamplerConfig {
     /// Apply the same conversation defaults the sampler applies to normal
     /// requests (model/temperature/top_p/max_output_tokens).
     ///
-    /// The shell uses this to freeze resolved/legacy replay bodies before
-    /// dispatch: sampler retries of those dispatches reuse the frozen body
-    /// verbatim and must never re-apply defaults themselves.
+    /// Callers use this to freeze resolved replay bodies before dispatch:
+    /// sampler retries reuse the frozen body verbatim and must never re-apply
+    /// defaults themselves.
     pub fn apply_conversation_defaults_to(
         &self,
         request: &mut xai_grok_sampling_types::ConversationRequest,
