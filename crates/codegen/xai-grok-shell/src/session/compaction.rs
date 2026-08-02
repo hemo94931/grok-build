@@ -1861,6 +1861,14 @@ impl SessionActor {
             .clone()
             .unwrap_or_else(|| full_config.model.clone());
         let cache_routing = self.cache_routing_for_config(&full_config, &routing_model);
+        // Recompact builds its sealed compact body from `request`; apply the
+        // same persisted main-session key used by adjacent normal requests
+        // before resolving that body. The key stays outside compatibility
+        // identity, while the deterministic route fingerprint below guards
+        // deployment/model/principal drift.
+        request.prompt_cache_key = cache_routing
+            .as_ref()
+            .map(|routing| routing.prompt_cache_key());
         let trusted_envelope_v2 = self.current_trusted_envelope_v2(&request)?;
         let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
             "xai".to_string()
@@ -1891,10 +1899,16 @@ impl SessionActor {
                 ),
             ),
         };
+        // Bind the current live wrapper with its existing chain link. The
+        // successor identity correctly points at the current checkpoint, but
+        // using that future identity here would classify every healthy V2
+        // wrapper as MigrationRequired before recompact could start.
+        let binding_identity_v2 = crate::session::responses_server_compaction::
+            current_v2_identity_for_recompact_binding(&identity_v2, &wrapper);
         let bound = self
             .chat_state_handle
             .bind_request_identity_at_revision(
-                xai_grok_sampling_types::CheckpointIdentity::V2(identity_v2.clone()),
+                xai_grok_sampling_types::CheckpointIdentity::V2(binding_identity_v2),
                 request_history_revision,
             )
             .await

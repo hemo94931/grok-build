@@ -8,8 +8,9 @@ use xai_grok_sampling_types::{
 use xai_grok_shell::session::responses_server_compaction::{
     CapabilityKey, NegativeCapabilityCache, ServerCompactionFailureReason,
     build_checkpoint_identity, build_server_successor, build_server_successor_v2,
-    classify_compact_failure, resolve_compact_model_layers, resolve_server_compaction_layers,
-    server_checkpoint_token_seed, should_send_inline_compaction_headers,
+    classify_compact_failure, current_v2_identity_for_recompact_binding,
+    resolve_compact_model_layers, resolve_server_compaction_layers, server_checkpoint_token_seed,
+    should_send_inline_compaction_headers,
     v1_migration_cohort_percent, v2_server_compaction_writers_enabled, v2_writer_cohort_allows,
     v2_writer_cohort_percent,
 };
@@ -471,6 +472,19 @@ fn server_successor_v2_shape_and_digest_binding() {
     assert_eq!(successor[1..].len(), tail.len());
     assert_eq!(wrapper.server_output_item_count, output.len());
     assert!(wrapper.auto_continue);
+
+    // Recompact computes a successor identity whose prior link is the live
+    // checkpoint, but must bind the current wrapper with its existing prior.
+    let mut successor_identity = wrapper.identity.clone();
+    successor_identity.prior_checkpoint_id = Some(wrapper.checkpoint_id.clone());
+    let binding_identity =
+        current_v2_identity_for_recompact_binding(&successor_identity, wrapper);
+    assert_eq!(binding_identity, wrapper.identity);
+    assert_eq!(
+        successor_identity.prior_checkpoint_id.as_deref(),
+        Some(wrapper.checkpoint_id.as_str())
+    );
+
     // The wrapper digest binds the immutable fields the V3 sidecar and V2
     // staging re-verify at read time.
     assert_eq!(

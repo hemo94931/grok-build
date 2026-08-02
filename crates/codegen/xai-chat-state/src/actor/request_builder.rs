@@ -181,7 +181,10 @@ impl ChatStateActor {
             prompt_cache_options: None,
             prompt_cache_retention: None,
             service_tier: None,
-            parallel_tool_calls: None,
+            // The main agent loop supports parallel tool execution. Keep this
+            // explicit on every request so normal, compact, and post-compact
+            // V2 envelope fingerprints bind the same semantics.
+            parallel_tool_calls: Some(true),
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }

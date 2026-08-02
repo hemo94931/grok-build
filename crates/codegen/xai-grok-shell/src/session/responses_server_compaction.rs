@@ -333,6 +333,21 @@ pub fn server_checkpoint_token_seed(
     Ok((seed, source))
 }
 
+/// Derive the identity used to bind the *current* live wrapper while
+/// preparing a V2 recompact. `successor_identity` intentionally points its
+/// prior link at the current checkpoint, but that future chain link must not
+/// be used to validate the current wrapper: the current wrapper still points
+/// at its own predecessor. Every other freshly recomputed compatibility field
+/// is retained, so model/route/envelope drift continues to fail closed.
+pub fn current_v2_identity_for_recompact_binding(
+    successor_identity: &CheckpointIdentityV2,
+    live_wrapper: &ServerResponsesCheckpointV2,
+) -> CheckpointIdentityV2 {
+    let mut current = successor_identity.clone();
+    current.prior_checkpoint_id = live_wrapper.prior_checkpoint_id.clone();
+    current
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Stage-D4 V2 successor: `[ResponsesCompactionCheckpointV2(wrapper)] ++ tail`.
 ///

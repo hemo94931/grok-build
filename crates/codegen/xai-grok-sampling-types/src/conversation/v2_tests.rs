@@ -5,7 +5,6 @@ use super::v2::{
     ServerResponsesCheckpointV2, TrustedPromptEnvelopeV2,
 };
 use super::*;
-use crate::TraceContext;
 
 fn envelope_fixture() -> TrustedPromptEnvelopeV2 {
     TrustedPromptEnvelopeV2 {
@@ -354,6 +353,7 @@ fn recompact_uses_prior_output_prefix() {
         .collect(),
         model: Some("grok-test".into()),
         instructions: Some("base".into()),
+        prompt_cache_key: Some("grok:stable-main-session-key".into()),
         ..Default::default()
     };
     let resolved =
@@ -369,6 +369,14 @@ fn recompact_uses_prior_output_prefix() {
         "prior opaque output stays the input prefix"
     );
     assert_eq!(input.len(), 3);
+    assert_eq!(
+        resolved
+            .body()
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str()),
+        Some("grok:stable-main-session-key"),
+        "RecompactV2 must preserve the main-session cache key"
+    );
     let binding = resolved.checkpoint_binding().unwrap();
     assert_eq!(binding.checkpoint_id, "cp-v2");
     assert_eq!(resolved.request_identity_generation(), Some(2));

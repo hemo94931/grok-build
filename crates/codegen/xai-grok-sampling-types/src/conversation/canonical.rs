@@ -169,6 +169,17 @@ pub fn cache_route_fingerprint(
     format!("cache-route:{digest}")
 }
 
+const PROVIDER_PROMPT_CACHE_KEY_MAX_LEN: usize = 64;
+
+fn prefixed_prompt_cache_key(prefix: &str, digest: &str) -> String {
+    debug_assert!(prefix.len() <= PROVIDER_PROMPT_CACHE_KEY_MAX_LEN);
+    let digest = digest
+        .chars()
+        .take(PROVIDER_PROMPT_CACHE_KEY_MAX_LEN.saturating_sub(prefix.len()))
+        .collect::<String>();
+    format!("{prefix}{digest}")
+}
+
 /// Main-session prompt cache key: route fingerprint + persistent logical
 /// namespace. The `prompt_cache_key` field is capped by providers, so the
 /// key is a digest, never the raw components.
@@ -176,7 +187,7 @@ pub fn prompt_cache_key_for_namespace(cache_route_fingerprint: &str, namespace_i
     let joined = [cache_route_fingerprint, namespace_id].join(KEY_HASH_SEPARATOR);
     let digest = canonical_value_digest(&serde_json::Value::String(joined))
         .unwrap_or_else(|_| "unstable".to_string());
-    format!("grok:{digest}")
+    prefixed_prompt_cache_key("grok:", &digest)
 }
 
 /// Isolated auxiliary namespace: stable per (session namespace, aux kind)
@@ -186,7 +197,7 @@ pub fn aux_cache_namespace(namespace_id: &str, auxiliary_kind: &str) -> String {
     let joined = [namespace_id, auxiliary_kind].join(KEY_HASH_SEPARATOR);
     let digest = canonical_value_digest(&serde_json::Value::String(joined))
         .unwrap_or_else(|_| "unstable".to_string());
-    format!("grok-aux:{digest}")
+    prefixed_prompt_cache_key("grok-aux:", &digest)
 }
 
 /// Generate a fresh logical cache namespace id. Persisted once per
@@ -310,6 +321,8 @@ mod tests {
         assert_ne!(aux, aux_cache_namespace("ns-1", "side_question"));
         assert_ne!(aux, main_a, "aux keys never collide with the main key");
         assert!(main_a.starts_with("grok:"));
+        assert_eq!(main_a.len(), 64, "provider-visible keys must fit the cap");
         assert!(aux.starts_with("grok-aux:"));
+        assert_eq!(aux.len(), 64, "auxiliary keys must fit the same cap");
     }
 }
