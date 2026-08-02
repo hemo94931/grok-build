@@ -2168,7 +2168,7 @@ impl SessionActor {
                     .await
                 {
                     Ok(()) => {
-                        auth_retry_schedule.reset();
+                        auth_retry_schedule.reset_on_success();
                         continue;
                     }
                     Err(error) => {

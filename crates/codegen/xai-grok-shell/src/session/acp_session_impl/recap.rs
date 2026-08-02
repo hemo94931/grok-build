@@ -57,24 +57,24 @@ impl SessionActor {
         let parent_session_id = self.session_info.id.to_string();
         let asked_at = chrono::Utc::now();
 
-        let sampling_client = self
-            .prepare_chat_completion(false)
-            .await
-            .map_err(|e| SideQuestionError::PrepareClient(e.to_string()))?;
-
         // Full conversation snapshot including system prompt, tool calls, and results.
         // A live server checkpoint is expanded into its validated lossless
         // portable history first; if that fails the side question fails
-        // closed instead of leaking the wrapper into a typed request.
+        // closed before preparing a client or sending any HTTP request.
         // Strip reasoning/thinking blocks from assistant items so we don't send
         // `ContentBlock::Thinking` without a top-level `thinking` config. The
         // Anthropic Messages API rejects requests that include thinking blocks in
         // messages but omit the `thinking` parameter.
         let conversation = self
             .portable_history_for_request(&self.chat_state_handle.get_conversation().await)
-            .map_err(|error| format!("checkpoint portable history unavailable: {error}"))?;
+            .map_err(SideQuestionError::CheckpointHistory)?;
         let mut items: Vec<ConversationItem> =
             xai_chat_state::compaction_utils::strip_reasoning_blocks(conversation);
+
+        let sampling_client = self
+            .prepare_chat_completion(false)
+            .await
+            .map_err(|e| SideQuestionError::PrepareClient(e.to_string()))?;
 
         // /btw fires mid-turn, so the snapshot may end with an assistant
         // message whose tool_calls have no matching ToolResult yet. The

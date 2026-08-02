@@ -3468,6 +3468,11 @@ async fn remove_session_releases_workspace_binding_and_side_maps() {
         .session_registry
         .set_permission_receiver(&sid, permission_rx);
     agent.session_registry.mark_require_gateway(&sid);
+    assert_eq!(
+        agent.session_registry.counts().require_gateway_sessions,
+        1,
+        "gateway-required resident state must be registered before removal"
+    );
     agent.remove_session(&sid);
     assert!(
         toolset_weak.upgrade().is_none(),
@@ -3475,6 +3480,11 @@ async fn remove_session_releases_workspace_binding_and_side_maps() {
     );
     assert!(agent.session_registry.unavailable_model(&sid).is_none());
     assert_eq!(agent.session_registry.counts().resident_resources, 0);
+    assert_eq!(
+        agent.session_registry.counts().require_gateway_sessions,
+        0,
+        "gateway-required resident state must be reclaimed on removal"
+    );
     assert_eq!(
         agent.session_registry.counts().retained_resources,
         0,

@@ -1003,7 +1003,7 @@ impl SessionActor {
         .await;
         Ok(())
     }
-    async fn emit_compact_cancelled(&self, auto_trigger: bool) -> Result<(), acp::Error> {
+    async fn notify_compact_cancelled(&self, auto_trigger: bool) {
         if auto_trigger {
             use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
             self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
@@ -1011,6 +1011,10 @@ impl SessionActor {
             })
             .await;
         }
+    }
+
+    async fn emit_compact_cancelled(&self, auto_trigger: bool) -> Result<(), acp::Error> {
+        self.notify_compact_cancelled(auto_trigger).await;
         Err(crate::session::helpers::session_compact::CompactFailure::cancelled_error())
     }
     /// Suppress AUTO compaction after a deterministic failure. Scope depends on
@@ -1070,8 +1074,15 @@ impl SessionActor {
         }
     }
     pub(crate) fn is_compaction_cancelled(error: &acp::Error) -> bool {
-        error.data.as_ref().and_then(serde_json::Value::as_str)
-            == Some("responses_compaction_cancelled")
+        error
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| {
+                message == "responses_compaction_cancelled"
+                    || message
+                        .contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
+            })
     }
 
     /// Map a deterministic failure's error text to a fixed, content-free
@@ -2278,6 +2289,7 @@ impl SessionActor {
             xai_grok_telemetry::events::CompactionTrigger::Manual => "manual",
             xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
         };
+        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
         let context_window = sampling_config
             .as_ref()
@@ -2323,16 +2335,11 @@ impl SessionActor {
         }
         let max_retries = 3u32;
         let retry_delay_secs = 3u64;
-        let cancellation = super::tasks_cancel::current_turn_cancellation();
+        let cancellation = cancel.clone();
         let preparation = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
-                self.send_xai_notification(
-                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                        reason: "cancelled".into(),
-                    },
-                )
-                .await;
+                self.notify_compact_cancelled(auto_trigger).await;
                 compaction.complete(tokens_before);
                 return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
             }
@@ -2595,12 +2602,7 @@ impl SessionActor {
                             None,
                             None,
                         );
-                        self.send_xai_notification(
-                            crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                                reason: "cancelled".into(),
-                            },
-                        )
-                        .await;
+                        self.notify_compact_cancelled(auto_trigger).await;
                         return Err(
                             acp::Error::internal_error().data("responses_compaction_cancelled")
                         );
@@ -2828,12 +2830,7 @@ impl SessionActor {
                                     Some(token_seed_source_name),
                                     None,
                                 );
-                                self.send_xai_notification(
-                                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                                        reason: "cancelled".into(),
-                                    },
-                                )
-                                .await;
+                                self.notify_compact_cancelled(auto_trigger).await;
                                 compaction
                                     .complete(self.chat_state_handle.get_total_tokens().await);
                                 return Err(acp::Error::internal_error()
@@ -2916,12 +2913,7 @@ impl SessionActor {
                                     Some(token_seed_source_name),
                                     Some("precommit"),
                                 );
-                                self.send_xai_notification(
-                                    crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                                        reason: "cancelled".into(),
-                                    },
-                                )
-                                .await;
+                                self.notify_compact_cancelled(auto_trigger).await;
                                 compaction
                                     .complete(self.chat_state_handle.get_total_tokens().await);
                                 return Err(acp::Error::internal_error()
@@ -3153,12 +3145,7 @@ impl SessionActor {
             );
         }
         if cancellation.is_cancelled() {
-            self.send_xai_notification(
-                crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                    reason: "cancelled".into(),
-                },
-            )
-            .await;
+            self.notify_compact_cancelled(auto_trigger).await;
             compaction.complete(self.chat_state_handle.get_total_tokens().await);
             return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
         }
@@ -3267,7 +3254,6 @@ impl SessionActor {
         let started_at = chrono::Utc::now().to_rfc3339();
         let estimated_input_tokens =
             xai_chat_state::estimate_conversation_tokens(&simplified_messages);
-        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let wall_clock_budget_secs = self
             .agent
             .borrow()
@@ -3310,12 +3296,7 @@ impl SessionActor {
         // observed it, so do not launch a fresh paid request without a
         // cancellation token.
         if cancellation.is_cancelled() {
-            self.send_xai_notification(
-                crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                    reason: "cancelled".into(),
-                },
-            )
-            .await;
+            self.notify_compact_cancelled(auto_trigger).await;
             compaction.complete(self.chat_state_handle.get_total_tokens().await);
             return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
         }
@@ -3364,7 +3345,10 @@ impl SessionActor {
                             crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
                         )
                     {
-                        return self.emit_compact_cancelled(auto_trigger).await;
+                        self.notify_compact_cancelled(auto_trigger).await;
+                        return Err(
+                            crate::session::helpers::session_compact::CompactFailure::cancelled_error(),
+                        );
                     }
                     if context_overflow {
                         let next_stage = match input_stage {
@@ -3911,16 +3895,6 @@ impl SessionActor {
                 Err(error) => Err(error),
                 Ok(()) => unreachable!("emit_compact_cancelled always returns Err"),
             };
-        }
-        if cancellation.is_cancelled() {
-            self.send_xai_notification(
-                crate::extensions::notification::SessionUpdate::AutoCompactCancelled {
-                    reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
-                },
-            )
-            .await;
-            compaction.complete(self.chat_state_handle.get_total_tokens().await);
-            return Err(acp::Error::internal_error().data("responses_compaction_cancelled"));
         }
         let operation_id = uuid::Uuid::now_v7().to_string();
         if !self
@@ -5726,6 +5700,19 @@ mod inline_auto_compact_flow_tests {
             SuppressReason::Other
         );
     }
+
+    #[test]
+    fn compaction_cancel_classification_accepts_server_and_builtin_errors() {
+        let server = acp::Error::internal_error().data("responses_compaction_cancelled");
+        assert!(SessionActor::is_compaction_cancelled(&server));
+
+        let builtin = crate::session::helpers::session_compact::CompactFailure::cancelled_error();
+        assert!(SessionActor::is_compaction_cancelled(&builtin));
+
+        let unrelated = acp::Error::internal_error().data("compaction failed");
+        assert!(!SessionActor::is_compaction_cancelled(&unrelated));
+    }
+
     /// `SuppressReason::as_str` is the stable telemetry wire value — BQ/OTLP and
     /// dashboards key off these exact strings. Lock them so a rename can't break monitoring.
     #[test]
