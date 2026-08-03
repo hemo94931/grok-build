@@ -31,7 +31,7 @@ use crate::retry::{
 };
 use crate::stream::responses::stream_responses_tracked;
 use crate::stream::{stream_chat_completions, stream_messages};
-use crate::types::RequestId;
+use crate::types::{RequestId, SamplingDispatch};
 
 /// Default per-chunk idle timeout when neither config nor caller
 /// supplies one. Matches the shell's session-level default
@@ -80,7 +80,7 @@ enum AttemptOutcome {
 /// `active_requests` via [`tokio::task::JoinSet::join_next`].
 pub(crate) async fn run_request_task(
     request_id: RequestId,
-    request: ConversationRequest,
+    request: SamplingDispatch,
     config: SamplerConfig,
     retry_policy: RetryPolicy,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
@@ -324,7 +324,7 @@ async fn apply_retry_decision(
     retry_policy: &RetryPolicy,
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
-    request: &mut ConversationRequest,
+    request: &mut SamplingDispatch,
     client: &mut SamplingClient,
     config: &SamplerConfig,
     cancel_token: &CancellationToken,
@@ -340,9 +340,13 @@ async fn apply_retry_decision(
     // Connection-reset / broken-pipe on body upload often means nginx
     // rejected an oversized payload before responding 413. Strip
     // images proactively before any retry of those errors so we don't
-    // burn budget re-uploading the same large body.
-    if err.is_likely_body_rejected() {
-        let stripped = request.strip_images();
+    // burn budget re-uploading the same large body. Only `Normal`
+    // dispatches can be rewritten; resolved bodies are frozen by
+    // construction and are retried byte-identically.
+    if err.is_likely_body_rejected()
+        && let SamplingDispatch::Normal(normal) = request
+    {
+        let stripped = normal.strip_images();
         if stripped > 0 {
             tracing::warn!(
                 stripped,
@@ -373,7 +377,12 @@ async fn apply_retry_decision(
             }
         }
         RetryDecision::RetryWithImageStrip => {
-            let stripped = request.strip_images();
+            // Only typed normal requests can strip images; resolved bodies
+            // are frozen, so there is nothing to strip.
+            let stripped = match request {
+                SamplingDispatch::Normal(normal) => normal.strip_images(),
+                _ => 0,
+            };
             if stripped == 0 {
                 // Nothing left to strip; upgrade to fatal.
                 emit_failed(event_tx, request_id, err);
@@ -472,6 +481,50 @@ async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -
 #[allow(clippy::too_many_arguments)]
 async fn run_one_attempt(
     client: &SamplingClient,
+    dispatch: SamplingDispatch,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    cancel_token: &CancellationToken,
+    doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    output_observed: Arc<AtomicBool>,
+) -> AttemptOutcome {
+    match dispatch {
+        SamplingDispatch::Normal(request) => {
+            run_normal_attempt(
+                client,
+                *request,
+                request_id,
+                idle_timeout,
+                event_tx,
+                cancel_token,
+                doom_check,
+                output_observed,
+            )
+            .await
+        }
+        SamplingDispatch::ResolvedResponses(resolved) => {
+            let init = client.resolved_stream_responses((*resolved).clone()).await;
+            run_responses_attempt(
+                init,
+                request_id,
+                idle_timeout,
+                event_tx,
+                cancel_token,
+                doom_check,
+                output_observed,
+            )
+            .await
+        }
+    }
+}
+
+/// Typed `ConversationRequest` attempt: conversation defaults are applied
+/// inside the client and the body is rebuilt from the typed request, exactly
+/// like historical behavior. Resolved dispatches bypass this entirely.
+#[allow(clippy::too_many_arguments)]
+async fn run_normal_attempt(
+    client: &SamplingClient,
     request: ConversationRequest,
     request_id: RequestId,
     idle_timeout: Duration,
@@ -500,31 +553,13 @@ async fn run_one_attempt(
             .await
         }
         ApiBackend::Responses => {
-            let (raw, metadata, doom_loop) =
-                match client.conversation_stream_responses(request).await {
-                    Ok(parts) => parts,
-                    Err(e) => return AttemptOutcome::InitFailed { error: e },
-                };
-            if doom_check.is_none()
-                && let Some(collector) = &doom_loop
-            {
-                collector.disarm_abort();
-            }
-            let (teed, captured) = tee_errors(raw);
-            let l2 = stream_responses_tracked(
-                teed,
-                metadata,
-                request_id.clone(),
-                idle_timeout,
-                doom_loop,
-                Arc::clone(&output_observed),
-            );
-            drive_l2(
-                l2,
+            let init = client.conversation_stream_responses(request).await;
+            run_responses_attempt(
+                init,
                 request_id,
+                idle_timeout,
                 event_tx,
                 cancel_token,
-                captured,
                 doom_check,
                 output_observed,
             )
@@ -549,6 +584,56 @@ async fn run_one_attempt(
             .await
         }
     }
+}
+
+/// Shared Responses L2 pipeline for typed-normal and resolved attempts. The
+/// raw stream init is the only step that differs between them; the frozen
+/// body lives behind the client call.
+#[allow(clippy::too_many_arguments)]
+async fn run_responses_attempt(
+    init: Result<
+        (
+            BoxStream<'static, SamplingResult<xai_grok_sampling_types::rs::ResponseStreamEvent>>,
+            Option<xai_grok_sampling_types::ResponseModelMetadata>,
+            Option<crate::doom_loop::DoomLoopSignalCollector>,
+        ),
+        SamplingError,
+    >,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    cancel_token: &CancellationToken,
+    doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    output_observed: Arc<AtomicBool>,
+) -> AttemptOutcome {
+    let (raw, metadata, doom_loop) = match init {
+        Ok(parts) => parts,
+        Err(e) => return AttemptOutcome::InitFailed { error: e },
+    };
+    if doom_check.is_none()
+        && let Some(collector) = &doom_loop
+    {
+        collector.disarm_abort();
+    }
+    let (teed, captured) = tee_errors(raw);
+    let l2 = stream_responses_tracked(
+        teed,
+        metadata,
+        request_id.clone(),
+        idle_timeout,
+        doom_loop,
+        Arc::clone(&output_observed),
+    );
+    drive_l2(
+        l2,
+        request_id,
+        event_tx,
+        cancel_token,
+        captured,
+        doom_check,
+        output_observed,
+    )
+    .await
 }
 
 /// Captured-error cell shared between the tee adapter and the
@@ -977,7 +1062,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel();
         let mut completion_tx = Some(completion_tx);
         let mut retry_count = 0;
-        let mut request = ConversationRequest::default();
+        let mut request = SamplingDispatch::from(ConversationRequest::default());
         let config = SamplerConfig {
             base_url: "http://localhost".into(),
             model: "test-model".into(),

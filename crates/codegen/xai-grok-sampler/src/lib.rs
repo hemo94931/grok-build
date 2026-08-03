@@ -36,7 +36,14 @@ pub use actor::SamplerActor;
 pub use attribution::{
     Auth401AttributionCallback, SENT_BEARER_PREFIX_LEN, SamplingConsumer, SharedAttributionCallback,
 };
-pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
+pub use client::responses_compact::{
+    CompactAuthKind, CompactCorrelationHeaders, CompactCredential, CompactCredentialResolver,
+    RESPONSES_COMPACT_CONNECT_TIMEOUT, RESPONSES_COMPACT_MAX_BYTES,
+    RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES, RequestCredentialSnapshot, ResponsesCompactError,
+    ResponsesCompactFailure, ResponsesCompactRequest, ResponsesCompactResponse,
+    USER_CONTEXT_DELIMITER, compact_directive_hash, validate_responses_compact_response,
+};
+pub use client::{ApiBackend, EndpointTemplate, SamplingClient, user_agent_string_for};
 pub use config::{
     AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
     SharedBearerResolver, SharedHeaderInjector,
@@ -51,4 +58,4 @@ pub use retry::{
 };
 pub use sampling_log::AuthInfo;
 pub use stream::{collect_response, stream_chat_completions, stream_messages, stream_responses};
-pub use types::RequestId;
+pub use types::{RequestId, SamplingDispatch};

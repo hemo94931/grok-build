@@ -4,14 +4,35 @@
 //! can switch between them by configuration. Each backend owns its own wire
 //! conversion in a sibling module.
 
+mod canonical;
 mod chat_completions;
 mod messages;
+mod resolved;
 mod responses;
+mod responses_compaction;
 
+pub use canonical::{
+    aux_cache_namespace, cache_route_fingerprint, model_cache_family,
+    new_logical_cache_namespace_id, normalize_base_url_for_routing, prompt_cache_key_for_namespace,
+};
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
+pub(crate) use resolved::SealedResponsesBody;
+pub use resolved::{
+    CheckpointReplayMaterial, INSTRUCTIONS_MEMORY_SEPARATOR, ReplayMaterialError,
+    ReplayVerificationError, ResolvedCheckpointBinding, ResolvedCompactError,
+    ResolvedCompactRequest, ResolvedRequestError, ResolvedResponsesRequest, ResponsesCorrelation,
+    USER_CONTEXT_DELIMITER, ValidatedResponsesReplay, compose_instructions, replay_input_tail,
+};
 pub use responses::{
-    extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,
+    FinalResponsesRequest, ResponsesRequestBuildError, canonical_json_bytes,
+    canonical_value_digest, extra_tool_entries, patch_reasoning_text_types, portable_history_bytes,
+    portable_history_digest, response_to_conversation_items,
+};
+pub use responses_compaction::{
+    CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ServerResponsesCheckpoint,
+    TrustedPromptEnvelope, base_instructions_sha256, canonical_envelope_fingerprint,
+    wire_prompt_sha256, wrapper_digest_for_branch,
 };
 
 use std::sync::Arc;
@@ -97,12 +118,74 @@ pub enum ConversationItem {
     /// wrapping `rs::WebSearchToolCall` etc.) so no field is dropped on the
     /// way through.
     Reasoning(rs::ReasoningItem),
+    /// Local-only wrapper for a canonical Responses compaction window.
+    ///
+    /// This item is never converted through a typed provider item. Replay and
+    /// recompaction flatten its opaque `output` only through validated resolved
+    /// constructors; all other backends reject it via
+    /// [`ConversationRequest::validate_for_backend`].
+    ResponsesCompactionCheckpoint(Box<ServerResponsesCheckpoint>),
+}
+
+/// Persisted mode metadata needed to repair a checkpoint marker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesCompactionMode {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Source used to seed token accounting after installing a checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenSeedSource {
+    UsageOutputTokens,
+    EstimatedCanonicalOutput,
 }
 
 /// System message content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemItem {
     pub content: Arc<str>,
+    /// Where this system item originated. Digest-stable: the
+    /// `LegacyUnclassified` default is never serialized, so historical items
+    /// deserialize and re-serialize to byte-identical canonical JSON.
+    #[serde(default, skip_serializing_if = "SystemSource::is_default")]
+    pub source: SystemSource,
+}
+
+/// Provenance of a [`SystemItem`]. Only `BaseInstructions` and
+/// `MemoryContext` may be lifted into the top-level Responses
+/// `instructions` field; every other source stays in `input` at its
+/// original position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemSource {
+    /// The agent's rendered base system prompt.
+    BaseInstructions,
+    /// The authored `<memory-context>` block, persisted as its own item.
+    MemoryContext,
+    /// A runtime-injected system notice (not part of the stable prompt
+    /// envelope).
+    Runtime,
+    /// Historical item written before provenance tracking. The default;
+    /// never serialized, so old records keep their exact canonical bytes.
+    /// Plain `ConversationItem::system(...)` produces this source and must
+    /// never gain `BaseInstructions` privileges implicitly.
+    #[default]
+    LegacyUnclassified,
+}
+
+impl SystemSource {
+    fn is_default(value: &Self) -> bool {
+        matches!(value, Self::LegacyUnclassified)
+    }
+
+    /// Whether items with this source may enter the top-level Responses
+    /// `instructions` field.
+    pub fn lifts_into_instructions(self) -> bool {
+        matches!(self, Self::BaseInstructions | Self::MemoryContext)
+    }
 }
 
 /// Reason why a `UserItem` was synthesized by the runtime rather than typed
@@ -590,6 +673,8 @@ impl From<ToolDefinition> for ToolSpec {
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
+    /// Actor history revision captured with `items`; local-only and never serialized.
+    pub history_revision: Option<u64>,
     /// The conversation items (messages)
     pub items: Vec<ConversationItem>,
     /// Available tools (client-side, sent as Function definitions)
@@ -622,11 +707,67 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
+    /// Normal Responses instructions. Kept separate from compact-only guidance.
+    pub instructions: Option<String>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Provider prompt-cache options, passed through without inventing defaults.
+    pub prompt_cache_options: Option<serde_json::Value>,
+    /// Provider prompt-cache retention, passed through without inventing defaults.
+    pub prompt_cache_retention: Option<String>,
+    /// Provider service tier, passed through without inventing defaults.
+    pub service_tier: Option<String>,
+    /// Explicit parallel-tool-calls flag for compact/recompact request
+    /// kinds (never `unwrap_or(true)`; it must come from the typed request).
+    /// Absent on
+    /// ordinary requests so their wire shape is unchanged; compact-bound
+    /// requests set it explicitly and the compact constructors require it.
+    pub parallel_tool_calls: Option<bool>,
+}
+
+/// A provider-visible request contains an invalid local checkpoint layout.
+#[derive(Debug, thiserror::Error)]
+pub enum ConversationValidationError {
+    #[error("a responses compaction checkpoint must be the unique item at index 0")]
+    InvalidCheckpointLayout,
+    #[error("a responses compaction checkpoint must contain non-empty output")]
+    EmptyCheckpointOutput,
+    #[error("responses compaction checkpoints cannot be sent to {0:?}")]
+    CheckpointBackendMismatch(crate::ApiBackend),
 }
 
 impl ConversationRequest {
+    /// Validate local-only conversation items before any backend converter runs.
+    pub fn validate_for_backend(
+        &self,
+        backend: &crate::ApiBackend,
+    ) -> Result<(), ConversationValidationError> {
+        let checkpoints: Vec<(usize, &ServerResponsesCheckpoint)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.as_responses_checkpoint()
+                    .map(|checkpoint| (index, checkpoint))
+            })
+            .collect();
+        let Some((index, checkpoint)) = checkpoints.first().copied() else {
+            return Ok(());
+        };
+        if checkpoints.len() != 1 || index != 0 {
+            return Err(ConversationValidationError::InvalidCheckpointLayout);
+        }
+        if checkpoint.output.is_empty() {
+            return Err(ConversationValidationError::EmptyCheckpointOutput);
+        }
+        if !matches!(backend, crate::ApiBackend::Responses) {
+            return Err(ConversationValidationError::CheckpointBackendMismatch(
+                backend.clone(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Strip all inline image data from the conversation to reduce payload size.
     ///
     /// Replaces `ContentPart::Image` entries with a text placeholder so the
@@ -935,11 +1076,47 @@ impl ConversationResponse {
 // ============================================================================
 
 impl ConversationItem {
-    /// Create a system message
+    /// Create a system message with the default [`SystemSource::LegacyUnclassified`]
+    /// provenance — it must never gain `BaseInstructions` privileges
+    /// implicitly.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
             content: Arc::<str>::from(content.into()),
+            source: SystemSource::LegacyUnclassified,
         })
+    }
+
+    /// Create the agent's rendered base system prompt item.
+    pub fn base_instructions(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::BaseInstructions,
+        })
+    }
+
+    /// Create the authored `<memory-context>` item, persisted separately
+    /// from the base instructions.
+    pub fn memory_context(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::MemoryContext,
+        })
+    }
+
+    /// Create a runtime-injected system notice.
+    pub fn runtime_system(content: impl Into<String>) -> Self {
+        Self::System(SystemItem {
+            content: Arc::<str>::from(content.into()),
+            source: SystemSource::Runtime,
+        })
+    }
+
+    /// Provenance of a system item, `None` for non-system items.
+    pub fn system_source(&self) -> Option<SystemSource> {
+        match self {
+            Self::System(system) => Some(system.source),
+            _ => None,
+        }
     }
 
     /// Create a user message with text content.
@@ -1268,6 +1445,10 @@ impl ConversationItem {
             Self::BackendToolCall(_) => Role::Assistant,
             // Reasoning is semantically part of the assistant's turn.
             Self::Reasoning(_) => Role::Assistant,
+            // Local checkpoint metadata has no provider role. Treat it as a
+            // system boundary only for legacy read-only callers; converters
+            // reject or flatten it explicitly.
+            Self::ResponsesCompactionCheckpoint(_) => Role::System,
         }
     }
 
@@ -1297,6 +1478,7 @@ impl ConversationItem {
             Self::ToolResult(t) => t.content.as_ref().to_owned(),
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
+            Self::ResponsesCompactionCheckpoint(_) => String::new(),
         }
     }
 }
@@ -1984,6 +2166,8 @@ pub fn transform_conversation_cwd(
                     }
                 }
             }
+            // The canonical provider prefix is opaque and must never be rewritten.
+            ConversationItem::ResponsesCompactionCheckpoint(_) => {}
         }
     }
 }
@@ -2360,6 +2544,14 @@ mod responses_tests;
 #[cfg(test)]
 #[path = "conversation/messages_tests.rs"]
 mod messages_tests;
+
+#[cfg(test)]
+#[path = "conversation/system_source_tests.rs"]
+mod system_source_tests;
+
+#[cfg(test)]
+#[path = "conversation/responses_compaction_tests.rs"]
+mod responses_compaction_tests;
 
 #[cfg(test)]
 mod tests {

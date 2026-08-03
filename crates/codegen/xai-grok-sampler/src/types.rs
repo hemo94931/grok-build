@@ -1,8 +1,30 @@
 //! Core sampler types.
 
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use xai_grok_sampling_types::{ConversationRequest, ResolvedResponsesRequest};
+
+/// What the sampler actor should send for one request.
+///
+/// `Normal` is a typed conversation request; conversation defaults are
+/// applied per attempt and the body is rebuilt inside the client, exactly
+/// like historical behavior. `ResolvedResponses` carries an opaque,
+/// already-validated frozen body: every retry reuses the identical body,
+/// correlation headers and continuity metadata (plan-once, body-frozen
+/// retry), and the attempt never re-reads caller state.
+#[derive(Clone, Debug)]
+pub enum SamplingDispatch {
+    Normal(Box<ConversationRequest>),
+    ResolvedResponses(Arc<ResolvedResponsesRequest>),
+}
+
+impl From<ConversationRequest> for SamplingDispatch {
+    fn from(request: ConversationRequest) -> Self {
+        Self::Normal(Box::new(request))
+    }
+}
 
 /// Unique identifier for a sampling request.
 ///

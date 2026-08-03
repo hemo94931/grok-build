@@ -130,7 +130,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             conversation: None,
             include: None,
             input,
-            instructions: None,
+            instructions: req.instructions.clone(),
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,
             metadata: None,
@@ -193,6 +193,175 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResponsesRequestBuildError {
+    #[error(transparent)]
+    Validation(#[from] ConversationValidationError),
+    #[error("failed to serialize responses request: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("serialized responses request has no input array")]
+    MissingInput,
+    #[error("checkpoint-bearing requests must go through validated replay construction")]
+    CheckpointRequiresReplayPath,
+}
+
+/// Canonical bytes of a portable history: the digest payload shared by the
+/// checkpoint sidecar writer, recovery scanner and replay verifier.
+pub fn portable_history_bytes(history: &[ConversationItem]) -> Result<Vec<u8>, serde_json::Error> {
+    let value = serde_json::to_value(history)?;
+    canonical_json_bytes(&value)
+}
+
+/// Hex SHA-256 over [`portable_history_bytes`].
+pub fn portable_history_digest(history: &[ConversationItem]) -> Result<String, serde_json::Error> {
+    use sha2::Digest as _;
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(portable_history_bytes(history)?)
+    ))
+}
+
+/// Hex SHA-256 over the canonical bytes of an arbitrary JSON value. Shared
+/// by the canonical-envelope and cache-routing fingerprints.
+pub fn canonical_value_digest(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    use sha2::Digest as _;
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(canonical_json_bytes(value)?)
+    ))
+}
+
+/// Immutable Responses request immediately before transport defaults/headers.
+/// Checkpoint-bearing bodies are only created internally by validated resolved
+/// replay/recompaction constructors.
+#[derive(Debug, Clone)]
+pub struct FinalResponsesRequest {
+    body: serde_json::Value,
+}
+
+impl FinalResponsesRequest {
+    pub fn body(&self) -> &serde_json::Value {
+        &self.body
+    }
+
+    pub fn into_body(self) -> serde_json::Value {
+        self.body
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self.body)
+    }
+}
+
+impl TryFrom<&ConversationRequest> for FinalResponsesRequest {
+    type Error = ResponsesRequestBuildError;
+
+    /// Typed conversion for ordinary requests. Checkpoint wrappers are
+    /// rejected: replay bodies are built exclusively through validated
+    /// replay constructors, never by silently flattening a wrapper. This
+    /// guarantees the public typed conversion is checkpoint-free and keeps
+    /// the transport gate sealed.
+    fn try_from(request: &ConversationRequest) -> Result<Self, Self::Error> {
+        if request
+            .items
+            .iter()
+            .any(|item| item.is_responses_checkpoint())
+        {
+            return Err(ResponsesRequestBuildError::CheckpointRequiresReplayPath);
+        }
+        Self::from_typed_items(request)
+    }
+}
+
+impl FinalResponsesRequest {
+    fn from_typed_items(request: &ConversationRequest) -> Result<Self, ResponsesRequestBuildError> {
+        request.validate_for_backend(&crate::ApiBackend::Responses)?;
+        let create_response = rs::CreateResponse::from(request);
+        let mut body = serde_json::to_value(create_response)?;
+        patch_reasoning_text_types(&mut body);
+
+        if let Some(value) = request.prompt_cache_options.clone() {
+            body["prompt_cache_options"] = value;
+        }
+        if let Some(value) = request.prompt_cache_retention.clone() {
+            body["prompt_cache_retention"] = serde_json::Value::String(value);
+        }
+        if let Some(value) = request.service_tier.clone() {
+            body["service_tier"] = serde_json::Value::String(value);
+        }
+        if let Some(value) = request.parallel_tool_calls {
+            body["parallel_tool_calls"] = serde_json::Value::Bool(value);
+        }
+
+        let extra_tools = extra_tool_entries(&request.hosted_tools);
+        if !extra_tools.is_empty() {
+            let tools = body
+                .as_object_mut()
+                .expect("CreateResponse serializes as an object")
+                .entry("tools")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            let tools = tools
+                .as_array_mut()
+                .expect("CreateResponse tools serializes as an array");
+            tools.extend(extra_tools);
+        }
+
+        Ok(Self { body })
+    }
+
+    /// Replay/recompact body from explicit parts: `output prefix ++
+    /// serialized typed items`. `typed_items` must already be checkpoint-free
+    /// and have instruction-lifted systems removed; `request` supplies the
+    /// envelope context (model, tools, cache fields, pre-composed
+    /// instructions).
+    ///
+    /// `pub(crate)`: only validated constructors in
+    /// [`crate::conversation::resolved`] may call this.
+    pub(crate) fn from_replay_parts(
+        request: &ConversationRequest,
+        output: Vec<serde_json::Value>,
+        typed_items: &[ConversationItem],
+    ) -> Result<Self, ResponsesRequestBuildError> {
+        let mut tail_request = request.clone();
+        tail_request.items = typed_items.to_vec();
+        let mut this = Self::from_typed_items(&tail_request)?;
+        if !output.is_empty() {
+            let tail = this
+                .body
+                .get_mut("input")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(ResponsesRequestBuildError::MissingInput)?;
+            let mut input = output;
+            input.append(tail);
+            this.body["input"] = serde_json::Value::Array(input);
+        }
+        Ok(this)
+    }
+}
+
+/// Serialize JSON with recursively sorted object keys.
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn sort(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut entries: Vec<_> = object.iter().collect();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                let mut sorted = serde_json::Map::new();
+                for (key, value) in entries {
+                    sorted.insert(key.clone(), sort(value));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(sort).collect())
+            }
+            scalar => scalar.clone(),
+        }
+    }
+
+    serde_json::to_vec(&sort(value))
 }
 
 fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {
@@ -284,6 +453,9 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
             }]
+        }
+        ConversationItem::ResponsesCompactionCheckpoint(_) => {
+            unreachable!("checkpoint input must be flattened by a validated resolved request")
         }
     }
 }
