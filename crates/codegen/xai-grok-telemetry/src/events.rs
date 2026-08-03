@@ -126,7 +126,7 @@ impl PermissionOutcome {
     }
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     Manual,
@@ -452,6 +452,104 @@ pub struct CompactionTriggered {
     pub model_id: String,
     pub user_context_provided: bool,
     pub compaction_id: String,
+}
+
+/// Metadata-only outcome of one per-session compaction-artifact GC pass
+/// (stage D4, best-effort detached after a committed server compaction).
+/// Records orphan classification and deletion sizes — never prompt content
+/// or provider output.
+#[derive(Serialize)]
+pub struct CompactionGcOutcome {
+    /// Total checkpoint bytes on disk (sidecars + segment staging).
+    pub session_checkpoint_bytes: u64,
+    /// Bytes referenced by nothing after the full scan (pre-CAS orphans).
+    pub orphan_bytes: u64,
+    /// Bytes actually deleted this pass.
+    pub deleted_bytes: u64,
+    /// Orphan bytes retained because their mtime is inside the grace period.
+    pub retained_orphan_bytes: u64,
+    pub files_scanned: u32,
+    pub files_deleted: u32,
+    /// Whether the session was over its checkpoint quota at GC time.
+    pub quota_exceeded: bool,
+    pub dry_run: bool,
+}
+
+/// Per-session checkpoint quota pressure (stage D4): exceeding the quota
+/// stops NEW remote checkpoints and falls back to builtin compaction —
+/// active recovery data is never deleted to make room. Rate-limited to once
+/// per session per hour.
+#[derive(Serialize)]
+pub struct CompactionQuotaPressure {
+    pub session_checkpoint_bytes: u64,
+    pub quota_bytes: u64,
+}
+
+/// Observed prompt-cache behavior per request kind (stage D3). Provider
+/// cache capability (`compact_seeds_prompt_cache`) has no reliable static
+/// signal, so it is recorded observationally per normalized
+/// deployment + model family: the first post-compact request is the
+/// hard-gate signal only once the capability is configured or stably
+/// observed.
+#[derive(Serialize)]
+pub struct PromptCacheObservation {
+    pub provider_id: String,
+    /// Normalized deployment fingerprint (base URL + principal, no path).
+    pub deployment_fingerprint: String,
+    pub model_cache_family: String,
+    /// `normal` | `post_compact_first` | `post_compact_subsequent` | `compact` | `aux`
+    pub request_kind: &'static str,
+    pub prompt_cache_key_present: bool,
+    pub cached_tokens: u64,
+    pub prompt_tokens: u64,
+}
+
+/// Metadata-only strategy attempt for standalone Responses compaction.
+/// Deliberately excludes endpoint/auth identity digests and all wire content.
+#[derive(Serialize)]
+pub struct CompactionStrategyAttempt {
+    pub compaction_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_compaction_id: Option<String>,
+    pub strategy: &'static str,
+    pub eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<&'static str>,
+    pub attempts: u8,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub output_items: u64,
+    pub capability_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_latency_ms: Option<u64>,
+    pub prefire_consumed: bool,
+    pub prefire_wasted: bool,
+    pub prefire_stale: bool,
+    pub history_revision: u64,
+    pub request_identity_generation: u64,
+    pub cas_outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_schema: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_outcome: Option<&'static str>,
+    pub marker_repaired: bool,
+    pub tokens_before: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_seed_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_failure_step: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1732,6 +1830,10 @@ telemetry_event!(
 );
 telemetry_event!(AutoCompactFired, "auto_compact_fired");
 telemetry_event!(CompactionTriggered, "compaction_triggered");
+telemetry_event!(CompactionStrategyAttempt, "compaction_strategy_attempt");
+telemetry_event!(CompactionGcOutcome, "compaction_gc_outcome");
+telemetry_event!(CompactionQuotaPressure, "compaction_quota_pressure");
+telemetry_event!(PromptCacheObservation, "prompt_cache_observation");
 telemetry_event!(
     CompactionCompleted,
     "compaction_completed",

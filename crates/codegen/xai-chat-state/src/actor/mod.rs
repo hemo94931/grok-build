@@ -118,10 +118,10 @@ impl ChatStateActor {
         match cmd {
             // ═══ Mutations ═══
             ChatStateCommand::PushUserMessage { item } => {
-                self.push_user_message(item);
+                self.push_user_message(item).await;
             }
             ChatStateCommand::PushUserMessageAndAck { item, reply } => {
-                self.push_user_message(item);
+                self.push_user_message(item).await;
                 let _ = reply.send(());
             }
             ChatStateCommand::AppendWorkingDirectorySwitchAndAck {
@@ -161,13 +161,14 @@ impl ChatStateActor {
                 let _ = reply.send(result);
             }
             ChatStateCommand::PushUserMessageWithRepairReason { item, reason } => {
-                self.push_user_message_with_repair_reason(item, reason);
+                self.push_user_message_with_repair_reason(item, reason)
+                    .await;
             }
             ChatStateCommand::PushAssistantResponse { item } => {
-                self.push_message(item);
+                self.push_message(item).await;
             }
             ChatStateCommand::PushToolResult { item } => {
-                self.push_message(item);
+                self.push_message(item).await;
             }
             ChatStateCommand::RecordTokenUsage { total_tokens } => {
                 self.record_token_usage(total_tokens);
@@ -204,7 +205,23 @@ impl ChatStateActor {
                 self.increment_prompt_index();
             }
             ChatStateCommand::UpdateSamplingConfig { config } => {
+                self.state.invalidate_request_identity();
                 self.state.sampling_config = config;
+            }
+            ChatStateCommand::InvalidateRequestIdentity => {
+                self.state.invalidate_request_identity();
+            }
+            ChatStateCommand::BindRequestIdentity { identity, reply } => {
+                let _ = reply.send(self.bind_request_identity(identity));
+            }
+            ChatStateCommand::BindRequestIdentityAtRevision {
+                identity,
+                expected_history_revision,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.bind_request_identity_at_revision(identity, expected_history_revision),
+                );
             }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
@@ -220,6 +237,10 @@ impl ChatStateActor {
                 is_compaction,
             } => {
                 self.replace_conversation(items, is_compaction);
+            }
+            ChatStateCommand::CommitCompaction { commit, reply } => {
+                let result = self.commit_compaction(commit).await;
+                let _ = reply.send(result);
             }
             ChatStateCommand::RepairHistory {
                 dry_run,
@@ -254,6 +275,7 @@ impl ChatStateActor {
                 self.persistence.flush();
             }
             ChatStateCommand::UpdateCredentials { credentials } => {
+                self.state.invalidate_request_identity();
                 self.state.credentials = credentials;
             }
             ChatStateCommand::RestoreSnapshot(snapshot) => {
@@ -273,7 +295,7 @@ impl ChatStateActor {
                 self.state.seal_harness_trace_turn();
             }
             ChatStateCommand::RepairDanglingAfterHarnessHalt { class } => {
-                self.repair_dangling_after_harness_halt(class);
+                self.repair_dangling_after_harness_halt(class).await;
             }
 
             // ═══ Queries ═══
@@ -291,16 +313,21 @@ impl ChatStateActor {
                 req_id,
                 reply,
             } => {
-                self.ensure_conversation_integrity();
-                let request = self.build_conversation_request(
-                    tool_definitions,
-                    memory_reminder,
-                    persist_memory_reminder,
-                    trace,
-                    conv_id,
-                    req_id,
-                );
+                self.ensure_conversation_integrity().await;
+                let request = self
+                    .build_conversation_request(
+                        tool_definitions,
+                        memory_reminder,
+                        persist_memory_reminder,
+                        trace,
+                        conv_id,
+                        req_id,
+                    )
+                    .await;
                 let _ = reply.send(request);
+            }
+            ChatStateCommand::GetCompactionSnapshot { reply } => {
+                let _ = reply.send(self.compaction_snapshot());
             }
             ChatStateCommand::GetConversation { reply } => {
                 tracing::debug!(

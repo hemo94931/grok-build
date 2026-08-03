@@ -34,7 +34,7 @@ impl ChatStateActor {
     /// already-repaired state, so there is no need to run
     /// `dedup_duplicate_tool_results` / `repair_dangling_tool_calls` on the
     /// clone — those would be O(n) no-ops.
-    pub(super) fn build_conversation_request(
+    pub(super) async fn build_conversation_request(
         &mut self,
         tool_definitions: Vec<ToolSpec>,
         memory_reminder: Option<String>,
@@ -51,15 +51,44 @@ impl ChatStateActor {
         if let Some(reminder) = memory_reminder.as_deref()
             && persist_memory_reminder
         {
-            // A live in-place inject can prepend a `System` item, shifting indices
-            // under an active capture; snapshot + rebase like the other mutators.
-            self.snapshot_turn_slice();
-            let injected = inject_memory_reminder(&mut self.state.conversation, reminder);
-            if injected {
-                self.persistence.replace_history(&self.state.conversation);
+            if self
+                .state
+                .conversation
+                .first()
+                .is_some_and(|item| item.is_responses_checkpoint())
+            {
+                // A new reminder is a strict typed-tail append. An existing
+                // dedicated reminder is durably replaced before memory changes.
+                let _ = self.persist_checkpoint_memory_reminder(reminder).await;
+                // Never send a reminder that failed its persistence boundary.
                 memory_reminder = None;
+            } else {
+                // A live in-place inject can prepend a `System` item, shifting indices
+                // under an active capture; snapshot + rebase like the other mutators.
+                self.snapshot_turn_slice();
+                let before_tokens =
+                    super::state::estimate_conversation_tokens(&self.state.conversation);
+                let injected = inject_memory_reminder(&mut self.state.conversation, reminder);
+                if injected {
+                    let after_tokens =
+                        super::state::estimate_conversation_tokens(&self.state.conversation);
+                    if after_tokens >= before_tokens {
+                        self.state.estimated_tokens_since_model = self
+                            .state
+                            .estimated_tokens_since_model
+                            .saturating_add(after_tokens - before_tokens);
+                    } else {
+                        self.state.estimated_tokens_since_model = self
+                            .state
+                            .estimated_tokens_since_model
+                            .saturating_sub(before_tokens - after_tokens);
+                    }
+                    self.persistence.replace_history(&self.state.conversation);
+                    self.state.bump_history_revision();
+                    memory_reminder = None;
+                }
+                self.rebase_turn_capture_offset();
             }
-            self.rebase_turn_capture_offset();
         }
         // Measure the exact serialized body and evict only once it approaches
         // the 50 MB ceiling. `conversation_body_bytes` is wire-accurate yet
@@ -93,7 +122,14 @@ impl ChatStateActor {
 
             // Step 2: Prune old tool results if context is > 50% utilized
             if needs_prune {
-                prune_conversation(&mut items, &self.pruning_config);
+                if items
+                    .first()
+                    .is_some_and(|item| item.is_responses_checkpoint())
+                {
+                    prune_conversation(&mut items[1..], &self.pruning_config);
+                } else {
+                    prune_conversation(&mut items, &self.pruning_config);
+                }
             }
 
             // Step 3: Inject memory reminder into the system message
@@ -126,6 +162,7 @@ impl ChatStateActor {
 
         // Step 4: Assemble request
         ConversationRequest {
+            history_revision: Some(self.state.history_revision),
             items,
             tools: tool_definitions,
             hosted_tools: vec![],
@@ -142,10 +179,95 @@ impl ChatStateActor {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace,
+            instructions: None,
             prompt_cache_key: None,
+            prompt_cache_options: None,
+            prompt_cache_retention: None,
+            service_tier: None,
+            // The main agent loop supports parallel tool execution. Keep this
+            // explicit on every request so normal, compact, and post-compact
+            // envelope fingerprints bind the same semantics.
+            parallel_tool_calls: Some(true),
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }
+    }
+
+    async fn persist_checkpoint_memory_reminder(&mut self, reminder: &str) -> bool {
+        // An existing memory item is either the dedicated `MemoryContext`
+        // item or a legacy unmarked System still carrying the block; both
+        // are replaced durably through the atomic history boundary.
+        let existing = self.state.conversation.iter().skip(1).any(|item| {
+            matches!(
+                item,
+                ConversationItem::System(system)
+                    if system.source == SystemSource::MemoryContext
+                        || system.content.contains(MEMORY_CONTEXT_OPEN_TAG)
+            )
+        });
+        if !existing {
+            // A new reminder is a strict typed-tail append of a *marked*
+            // item — never an unmarked trailing System.
+            let item = ConversationItem::memory_context(reminder);
+            if self.persist_append(&item).await {
+                self.apply_pushed_message(item);
+                return true;
+            }
+            return false;
+        }
+
+        let mut replacement = self.state.conversation.clone();
+        if !inject_memory_reminder(&mut replacement, reminder) {
+            return true;
+        }
+        let checkpoint_id = match replacement.first() {
+            Some(item) => match item.as_responses_checkpoint() {
+                Some(checkpoint) => checkpoint.checkpoint_id.clone(),
+                None => return false,
+            },
+            None => return false,
+        };
+        let operation_id = format!(
+            "memory-{checkpoint_id}-{}",
+            self.state.history_revision.saturating_add(1)
+        );
+        let persisted = self
+            .persistence
+            .replace_history_and_ack(&operation_id, &replacement)
+            .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(crate::persistence::HistoryReplaceError::Committed(error))) => {
+                tracing::warn!(%error, "checkpoint memory reminder committed but acknowledgement was lost");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "checkpoint memory reminder was not committed");
+                return false;
+            }
+            Err(_) => {
+                tracing::error!("checkpoint memory reminder acknowledgement was dropped");
+                return false;
+            }
+        }
+
+        self.snapshot_turn_slice();
+        let before_tokens = super::state::estimate_conversation_tokens(&self.state.conversation);
+        let after_tokens = super::state::estimate_conversation_tokens(&replacement);
+        if after_tokens >= before_tokens {
+            self.state.estimated_tokens_since_model = self
+                .state
+                .estimated_tokens_since_model
+                .saturating_add(after_tokens - before_tokens);
+        } else {
+            self.state.estimated_tokens_since_model = self
+                .state
+                .estimated_tokens_since_model
+                .saturating_sub(before_tokens - after_tokens);
+        }
+        self.state.conversation = replacement;
+        self.state.bump_history_revision();
+        self.rebase_turn_capture_offset();
+        true
     }
 }
 
@@ -455,13 +577,23 @@ pub(crate) fn compact_images_to_byte_budget(
 // Memory reminder injection
 // ============================================================================
 
-use crate::types::MEMORY_CONTEXT_OPEN_TAG;
+use crate::types::{MEMORY_CONTEXT_CLOSE_TAG, MEMORY_CONTEXT_OPEN_TAG};
+use xai_grok_sampling_types::SystemSource;
 
-/// Upsert a memory reminder into the conversation's system message.
+/// Upsert a memory reminder as a dedicated [`SystemSource::MemoryContext`]
+/// item.
 ///
-/// If the first item is a `System` message, any previously injected memory
-/// reminder section is replaced in-place; otherwise the reminder is appended.
-/// If no system message exists, a new `System` item is prepended.
+/// Rules (stage D1c):
+///
+/// * base instructions and memory context are separate items;
+/// * a memory update only replaces the `MemoryContext` item — the base
+///   System string is never concatenated with `<memory-context>` again;
+/// * a legacy combined leading System (memory block embedded in the base
+///   string) is split only when the block is unambiguous (exactly one
+///   well-formed open/close pair); malformed combinations are left for
+///   migration;
+/// * with a live checkpoint the memory item lives in the typed tail and is
+///   always marked — never an unmarked trailing System.
 ///
 /// Returns `true` when the conversation was changed.
 pub(super) fn inject_memory_reminder(items: &mut Vec<ConversationItem>, reminder: &str) -> bool {
@@ -470,40 +602,87 @@ pub(super) fn inject_memory_reminder(items: &mut Vec<ConversationItem>, reminder
         return false;
     }
 
-    if let Some(ConversationItem::System(sys)) = items.first_mut() {
-        upsert_memory_reminder_text(&mut sys.content, reminder)
-    } else {
-        items.insert(0, ConversationItem::system(reminder));
-        true
+    // 1. Replace the dedicated memory item.
+    if let Some(system) = items.iter_mut().find_map(|item| match item {
+        ConversationItem::System(system) if system.source == SystemSource::MemoryContext => {
+            Some(system)
+        }
+        _ => None,
+    }) {
+        if system.content.as_ref() == reminder {
+            return false;
+        }
+        system.content = std::sync::Arc::<str>::from(reminder);
+        return true;
     }
+
+    // 2. Legacy combined form: an unmarked System still carrying the memory
+    //    block inside its string. Split only when unambiguous.
+    let legacy_index = items.iter().position(|item| match item {
+        ConversationItem::System(system)
+            if system.source != SystemSource::MemoryContext
+                && system.content.contains(MEMORY_CONTEXT_OPEN_TAG) =>
+        {
+            true
+        }
+        _ => false,
+    });
+    if let Some(index) = legacy_index {
+        let split = match &items[index] {
+            ConversationItem::System(system) => split_legacy_memory_block(&system.content),
+            _ => None,
+        };
+        if let Some((base_part, _old_memory)) = split {
+            if base_part.is_empty() {
+                // The item was pure memory: convert it in place.
+                if let Some(ConversationItem::System(system)) = items.get_mut(index) {
+                    system.content = std::sync::Arc::<str>::from(reminder);
+                    system.source = SystemSource::MemoryContext;
+                }
+            } else {
+                if let Some(ConversationItem::System(system)) = items.get_mut(index) {
+                    system.content = std::sync::Arc::<str>::from(base_part);
+                }
+                items.insert(index + 1, ConversationItem::memory_context(reminder));
+            }
+            return true;
+        }
+        // Ambiguous legacy block: leave the item untouched (migration
+        // normalizes it) and fall through to inserting a dedicated item.
+    }
+
+    // 3. Insert after the base head: after the checkpoint wrapper or the
+    //    leading base System, else at the front.
+    let insert_at = match items.first() {
+        Some(item) if item.is_responses_checkpoint() => 1,
+        Some(ConversationItem::System(system)) if system.source != SystemSource::MemoryContext => 1,
+        _ => 0,
+    };
+    items.insert(insert_at, ConversationItem::memory_context(reminder));
+    true
 }
 
-fn upsert_memory_reminder_text(system_prompt: &mut std::sync::Arc<str>, reminder: &str) -> bool {
-    let existing_start = system_prompt
-        .find(MEMORY_CONTEXT_OPEN_TAG)
-        .map(|idx| system_prompt[..idx].trim_end_matches('\n').len());
-
-    let updated: String = if let Some(prefix_len) = existing_start {
-        let prefix = system_prompt[..prefix_len].trim_end_matches('\n');
-        if prefix.is_empty() {
-            reminder.to_string()
-        } else {
-            format!("{prefix}\n\n{reminder}")
-        }
-    } else if system_prompt.trim_end() == reminder {
-        system_prompt.as_ref().to_owned()
-    } else if system_prompt.is_empty() {
-        reminder.to_string()
-    } else {
-        format!("{}\n\n{reminder}", system_prompt.trim_end_matches('\n'))
-    };
-
-    if system_prompt.as_ref() == updated.as_str() {
-        false
-    } else {
-        *system_prompt = std::sync::Arc::<str>::from(updated);
-        true
+/// Split a legacy combined system prompt into `(base, memory_block)` when
+/// the memory block is unambiguous: exactly one well-formed open/close pair
+/// and no further memory tags anywhere else.
+fn split_legacy_memory_block(content: &str) -> Option<(String, String)> {
+    let open = content.find(MEMORY_CONTEXT_OPEN_TAG)?;
+    let close_rel = content[open..].find(MEMORY_CONTEXT_CLOSE_TAG)?;
+    let close = open + close_rel;
+    let after = close + MEMORY_CONTEXT_CLOSE_TAG.len();
+    if content[after..].contains(MEMORY_CONTEXT_OPEN_TAG) {
+        return None;
     }
+    let before = content[..open].trim();
+    let rest = content[after..].trim();
+    let base = match (before.is_empty(), rest.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => rest.to_string(),
+        (false, false) => format!("{before}\n\n{rest}"),
+    };
+    let memory = content[open..after].trim().to_string();
+    Some((base, memory))
 }
 
 // ============================================================================
@@ -549,17 +728,97 @@ mod tests {
     }
 
     #[test]
-    fn inject_memory_into_existing_system() {
+    fn inject_memory_creates_dedicated_item_after_base() {
         let mut items = vec![
-            ConversationItem::system("You are helpful."),
+            ConversationItem::base_instructions("You are helpful."),
             ConversationItem::user("hi"),
         ];
         inject_memory_reminder(&mut items, "Remember: user likes rust");
-        if let ConversationItem::System(ref sys) = items[0] {
-            assert!(sys.content.contains("Remember: user likes rust"));
-            assert!(sys.content.starts_with("You are helpful."));
-        }
-        assert_eq!(items.len(), 2); // no new item added
+        // Base instructions are never concatenated with the memory block.
+        assert_eq!(
+            items[0].text_content(),
+            "You are helpful.",
+            "base instructions stay untouched"
+        );
+        assert_eq!(items.len(), 3);
+        let ConversationItem::System(memory) = &items[1] else {
+            panic!("expected memory system item");
+        };
+        assert_eq!(memory.source, SystemSource::MemoryContext);
+        assert_eq!(memory.content.as_ref(), "Remember: user likes rust");
+    }
+
+    #[test]
+    fn inject_memory_replaces_only_the_memory_item() {
+        let mut items = vec![
+            ConversationItem::base_instructions("You are helpful."),
+            ConversationItem::memory_context("old memory"),
+            ConversationItem::user("hi"),
+        ];
+        assert!(inject_memory_reminder(&mut items, "new memory"));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text_content(), "You are helpful.");
+        assert_eq!(items[1].text_content(), "new memory");
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
+        // Idempotent: same reminder is a no-op.
+        assert!(!inject_memory_reminder(&mut items, "new memory"));
+    }
+
+    #[test]
+    fn inject_memory_splits_unambiguous_legacy_combined_system() {
+        let mut items = vec![
+            ConversationItem::system("You are helpful.\n\n<memory-context>old</memory-context>"),
+            ConversationItem::user("hi"),
+        ];
+        assert!(inject_memory_reminder(
+            &mut items,
+            "<memory-context>new</memory-context>"
+        ));
+        assert_eq!(items.len(), 3);
+        // Legacy item shrinks to the base part; the memory block moves into
+        // its own marked item right after it.
+        assert_eq!(items[0].text_content(), "You are helpful.");
+        assert_eq!(
+            items[0].system_source(),
+            Some(SystemSource::LegacyUnclassified)
+        );
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
+        assert_eq!(
+            items[1].text_content(),
+            "<memory-context>new</memory-context>"
+        );
+    }
+
+    #[test]
+    fn inject_memory_converts_pure_legacy_memory_item_in_place() {
+        let mut items = vec![
+            ConversationItem::system("<memory-context>old</memory-context>"),
+            ConversationItem::user("hi"),
+        ];
+        assert!(inject_memory_reminder(
+            &mut items,
+            "<memory-context>new</memory-context>"
+        ));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].system_source(), Some(SystemSource::MemoryContext));
+        assert_eq!(
+            items[0].text_content(),
+            "<memory-context>new</memory-context>"
+        );
+    }
+
+    #[test]
+    fn inject_memory_leaves_ambiguous_legacy_block_for_migration() {
+        let mut items = vec![ConversationItem::system(
+            "base <memory-context>one</memory-context> mid <memory-context>two</memory-context>",
+        )];
+        assert!(inject_memory_reminder(
+            &mut items,
+            "<memory-context>new</memory-context>"
+        ));
+        // The ambiguous legacy item is untouched; a dedicated item is added.
+        assert!(items[0].text_content().contains("one"));
+        assert_eq!(items[1].system_source(), Some(SystemSource::MemoryContext));
     }
 
     #[test]
@@ -568,6 +827,7 @@ mod tests {
         inject_memory_reminder(&mut items, "Remember: user likes rust");
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], ConversationItem::System(_)));
+        assert_eq!(items[0].system_source(), Some(SystemSource::MemoryContext));
     }
 
     // -- image size-gated compaction tests --

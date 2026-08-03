@@ -18,6 +18,8 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
+pub mod responses_compaction;
+mod responses_recovery;
 pub mod search;
 pub mod search_fts;
 mod search_recovery;
@@ -143,6 +145,9 @@ pub(crate) mod chat_rebuild {
         use std::io::{Seek, Write};
 
         let updates_path = dir.join(UPDATES_FILE);
+        if let Some(count) = super::responses_recovery::try_rebuild_responses(dir, &updates_path)? {
+            return Ok(count);
+        }
         let Some(iter) = UpdatesIterator::open(&updates_path)? else {
             return Ok(0);
         };
@@ -467,6 +472,31 @@ pub(crate) mod chat_rebuild {
         }
         String::new()
     }
+}
+
+/// Parse a `chat_history.jsonl` file into current persisted entries without
+/// recovering them. GC uses this to inspect every authoritative reference.
+pub(crate) fn read_persisted_chat_entries(
+    path: &Path,
+) -> io::Result<Vec<responses_compaction::PersistedChatEntry>> {
+    let bytes = std::fs::read(path)?;
+    let mut entries = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        entries.push(
+            serde_json::from_slice::<responses_compaction::PersistedChatEntry>(line).map_err(
+                |error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid chat history line {}: {error}", index + 1),
+                    )
+                },
+            )?,
+        );
+    }
+    Ok(entries)
 }
 
 /// Iterator that streams session updates from a JSONL file without loading all into memory.
@@ -958,6 +988,12 @@ pub enum AppendCwdSwitchError {
     },
 }
 
+#[derive(Debug)]
+pub enum AppendTailError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
 impl AppendUpdateError {
     pub fn into_io_error(self) -> io::Error {
         match self {
@@ -1027,6 +1063,19 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Append a chat message and increment counter.
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()>;
+
+    /// Durably append one typed checkpoint tail item. The boolean is false
+    /// when the exact operation was already present.
+    async fn append_chat_tail_durable(
+        &self,
+        _info: &Info,
+        _tail: &responses_compaction::PersistedTail,
+    ) -> Result<bool, AppendTailError> {
+        Err(AppendTailError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "typed checkpoint tail append is unsupported",
+        )))
+    }
 
     /// Append one working-directory switch generation exactly once.
     async fn append_cwd_switch_commit_aware(
@@ -1164,6 +1213,18 @@ pub trait StorageAdapter: Send + Sync {
         messages: &[ConversationItem],
     ) -> io::Result<()>;
 
+    /// Durable, commit-aware replacement used by the chat-state CAS boundary.
+    async fn replace_chat_history_durable(
+        &self,
+        info: &Info,
+        _operation_id: &str,
+        messages: &[ConversationItem],
+    ) -> Result<(), xai_chat_state::HistoryReplaceError> {
+        self.replace_chat_history(info, messages)
+            .await
+            .map_err(xai_chat_state::HistoryReplaceError::NotCommitted)
+    }
+
     /// Copy session data from source to target, transforming session IDs
     /// The `options` parameter allows setting parent session tracking and model overrides.
     async fn copy_session_data(
@@ -1218,6 +1279,47 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()>;
+
+    /// Durably write the Responses checkpoint sidecar.
+    async fn write_responses_compaction_checkpoint(
+        &self,
+        _info: &Info,
+        _relative_path: &str,
+        _checkpoint: &responses_compaction::CompactionCheckpointFile,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses checkpoint persistence is unsupported",
+        ))
+    }
+
+    /// Durably stage a checkpoint-keyed segment with operation, branch, and
+    /// wrapper-digest binding without allocating a formal index.
+    async fn stage_responses_compaction_segment(
+        &self,
+        _info: &Info,
+        _staging: &responses_compaction::ResponsesCompactionSegmentStaging,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment staging is unsupported",
+        ))
+    }
+
+    /// Publish a committed staged segment idempotently after validating its
+    /// operation id and wrapper digest.
+    async fn publish_responses_compaction_segment(
+        &self,
+        _info: &Info,
+        _checkpoint_id: &str,
+        _operation_id: &str,
+        _wrapper_digest: &str,
+    ) -> io::Result<responses_compaction::PublishedCompactionSegment> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Responses compaction segment publication is unsupported",
+        ))
+    }
 
     /// Write a compaction request artifact to `compaction_requests/{request_id}.json`.
     /// Captures the exact request sent to the compaction model and the response
@@ -2373,6 +2475,7 @@ pub(crate) fn parse_prompt_extract_event(line: &str) -> PromptExtractEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -3993,5 +4096,274 @@ mod tests {
             }
             SessionUpdate::Acp(_) => panic!("expected Xai variant"),
         }
+    }
+
+    // ── chat_rebuild marker-kind dispatch ─────────────────────────────────────
+
+    use crate::extensions::notification::{
+        CompactionCheckpointInfo, CompactionCheckpointKind, SessionNotification as XaiNotification,
+        SessionUpdate as XaiSessionUpdateType,
+    };
+    use xai_grok_sampling_types::{
+        CheckpointIdentity, CheckpointReplayMaterial, ServerResponsesCheckpoint, TokenSeedSource,
+        TrustedPromptEnvelope,
+    };
+
+    fn rebuild_identity_fixture() -> CheckpointIdentity {
+        CheckpointIdentity {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: None,
+            cache_route_fingerprint: None,
+        }
+    }
+
+    fn rebuild_envelope_fixture() -> TrustedPromptEnvelope {
+        TrustedPromptEnvelope {
+            base_instructions_sha256: "base-hash".into(),
+            memory_revision: Some(3),
+            envelope_fingerprint: "envelope-fp".into(),
+            wire_prompt_sha256: "wire-hash".into(),
+        }
+    }
+
+    fn rebuild_portable_fixture() -> Vec<ConversationItem> {
+        vec![
+            ConversationItem::base_instructions("base prompt"),
+            ConversationItem::user("first"),
+            ConversationItem::assistant("first answer"),
+        ]
+    }
+
+    fn rebuild_wrapper_fixture(
+        checkpoint_id: &str,
+        branch_id: &str,
+        portable: &[ConversationItem],
+    ) -> ServerResponsesCheckpoint {
+        let digest = xai_grok_sampling_types::portable_history_digest(portable).unwrap();
+        let bytes = responses_compaction::portable_history_bytes(portable).unwrap();
+        ServerResponsesCheckpoint {
+            checkpoint_id: checkpoint_id.into(),
+            operation_id: "operation-current".into(),
+            prompt_index: 2,
+            created_at: chrono::Utc::now(),
+            auto_continue: false,
+            mode: xai_grok_sampling_types::ResponsesCompactionMode {
+                name: "default".into(),
+                detail: None,
+            },
+            branch_id: branch_id.into(),
+            identity: rebuild_identity_fixture(),
+            output: vec![serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })],
+            portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
+            portable_history_sha256: digest,
+            portable_history_bytes: bytes.len() as u64,
+            checkpoint_token_seed: 42,
+            token_seed_source: TokenSeedSource::UsageOutputTokens,
+            server_output_item_count: 1,
+            prior_checkpoint_id: None,
+            memory_revision: Some(3),
+        }
+    }
+
+    fn rebuild_write_sidecar(
+        dir: &Path,
+        wrapper: &ServerResponsesCheckpoint,
+        portable: &[ConversationItem],
+    ) {
+        let material =
+            CheckpointReplayMaterial::try_new(wrapper, rebuild_envelope_fixture(), portable)
+                .unwrap();
+        let file = responses_compaction::CompactionCheckpointFile::new(
+            wrapper.clone(),
+            material,
+            portable.to_vec(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        responses_compaction::write_checkpoint_durable(dir, &wrapper.portable_history_path, &file)
+            .unwrap();
+    }
+
+    fn rebuild_marker_update(info: CompactionCheckpointInfo) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("rebuild-test"),
+            update: XaiSessionUpdateType::CompactionCheckpoint(Box::new(info)),
+            meta: None,
+        }))
+    }
+
+    fn rebuild_current_marker(wrapper: &ServerResponsesCheckpoint) -> SessionUpdate {
+        rebuild_marker_update(responses_compaction::marker_for_wrapper(wrapper))
+    }
+
+    fn rebuild_unknown_marker() -> SessionUpdate {
+        rebuild_marker_update(CompactionCheckpointInfo {
+            kind: CompactionCheckpointKind::Unknown,
+            checkpoint_id: "checkpoint-unsupported".into(),
+            prompt_index_at_compaction: 1,
+            checkpoint_file: "compaction_checkpoints/checkpoint-unsupported.json".into(),
+            auto_continue: None,
+            operation_id: None,
+            branch_id: None,
+            portable_history_sha256: None,
+            responses_mode: None,
+            responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+        })
+    }
+
+    fn rebuild_tail_prepared(
+        wrapper: &ServerResponsesCheckpoint,
+        sequence: u64,
+        prompt_index: usize,
+        item: ConversationItem,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("rebuild-test"),
+            update: XaiSessionUpdateType::ConversationAppendPrepared(Box::new(
+                responses_compaction::ConversationAppendPrepared {
+                    operation_id: format!("{}-tail-{sequence}", wrapper.operation_id),
+                    checkpoint_id: wrapper.checkpoint_id.clone(),
+                    branch_id: wrapper.branch_id.clone(),
+                    sequence,
+                    prompt_index,
+                    item,
+                },
+            )),
+            meta: None,
+        }))
+    }
+
+    fn rebuild_tail_committed(
+        wrapper: &ServerResponsesCheckpoint,
+        sequence: u64,
+        prompt_index: usize,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("rebuild-test"),
+            update: XaiSessionUpdateType::ConversationAppendCommitted(
+                responses_compaction::ConversationAppendCommitted {
+                    operation_id: format!("{}-tail-{sequence}", wrapper.operation_id),
+                    checkpoint_id: wrapper.checkpoint_id.clone(),
+                    branch_id: wrapper.branch_id.clone(),
+                    sequence,
+                    prompt_index,
+                },
+            ),
+            meta: None,
+        }))
+    }
+
+    fn rebuild_write_updates(dir: &Path, updates: &[SessionUpdate]) {
+        let mut content = Vec::new();
+        for update in updates {
+            let envelope = SessionUpdateEnvelope::from_update(update).unwrap();
+            let mut line = serde_json::to_vec(&envelope).unwrap();
+            line.push(b'\n');
+            content.extend(line);
+        }
+        std::fs::write(dir.join(UPDATES_FILE), content).unwrap();
+    }
+
+    fn rebuild_write_wrapper_head(dir: &Path, wrapper: &ServerResponsesCheckpoint) {
+        let item = ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone()));
+        let mut line = serde_json::to_vec(&item).unwrap();
+        line.push(b'\n');
+        std::fs::write(dir.join(CHAT_HISTORY_FILE), line).unwrap();
+    }
+
+    #[test]
+    fn rebuild_responses_marker_uses_typed_path() {
+        let tmp = TempDir::new().unwrap();
+        let portable = rebuild_portable_fixture();
+        let wrapper = rebuild_wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        rebuild_write_sidecar(tmp.path(), &wrapper, &portable);
+        rebuild_write_wrapper_head(tmp.path(), &wrapper);
+        let updates = vec![
+            rebuild_current_marker(&wrapper),
+            rebuild_tail_prepared(&wrapper, 1, 2, ConversationItem::user("P2")),
+            rebuild_tail_committed(&wrapper, 1, 2),
+            rebuild_tail_prepared(&wrapper, 2, 2, ConversationItem::assistant("A2")),
+            rebuild_tail_committed(&wrapper, 2, 2),
+        ];
+        rebuild_write_updates(tmp.path(), &updates);
+
+        let count = chat_rebuild::rebuild_chat_history(tmp.path()).unwrap();
+        assert_eq!(count, 3, "wrapper + 2 typed tail items");
+        let entries = read_persisted_chat_entries(&tmp.path().join(CHAT_HISTORY_FILE)).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(
+            entries[0],
+            responses_compaction::PersistedChatEntry::Item(
+                ConversationItem::ResponsesCompactionCheckpoint(_)
+            )
+        ));
+        assert!(matches!(
+            entries[1],
+            responses_compaction::PersistedChatEntry::Tail(_)
+        ));
+        let recovered = responses_compaction::recover_history_entries(entries).unwrap();
+        assert_eq!(recovered.conversation.len(), 3);
+    }
+
+    #[test]
+    fn rebuild_unknown_kind_does_not_overwrite_chat_history() {
+        let tmp = TempDir::new().unwrap();
+        let chat_path = tmp.path().join(CHAT_HISTORY_FILE);
+        let original = serde_json::to_vec(&ConversationItem::user("precious history")).unwrap();
+        std::fs::write(&chat_path, &original).unwrap();
+        rebuild_write_updates(tmp.path(), &[rebuild_unknown_marker()]);
+
+        let error = chat_rebuild::rebuild_chat_history(tmp.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&chat_path).unwrap(), original);
+    }
+
+    #[test]
+    fn rebuild_responses_marker_without_live_wrapper_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let portable = rebuild_portable_fixture();
+        let wrapper = rebuild_wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        rebuild_write_sidecar(tmp.path(), &wrapper, &portable);
+        rebuild_write_updates(tmp.path(), &[rebuild_current_marker(&wrapper)]);
+
+        let error = chat_rebuild::rebuild_chat_history(tmp.path()).unwrap_err();
+        assert!(!tmp.path().join(CHAT_HISTORY_FILE).exists());
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn rebuild_without_responses_marker_uses_builtin_reducer() {
+        let tmp = TempDir::new().unwrap();
+        let updates = vec![
+            SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+                acp::SessionId::new("rebuild-test"),
+                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("hello".to_string())),
+                )),
+            ))),
+            SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+                acp::SessionId::new("rebuild-test"),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("hi back".to_string())),
+                )),
+            ))),
+        ];
+        rebuild_write_updates(tmp.path(), &updates);
+        let count = chat_rebuild::rebuild_chat_history(tmp.path()).unwrap();
+        assert_eq!(count, 2);
     }
 }

@@ -346,10 +346,15 @@ impl SessionActor {
                 let replay_updates = updates_path.clone();
                 let replay_session_dir = session_dir.clone();
                 let replay_target = target_index;
+                // The live Responses wrapper at index zero binds the current
+                // marker to its sidecar. Builtin checkpoint replay remains
+                // marker-driven.
+                let replay_live_checkpoint = conversation.first().cloned();
                 let replay_result = tokio::task::spawn_blocking(move || {
                     crate::session::helpers::replay::replay_to_prompt(
                         &replay_updates,
                         &replay_session_dir,
+                        replay_live_checkpoint.as_ref(),
                         replay_target,
                     )
                 })
@@ -431,13 +436,55 @@ impl SessionActor {
                 conversation.truncate(keep_count);
             }
 
-            // Write the truncated conversation back via the actor
-            // (handles both state update + persistence).
-            self.chat_state_handle.replace_conversation(conversation);
+            // A rewind from a server checkpoint starts a fresh tail branch;
+            // abandoned future records can no longer match active replay.
+            if let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
+                conversation.first_mut()
+            {
+                wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+            }
+
+            // Cross the acknowledged dual-generation CAS boundary rather than
+            // issuing a resident fire-and-forget history rewrite.
+            let Some(expected) = self.chat_state_handle.get_compaction_snapshot().await else {
+                anyhow::bail!("chat-state actor unavailable during rewind");
+            };
+            let committed_total_tokens =
+                xai_chat_state::estimate_conversation_tokens(&conversation);
+            let rewind_operation_id = format!("rewind-{}", uuid::Uuid::now_v7());
+            let commit = self
+                .chat_state_handle
+                .commit_compaction(xai_chat_state::CommitCompaction {
+                    operation_id: rewind_operation_id.clone(),
+                    expected_history_revision: expected.history_revision,
+                    expected_request_identity_generation: expected.request_identity_generation,
+                    replacement: conversation.clone(),
+                    committed_total_tokens,
+                })
+                .await;
+            match commit {
+                Some(xai_chat_state::CommitCompactionResult::Committed { .. }) => {}
+                Some(xai_chat_state::CommitCompactionResult::Superseded { .. }) => {
+                    anyhow::bail!("rewind was superseded by a concurrent history change");
+                }
+                Some(xai_chat_state::CommitCompactionResult::PersistenceFailed(error)) => {
+                    return Ok(RewindResponse {
+                        success: false,
+                        target_prompt_index: target_index,
+                        mode,
+                        reverted_files: vec![],
+                        clean_files: vec![],
+                        conflicts: vec![],
+                        prompt_text: None,
+                        error: Some(format!("Failed to persist rewind: {error}")),
+                    });
+                }
+                None => anyhow::bail!("chat-state actor unavailable during rewind commit"),
+            }
+
             // Use a snapshot to set the correct prompt_index and truncated prompt_texts.
             // The actor's TruncateToPromptIndex doesn't apply here because the
-            // conversation was already truncated locally. Instead, snapshot + restore
-            // with the corrected fields.
+            // conversation was already replaced by the acknowledged commit.
             if let Some(mut snap) = self.chat_state_handle.snapshot().await {
                 snap.prompt_index = target_index;
                 snap.prompt_texts.truncate(target_index);
@@ -447,7 +494,18 @@ impl SessionActor {
                 let new_marker =
                     replay_compaction_marker.unwrap_or(snap.last_compaction_prompt_index);
                 snap.last_compaction_prompt_index = new_marker;
+                // Stage-D3 hint: rewind changes checkpoint presence, so the
+                // post-compact classification must follow the restored
+                // conversation (checkpoint present ⇒ subsequent, else none).
+                let checkpoint_active = snap
+                    .conversation
+                    .first()
+                    .is_some_and(|item| item.is_responses_checkpoint());
                 self.chat_state_handle.restore_snapshot(snap);
+                self.post_compact_usage_state.store(
+                    u8::from(checkpoint_active),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             // Conversation shrank — clear budget-based (size/schema) and stale
@@ -466,12 +524,36 @@ impl SessionActor {
                 );
             }
 
-            // Append a RewindMarker to updates.jsonl so the replay pipeline can
-            // handle timeline branching (updates.jsonl is append-only).
-            self.persist_xai_update_only(XaiSessionUpdate::RewindMarker {
-                target_prompt_index: target_index,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            });
+            // Commit the branch cut first. If a server checkpoint survives,
+            // follow it with a fresh branch-bound marker and a complete
+            // Prepared/Committed baseline for every retained typed-tail item.
+            // A second rewind in this same process can then rebuild the new
+            // branch without waiting for resume repair.
+            match self
+                .persist_xai_update_durable(XaiSessionUpdate::RewindMarker {
+                    target_prompt_index: target_index,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+            {
+                Ok(()) => {}
+                Err(crate::session::persistence::DurableAppendError::Committed(error)) => {
+                    tracing::warn!(%error, "rewind marker committed with bookkeeping error");
+                }
+                Err(error) => {
+                    anyhow::bail!(
+                        "rewind committed but its branch marker was not durably acknowledged: {error}"
+                    );
+                }
+            }
+            if let Some(wrapper) = conversation
+                .first()
+                .and_then(ConversationItem::as_responses_checkpoint)
+            {
+                self.persist_server_marker(wrapper, &conversation, &rewind_operation_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
         }
 
         // Update the file state tracker to reflect the rewind.

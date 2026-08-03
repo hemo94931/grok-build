@@ -180,7 +180,8 @@ pub(crate) async fn create_test_actor_ex(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
-    let cwd = xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    let cwd = xai_grok_paths::AbsPathBuf::new(std::env::temp_dir())
+        .expect("the platform temp directory must be absolute");
     let fs = Arc::new(xai_grok_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));
@@ -277,6 +278,7 @@ pub(crate) async fn create_test_actor_ex(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
@@ -400,6 +402,7 @@ pub(crate) async fn create_test_actor_ex(
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -528,6 +531,7 @@ pub(crate) fn running_task_stub(prompt_id: &str) -> AgentTask {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         })
         .abort_handle(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
     }
 }
 #[cfg(test)]

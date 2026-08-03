@@ -639,6 +639,43 @@ impl SessionActor {
             tracing::warn!("Failed to send xAI update to persistence channel");
         }
     }
+
+    /// Append one internal xAI update after older buffered writes and wait for
+    /// its durable commit classification. Compaction markers and their typed
+    /// tail journal use this path; a generic flush acknowledgement cannot
+    /// prove that the preceding update itself was written.
+    pub(crate) async fn persist_xai_update_durable(
+        &self,
+        update: XaiSessionUpdate,
+    ) -> Result<(), crate::session::persistence::DurableAppendError> {
+        let notification = XaiSessionNotification {
+            session_id: self.session_info.id.clone(),
+            update,
+            meta: Some(self.build_notification_meta()),
+        };
+        let update = crate::session::storage::SessionUpdate::Xai(Box::new(notification));
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
+            .persistence_tx
+            .send(PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to })
+            .map_err(|_| {
+                crate::session::persistence::DurableAppendError::NotCommitted(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "session persistence stopped before durable update dispatch",
+                ))
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                crate::session::persistence::DurableAppendError::AcknowledgementLost(
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "session persistence stopped before durable update acknowledgement",
+                    ),
+                )
+            })?
+            .map_err(crate::session::persistence::DurableAppendError::from)
+    }
     /// Dispatch a `Notification` hook for a user-attention event.
     pub(super) async fn dispatch_notification_hook(
         &self,

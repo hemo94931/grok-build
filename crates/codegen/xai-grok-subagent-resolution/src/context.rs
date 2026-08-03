@@ -47,9 +47,13 @@ const FORK_NOISE_TAGS: &[&str] = &[
 /// pre-existing context (typically 2 for `[System, BackgroundContext]`).
 pub fn normalize_forked_context(items: Vec<ConversationItem>) -> (Vec<ConversationItem>, usize) {
     // Extract system prompt (position 0) - kept as placeholder for spawn_session_actor.
+    // A leading MemoryContext item is NOT the base head and is never copied
+    // into the child: memory belongs to the parent session.
     let system = items
         .first()
-        .filter(|i| matches!(i, ConversationItem::System(_)))
+        .filter(|i| {
+            matches!(i, ConversationItem::System(sys) if sys.source != xai_grok_sampling_types::SystemSource::MemoryContext)
+        })
         .cloned()
         .unwrap_or_else(|| ConversationItem::system(String::new()));
 
@@ -329,10 +333,9 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
         ConversationItem::BackendToolCall(b) => {
             let _ = writeln!(out, "[Backend Tool]: {}", b.text_summary());
         }
-        // Reasoning siblings don't enter the fork-background rendering —
-        // they're rendered (when needed) inline with the surrounding
-        // assistant turn elsewhere.
-        ConversationItem::Reasoning(_) => {}
+        // Reasoning siblings and local opaque checkpoints never enter fork
+        // background text. Checkpoint migration uses its portable sidecar.
+        ConversationItem::Reasoning(_) | ConversationItem::ResponsesCompactionCheckpoint(_) => {}
     }
 }
 

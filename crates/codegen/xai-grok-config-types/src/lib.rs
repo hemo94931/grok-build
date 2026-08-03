@@ -738,6 +738,12 @@ pub struct RemoteSettings {
     /// `GROK_TWO_PASS_COMPACTION` / default (off).
     #[serde(default)]
     pub two_pass_compaction_enabled: Option<bool>,
+    /// Standalone Responses server compaction rollout gate.
+    #[serde(default)]
+    pub server_compaction_enabled: Option<bool>,
+    /// Optional model used by builtin compaction and server fallback prefire.
+    #[serde(default)]
+    pub compact_model: Option<String>,
     /// Dynamic tip list from remote settings. When present with non-empty entries,
     /// one tip is shown at startup (rotated daily by UTC day).
     /// `None` or `[]` = no tips shown.

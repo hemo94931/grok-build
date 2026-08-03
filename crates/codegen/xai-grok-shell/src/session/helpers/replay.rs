@@ -5,14 +5,124 @@
 //! messages. This module reconstructs the conversation by streaming
 //! `updates.jsonl` and handling `CompactionCheckpoint` / `RewindMarker` entries.
 
-use std::io;
+use std::io::{self, BufRead};
 use std::path::Path;
 
 use crate::extensions::notification::{
-    CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
+    CompactionCheckpointFile, CompactionCheckpointInfo, CompactionCheckpointKind,
+    SessionUpdate as XaiSessionUpdate,
 };
 use crate::sampling::ConversationItem;
-use crate::session::storage::{SessionUpdate, UpdatesIterator};
+use crate::session::storage::{SessionUpdate, SessionUpdateEnvelope, UpdatesIterator};
+
+mod responses;
+
+/// Semantic marker dispatch shared by replay and chat rebuild.
+///
+/// Builtin and Responses checkpoints have distinct current representations.
+/// Missing or unknown kinds fail closed rather than falling through to the
+/// builtin reducer.
+#[derive(Debug)]
+pub(crate) enum CompactionMarkerDispatch {
+    None,
+    Builtin {
+        marker_index: usize,
+        marker: Box<CompactionCheckpointInfo>,
+    },
+    Responses {
+        marker_index: usize,
+        marker: Box<CompactionCheckpointInfo>,
+    },
+}
+
+/// Reject removed or unknown marker representations anywhere in the retained
+/// update stream. Checking the whole stream prevents an older invalid marker
+/// from being hidden by a newer valid compaction boundary.
+pub(crate) fn validate_compaction_marker_kinds(updates: &[SessionUpdate]) -> io::Result<()> {
+    for update in updates {
+        let SessionUpdate::Xai(notification) = update else {
+            continue;
+        };
+        let XaiSessionUpdate::CompactionCheckpoint(marker) = &notification.update else {
+            continue;
+        };
+        if marker.kind == CompactionCheckpointKind::Unknown {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown compaction checkpoint kind; refusing to replay or rebuild",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stream the durable update log and reject every malformed, removed, or
+/// unknown compaction marker before rewind filtering can hide it. Non-marker
+/// lines retain the storage layer's existing torn-line tolerance.
+pub(crate) fn validate_persisted_compaction_marker_kinds(updates_path: &Path) -> io::Result<()> {
+    let file = match std::fs::File::open(updates_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if !line.contains("compaction_checkpoint") {
+            continue;
+        }
+        let update = SessionUpdateEnvelope::from_str(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "malformed compaction marker at updates.jsonl line {}: {error}",
+                    index + 1
+                ),
+            )
+        })?;
+        validate_compaction_marker_kinds(std::slice::from_ref(&update))?;
+    }
+    Ok(())
+}
+
+/// Scan the filtered update stream for the latest compaction marker and
+/// dispatch by semantic kind. Replay and chat rebuild share this function so
+/// neither can silently reinterpret a removed/unknown format as builtin.
+///
+/// `marker_index` is the marker's position in `updates`; the typed tail
+/// journal records live at `updates[marker_index + 1..]`.
+pub(crate) fn dispatch_compaction_marker(
+    updates: &[SessionUpdate],
+) -> io::Result<CompactionMarkerDispatch> {
+    validate_compaction_marker_kinds(updates)?;
+    let Some((marker_index, marker)) =
+        updates
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, update)| {
+                let SessionUpdate::Xai(notification) = update else {
+                    return None;
+                };
+                let XaiSessionUpdate::CompactionCheckpoint(marker) = &notification.update else {
+                    return None;
+                };
+                Some((index, marker.as_ref()))
+            })
+    else {
+        return Ok(CompactionMarkerDispatch::None);
+    };
+    match marker.kind {
+        CompactionCheckpointKind::Builtin => Ok(CompactionMarkerDispatch::Builtin {
+            marker_index,
+            marker: Box::new(marker.clone()),
+        }),
+        CompactionCheckpointKind::ResponsesServer => Ok(CompactionMarkerDispatch::Responses {
+            marker_index,
+            marker: Box::new(marker.clone()),
+        }),
+        CompactionCheckpointKind::Unknown => unreachable!("validated above"),
+    }
+}
 
 /// Result of replaying updates.jsonl up to a target prompt index.
 #[derive(Debug)]
@@ -23,8 +133,7 @@ pub struct ReplayResult {
     pub prompt_index_reached: usize,
     /// The original User(user_info) text from before the first compaction.
     /// Extracted from the checkpoint file's `original_user_info` field.
-    /// `None` if no checkpoint was encountered or the checkpoint predates
-    /// the field (schema_version 1 without it).
+    /// `None` if no checkpoint was encountered or no value was captured.
     pub original_user_info: Option<String>,
     /// Compaction marker for the rebuilt conversation: `Some(idx)` if a summary survives, else `None`.
     pub last_compaction_prompt_index: Option<usize>,
@@ -89,11 +198,23 @@ pub fn find_latest_compaction_checkpoint(
 ///   target is before or after the compaction boundary.
 ///
 /// `session_dir` is the path to the session directory (for reading checkpoint files).
+/// `live_checkpoint` is the first item of the live conversation (when the
+/// session currently starts with a Responses compaction checkpoint). It is
+/// required to bind a Responses marker to its sidecar.
 pub fn replay_to_prompt(
     updates_path: &Path,
     session_dir: &Path,
+    live_checkpoint: Option<&ConversationItem>,
     target_prompt_index: usize,
 ) -> io::Result<ReplayResult> {
+    if let Some(result) = responses::try_replay_responses(
+        updates_path,
+        session_dir,
+        live_checkpoint,
+        target_prompt_index,
+    )? {
+        return Ok(result);
+    }
     let Some(iter) = UpdatesIterator::open(updates_path)? else {
         return Ok(ReplayResult {
             conversation: vec![],
@@ -284,6 +405,20 @@ impl ReplayState {
         info: &CompactionCheckpointInfo,
         session_dir: &Path,
     ) -> io::Result<ReplayAction> {
+        match info.kind {
+            CompactionCheckpointKind::Builtin => {}
+            // If the latest marker is builtin, older Responses boundaries are
+            // historical inputs to that builtin checkpoint. Raw ACP updates
+            // remain authoritative for pre-builtin targets, so the builtin
+            // reducer must ignore (not reinterpret) these markers.
+            CompactionCheckpointKind::ResponsesServer => return Ok(ReplayAction::Continue),
+            CompactionCheckpointKind::Unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown compaction checkpoint kind in builtin replay",
+                ));
+            }
+        }
         if self.target < info.prompt_index_at_compaction {
             // Target is before this compaction — don't load the compacted
             // history (we'll reconstruct from raw updates). But the
@@ -312,6 +447,12 @@ impl ReplayState {
             };
             match serde_json::from_slice::<CompactionCheckpointFile>(&bytes) {
                 Ok(file) => {
+                    if file.kind != CompactionCheckpointKind::Builtin {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "builtin compaction marker points to a non-builtin checkpoint",
+                        ));
+                    }
                     if self.original_user_info.is_none() {
                         self.original_user_info = file.original_user_info;
                     }
@@ -377,19 +518,10 @@ impl ReplayState {
                 }
             };
 
-            if file.schema_version > 1 {
-                tracing::error!(
-                    schema_version = file.schema_version,
-                    path = %checkpoint_path.display(),
-                    "Unsupported checkpoint schema version, cannot reconstruct conversation"
-                );
+            if file.kind != CompactionCheckpointKind::Builtin {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "Unsupported checkpoint schema version {}. \
-                         Cannot safely rewind past the compaction point.",
-                        file.schema_version
-                    ),
+                    "builtin compaction marker points to a non-builtin checkpoint",
                 ));
             }
 
@@ -774,11 +906,18 @@ mod tests {
         SessionUpdate::Xai(Box::new(XaiNotification {
             session_id: acp::SessionId::new("test"),
             update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+                kind: CompactionCheckpointKind::Builtin,
                 checkpoint_id: checkpoint_id.to_string(),
                 prompt_index_at_compaction,
                 checkpoint_file: format!("compaction_checkpoints/{checkpoint_id}.json"),
                 auto_continue,
-                schema_version: 1,
+                operation_id: None,
+                branch_id: None,
+                portable_history_sha256: None,
+                responses_mode: None,
+                responses_auto_continue: None,
+                wrapper_digest: None,
+                prior_checkpoint_id: None,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             })),
             meta: None,
@@ -794,10 +933,10 @@ mod tests {
         let dir = session_dir.join("compaction_checkpoints");
         std::fs::create_dir_all(&dir).unwrap();
         let file = CompactionCheckpointFile {
+            kind: CompactionCheckpointKind::Builtin,
             checkpoint_id: checkpoint_id.to_string(),
             prompt_index_at_compaction,
             compacted_history,
-            schema_version: 1,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             original_user_info: None,
             reread_file_paths: vec![],
@@ -821,7 +960,7 @@ mod tests {
             content.extend(line);
         }
         std::fs::write(&updates_path, content).unwrap();
-        replay_to_prompt(&updates_path, session_dir, target).unwrap()
+        replay_to_prompt(&updates_path, session_dir, None, target).unwrap()
     }
 
     #[test]
@@ -1252,5 +1391,465 @@ mod tests {
         assert_eq!(result.conversation.len(), 2);
         assert_eq!(result.conversation[0].text_content(), "sys");
         assert_eq!(result.conversation[1].text_content(), "summary2");
+    }
+
+    // ── Responses marker-kind dispatch fixtures ──────────────────────────────
+
+    fn identity_fixture() -> xai_grok_sampling_types::CheckpointIdentity {
+        xai_grok_sampling_types::CheckpointIdentity {
+            provider_id: "xai".into(),
+            api: "responses".into(),
+            endpoint_fingerprint: "endpoint".into(),
+            model: "grok-test".into(),
+            auth_principal_fingerprint: "principal".into(),
+            contract_version: xai_grok_sampling_types::RESPONSES_COMPACTION_CONTRACT.into(),
+            prompt_envelope_fingerprint: "envelope-fp".into(),
+            base_instructions_sha256: "base-hash".into(),
+            prior_checkpoint_id: None,
+            cache_route_fingerprint: None,
+        }
+    }
+
+    fn envelope_fixture() -> xai_grok_sampling_types::TrustedPromptEnvelope {
+        xai_grok_sampling_types::TrustedPromptEnvelope {
+            base_instructions_sha256: "base-hash".into(),
+            memory_revision: Some(3),
+            envelope_fingerprint: "envelope-fp".into(),
+            wire_prompt_sha256: "wire-hash".into(),
+        }
+    }
+
+    fn portable_fixture() -> Vec<ConversationItem> {
+        let mut first = ConversationItem::user("first");
+        first.set_prompt_index(0);
+        let mut second = ConversationItem::user("second");
+        second.set_prompt_index(1);
+        vec![
+            ConversationItem::base_instructions("base prompt"),
+            first,
+            ConversationItem::assistant("first answer"),
+            second,
+            ConversationItem::assistant("second answer"),
+        ]
+    }
+
+    fn wrapper_fixture(
+        checkpoint_id: &str,
+        branch_id: &str,
+        portable: &[ConversationItem],
+    ) -> xai_grok_sampling_types::ServerResponsesCheckpoint {
+        let digest = xai_grok_sampling_types::portable_history_digest(portable).unwrap();
+        let bytes = crate::session::storage::responses_compaction::portable_history_bytes(portable)
+            .unwrap();
+        xai_grok_sampling_types::ServerResponsesCheckpoint {
+            checkpoint_id: checkpoint_id.into(),
+            operation_id: "operation-current".into(),
+            prompt_index: 2,
+            created_at: chrono::Utc::now(),
+            auto_continue: false,
+            mode: xai_grok_sampling_types::ResponsesCompactionMode {
+                name: "default".into(),
+                detail: None,
+            },
+            branch_id: branch_id.into(),
+            identity: identity_fixture(),
+            output: vec![serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })],
+            portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
+            portable_history_sha256: digest,
+            portable_history_bytes: bytes.len() as u64,
+            checkpoint_token_seed: 42,
+            token_seed_source: xai_grok_sampling_types::TokenSeedSource::UsageOutputTokens,
+            server_output_item_count: 1,
+            prior_checkpoint_id: None,
+            memory_revision: Some(3),
+        }
+    }
+
+    fn write_responses_checkpoint(
+        session_dir: &Path,
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpoint,
+        portable: &[ConversationItem],
+    ) {
+        let material = xai_grok_sampling_types::CheckpointReplayMaterial::try_new(
+            wrapper,
+            envelope_fixture(),
+            portable,
+        )
+        .unwrap();
+        let file = crate::session::storage::responses_compaction::CompactionCheckpointFile::new(
+            wrapper.clone(),
+            material,
+            portable.to_vec(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        crate::session::storage::responses_compaction::write_checkpoint_durable(
+            session_dir,
+            &wrapper.portable_history_path,
+            &file,
+        )
+        .unwrap();
+    }
+
+    fn marker_update(info: CompactionCheckpointInfo) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(info)),
+            meta: None,
+        }))
+    }
+
+    fn responses_marker_update(
+        wrapper: &xai_grok_sampling_types::ServerResponsesCheckpoint,
+    ) -> SessionUpdate {
+        marker_update(crate::session::storage::responses_compaction::marker_for_wrapper(wrapper))
+    }
+
+    fn unknown_marker_update() -> SessionUpdate {
+        marker_update(CompactionCheckpointInfo {
+            kind: CompactionCheckpointKind::Unknown,
+            checkpoint_id: "cp-unknown".into(),
+            prompt_index_at_compaction: 1,
+            checkpoint_file: "compaction_checkpoints/cp-unknown.json".into(),
+            auto_continue: None,
+            operation_id: None,
+            branch_id: None,
+            portable_history_sha256: None,
+            responses_mode: None,
+            responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+        })
+    }
+
+    fn tail_prepared(
+        checkpoint_id: &str,
+        branch_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        prompt_index: usize,
+        item: ConversationItem,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::ConversationAppendPrepared(Box::new(
+                crate::session::storage::responses_compaction::ConversationAppendPrepared {
+                    operation_id: format!("{operation_id}-tail-{sequence}"),
+                    checkpoint_id: checkpoint_id.into(),
+                    branch_id: branch_id.into(),
+                    sequence,
+                    prompt_index,
+                    item,
+                },
+            )),
+            meta: None,
+        }))
+    }
+
+    fn tail_committed(
+        checkpoint_id: &str,
+        branch_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        prompt_index: usize,
+    ) -> SessionUpdate {
+        SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("test"),
+            update: XaiSessionUpdate::ConversationAppendCommitted(
+                crate::session::storage::responses_compaction::ConversationAppendCommitted {
+                    operation_id: format!("{operation_id}-tail-{sequence}"),
+                    checkpoint_id: checkpoint_id.into(),
+                    branch_id: branch_id.into(),
+                    sequence,
+                    prompt_index,
+                },
+            ),
+            meta: None,
+        }))
+    }
+
+    fn replay_updates_result(
+        updates: &[SessionUpdate],
+        session_dir: &Path,
+        live: Option<ConversationItem>,
+        target: usize,
+    ) -> io::Result<ReplayResult> {
+        let updates_path = session_dir.join("updates.jsonl");
+        let mut content = Vec::new();
+        for u in updates {
+            let envelope = crate::session::storage::SessionUpdateEnvelope::from_update(u).unwrap();
+            let mut line = serde_json::to_vec(&envelope).unwrap();
+            line.push(b'\n');
+            content.extend(line);
+        }
+        std::fs::write(&updates_path, content).unwrap();
+        replay_to_prompt(&updates_path, session_dir, live.as_ref(), target)
+    }
+
+    fn replay_updates_with_live(
+        updates: &[SessionUpdate],
+        session_dir: &Path,
+        live: Option<ConversationItem>,
+        target: usize,
+    ) -> ReplayResult {
+        replay_updates_result(updates, session_dir, live, target).unwrap()
+    }
+
+    // ── marker-kind dispatch tests ───────────────────────────────────────────
+
+    /// Responses markers replay the typed journal through the bound wrapper and sidecar.
+    #[test]
+    fn test_replay_responses_marker_current_path() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        write_responses_checkpoint(tmp.path(), &wrapper, &portable);
+        let updates = vec![
+            responses_marker_update(&wrapper),
+            tail_prepared(
+                "checkpoint-current",
+                "branch-1",
+                "operation-current",
+                1,
+                2,
+                ConversationItem::user("P2"),
+            ),
+            tail_committed("checkpoint-current", "branch-1", "operation-current", 1, 2),
+            tail_prepared(
+                "checkpoint-current",
+                "branch-1",
+                "operation-current",
+                2,
+                2,
+                ConversationItem::assistant("A2"),
+            ),
+            tail_committed("checkpoint-current", "branch-1", "operation-current", 2, 2),
+        ];
+        let live = ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone()));
+        let result = replay_updates_with_live(&updates, tmp.path(), Some(live), 3);
+        assert!(matches!(
+            result.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        let texts: Vec<String> = result
+            .conversation
+            .iter()
+            .skip(1)
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(texts, vec!["P2", "A2"]);
+        assert_eq!(result.prompt_index_reached, 3);
+        assert_eq!(result.last_compaction_prompt_index, Some(2));
+    }
+
+    /// Responses replay uses portable history for a pre-compaction target.
+    #[test]
+    fn test_replay_responses_marker_pre_compaction_target() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        write_responses_checkpoint(tmp.path(), &wrapper, &portable);
+        let updates = vec![responses_marker_update(&wrapper)];
+        let live = ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone()));
+        let result = replay_updates_with_live(&updates, tmp.path(), Some(live), 1);
+        let texts: Vec<String> = result
+            .conversation
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect();
+        assert_eq!(texts, vec!["base prompt", "first", "first answer"]);
+        assert_eq!(result.prompt_index_reached, 1);
+        assert_eq!(result.last_compaction_prompt_index, None);
+    }
+
+    /// Missing or unknown semantic kinds fail closed even when a newer
+    /// builtin marker would otherwise select the builtin reducer.
+    #[test]
+    fn test_replay_unknown_kind_is_not_hidden_by_newer_builtin_marker() {
+        let tmp = TempDir::new().unwrap();
+        let updates = vec![
+            make_user_update_pi("s1", "P0", 0),
+            make_agent_update("s1", "R0"),
+            unknown_marker_update(),
+            make_checkpoint("newer-builtin", 2, None),
+        ];
+        let err = replay_updates_result(&updates, tmp.path(), None, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("unknown compaction checkpoint kind")
+        );
+    }
+
+    #[test]
+    fn test_replay_rejects_unknown_marker_even_on_rewound_branch() {
+        let tmp = TempDir::new().unwrap();
+        let updates = vec![
+            make_user_update_pi("s1", "abandoned", 0),
+            unknown_marker_update(),
+            make_rewind_marker(0),
+            make_user_update_pi("s1", "replacement", 0),
+        ];
+        let error = replay_updates_result(&updates, tmp.path(), None, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("unknown compaction checkpoint kind")
+        );
+    }
+
+    /// Builtin markers are handled by the builtin reducer.
+    #[test]
+    fn test_replay_builtin_marker_path() {
+        let tmp = TempDir::new().unwrap();
+        write_checkpoint_file(
+            tmp.path(),
+            "ckpt1",
+            2,
+            vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("compacted summary"),
+            ],
+        );
+        let updates = vec![
+            make_user_update("s1", "P0"),
+            make_agent_update("s1", "R0"),
+            make_checkpoint("ckpt1", 2, None),
+            make_user_update("s1", "P1"),
+            make_agent_update("s1", "R1"),
+        ];
+        let result = replay_updates(&updates, tmp.path(), 2);
+        assert_eq!(result.conversation.len(), 2);
+        assert_eq!(result.last_compaction_prompt_index, Some(2));
+    }
+
+    /// A later builtin compaction can legally follow a Responses checkpoint.
+    /// The builtin reducer ignores the older Responses marker rather than
+    /// trying to deserialize its sidecar as a builtin checkpoint.
+    #[test]
+    fn test_replay_responses_then_builtin_uses_latest_builtin_boundary() {
+        let tmp = TempDir::new().unwrap();
+        write_checkpoint_file(
+            tmp.path(),
+            "builtin-after-responses",
+            4,
+            vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("builtin summary"),
+            ],
+        );
+        let portable = portable_fixture();
+        let response_wrapper = wrapper_fixture("checkpoint-responses", "branch-1", &portable);
+        write_responses_checkpoint(tmp.path(), &response_wrapper, &portable);
+        let updates = vec![
+            responses_marker_update(&response_wrapper),
+            tail_prepared(
+                "checkpoint-responses",
+                "branch-1",
+                "operation-current",
+                1,
+                2,
+                ConversationItem::user("P2"),
+            ),
+            tail_committed(
+                "checkpoint-responses",
+                "branch-1",
+                "operation-current",
+                1,
+                2,
+            ),
+            tail_prepared(
+                "checkpoint-responses",
+                "branch-1",
+                "operation-current",
+                2,
+                2,
+                ConversationItem::assistant("A2"),
+            ),
+            tail_committed(
+                "checkpoint-responses",
+                "branch-1",
+                "operation-current",
+                2,
+                2,
+            ),
+            make_user_update_pi("s1", "P2", 2),
+            make_agent_update("s1", "A2"),
+            make_checkpoint("builtin-after-responses", 4, None),
+            make_user_update_pi("s1", "P4", 4),
+            make_agent_update("s1", "A4"),
+        ];
+
+        let result = replay_updates(&updates, tmp.path(), 5);
+        let texts = result
+            .conversation
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["sys", "builtin summary", "P4", "A4"]);
+        assert_eq!(result.last_compaction_prompt_index, Some(4));
+
+        let between = replay_updates(&updates, tmp.path(), 3);
+        assert!(matches!(
+            between.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        assert_eq!(
+            between
+                .conversation
+                .iter()
+                .skip(1)
+                .map(ConversationItem::text_content)
+                .collect::<Vec<_>>(),
+            vec!["P2", "A2"]
+        );
+        assert_eq!(between.last_compaction_prompt_index, Some(2));
+
+        let mut after_rewind = updates;
+        after_rewind.push(make_rewind_marker(3));
+        let resumed = replay_updates_with_live(
+            &after_rewind,
+            tmp.path(),
+            between.conversation.first().cloned(),
+            3,
+        );
+        assert!(matches!(
+            resumed.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        assert_eq!(resumed.last_compaction_prompt_index, Some(2));
+    }
+
+    /// Responses markers require the live wrapper to bind the sidecar.
+    #[test]
+    fn test_replay_responses_marker_requires_live_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        write_responses_checkpoint(tmp.path(), &wrapper, &portable);
+        let updates = vec![responses_marker_update(&wrapper)];
+        let err = replay_updates_result(&updates, tmp.path(), None, 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A tampered Responses marker fails its sidecar binding.
+    #[test]
+    fn test_replay_responses_marker_mismatch_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let portable = portable_fixture();
+        let wrapper = wrapper_fixture("checkpoint-current", "branch-1", &portable);
+        write_responses_checkpoint(tmp.path(), &wrapper, &portable);
+        let mut bad = crate::session::storage::responses_compaction::marker_for_wrapper(&wrapper);
+        bad.prompt_index_at_compaction = 99;
+        let updates = vec![marker_update(bad)];
+        let live = ConversationItem::ResponsesCompactionCheckpoint(Box::new(wrapper.clone()));
+        let err = replay_updates_result(&updates, tmp.path(), Some(live), 3).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

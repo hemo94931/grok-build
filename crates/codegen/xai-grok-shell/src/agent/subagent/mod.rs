@@ -378,6 +378,38 @@ impl SubagentSpawnContext {
             .resolve()
             .value
     }
+    pub(crate) fn resolve_server_compaction_enabled(&self) -> bool {
+        crate::agent::config::BoolFlag::env("GROK_SERVER_COMPACTION")
+            .config(
+                self.agent_config
+                    .as_ref()
+                    .and_then(|config| config.features.server_compaction),
+            )
+            .feature_flag(
+                self.remote_settings
+                    .as_ref()
+                    .and_then(|settings| settings.server_compaction_enabled),
+            )
+            .default(true)
+            .resolve()
+            .value
+    }
+
+    pub(crate) fn resolve_compact_model(&self, current_model: &str) -> Option<String> {
+        let selected = crate::session::responses_server_compaction::resolve_compact_model_layers(
+            crate::agent::config::env_string("GROK_COMPACT_MODEL").as_deref(),
+            self.agent_config
+                .as_ref()
+                .and_then(|config| config.features.compact_model.as_deref()),
+            self.remote_settings
+                .as_ref()
+                .and_then(|settings| settings.compact_model.as_deref()),
+            current_model,
+            |model| crate::agent::config::find_model_by_id(&self.available_models, model).is_some(),
+        );
+        (selected != current_model).then_some(selected)
+    }
+
     pub(crate) fn resolve_compaction_tool_choice(
         &self,
     ) -> crate::util::config::CompactionToolChoice {
@@ -938,12 +970,20 @@ fn resolve_model_override_to_config(
 /// Leading items to preserve across compaction on resume: the System head only, so the
 /// resumed body (the child's own work) stays compactable. Returns 0 when there's no
 /// leading System; the spawn path then inserts one and bumps the prefix to 1.
+/// Leading items to preserve across compaction on resume: the System head only, so the
+/// resumed body (the child's own work) stays compactable. Returns 0 when there's no
+/// leading System; the spawn path then inserts one and bumps the prefix to 1.
+///
+/// A leading `MemoryContext` item is NOT inherited: memory belongs to the
+/// parent session and is never copied into a subagent's preamble.
 pub(crate) fn resume_inherited_prefix_len(
     conversation: &[xai_grok_sampling_types::conversation::ConversationItem],
 ) -> usize {
     conversation
         .iter()
-        .take_while(|i| matches!(i, ConversationItem::System(_)))
+        .take_while(|i| {
+            matches!(i, ConversationItem::System(sys) if sys.source != xai_grok_sampling_types::SystemSource::MemoryContext)
+        })
         .count()
 }
 /// How a subagent's initial conversation was bootstrapped.
@@ -1283,6 +1323,7 @@ async fn bootstrap_initial_context(
             copy_plan_mode_state: false,
             copy_signals: false,
             copy_tool_state: false,
+            copy_compaction_segments: true,
             fork_filter: true,
             ..Default::default()
         };

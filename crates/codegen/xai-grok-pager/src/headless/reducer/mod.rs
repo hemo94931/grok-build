@@ -97,6 +97,8 @@ pub(crate) struct ToolCallUpdateEvent {
 
 pub(crate) enum Lifecycle {
     CompactStarted { percentage: u8 },
+    CompactionFallbackStarted { reason: String },
+    CompactionMigrationStarted { reason: String },
     CompactCompleted { pre_tokens: u64 },
     CompactFailed { error: String },
     CompactCancelled,
@@ -110,6 +112,13 @@ impl Lifecycle {
         match self {
             Lifecycle::CompactStarted { percentage } => {
                 format!("Auto-compacting conversation ({percentage}% full)...")
+            }
+            Lifecycle::CompactionFallbackStarted { reason } => {
+                format!("Continuing with local conversation compaction ({reason}).")
+            }
+            Lifecycle::CompactionMigrationStarted { reason: _ } => {
+                "Updating the compacted conversation for the current model and connection."
+                    .to_string()
             }
             Lifecycle::CompactCompleted { .. } => "Conversation compacted.".to_string(),
             Lifecycle::CompactFailed { error } if error.trim().is_empty() => {

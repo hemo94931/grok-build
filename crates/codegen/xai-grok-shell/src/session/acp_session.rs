@@ -1016,6 +1016,14 @@ pub(crate) struct SessionActor {
     /// terminal `SamplingEvent::Completed` (every text/thought chunk has been
     /// `send_update`d by then). `None` between turns.
     pub(crate) turn_stream_drained: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Stage-D3 observability hint for `PromptCacheObservation.request_kind`:
+    /// 0 = no active checkpoint, 1 = checkpoint active (post-compact
+    /// subsequent), 2 = checkpoint committed, first post-compact usage not
+    /// yet recorded. Set to 2 when a checkpoint commits, to 0 when a
+    /// builtin/migration commit or rewind removes the checkpoint. A rewind
+    /// that bypasses the shell hooks could leave a stale `1` — acceptable
+    /// for an observability hint; the hard signal is `post_compact_first`.
+    pub(crate) post_compact_usage_state: std::sync::atomic::AtomicU8,
     /// Handle to the per-session `xai-grok-sampler` actor.
     ///
     /// Live sessions get a real handle from `spawn_session_actor`;
@@ -1297,46 +1305,6 @@ fn save_prompt_context(session_info: &SessionInfo, prompt_context: &xai_grok_age
     }
 }
 const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
-/// Synchronously and atomically rewrite `{session_dir}/chat_history.jsonl`.
-///
-/// Serializes to a temp file then `rename`s over the target, matching the
-/// persistence actor's own crash-safety (a truncating in-place write can tear
-/// the file on crash / `ENOSPC`). Best-effort with a logged failure.
-///
-/// Callers use this for a *synchronous* on-disk snapshot at spawn / initialize /
-/// agent-rebuild: `chat_state_handle.replace_conversation` persists the same
-/// content, but only after two async actor hops, so a reload that races the
-/// first prompt could otherwise read the bare pre-enrichment template. A
-/// distinct temp suffix (`.sync.tmp`) avoids clobbering the persistence actor's
-/// own `chat_history.jsonl.tmp`; whichever atomic `rename` lands last wins and
-/// the content is identical, so the two writers can never produce a torn file.
-fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
-    let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(session_id = %session_info.id.0, ?e,
-            "persist_chat_history_jsonl_sync: failed to create session dir");
-        return;
-    }
-    let final_path = dir.join("chat_history.jsonl");
-    let tmp_path = dir.join("chat_history.jsonl.sync.tmp");
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        for item in conversation {
-            serde_json::to_writer(&mut buf, item)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push(b'\n');
-        }
-        std::fs::File::create(&tmp_path)?.write_all(&buf)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        tracing::warn!(session_id = %session_info.id.0, ?e,
-            "persist_chat_history_jsonl_sync: failed to persist chat_history.jsonl");
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-}
 /// Persist the exact rendered system prompt to `{session_dir}/system_prompt.txt`.
 /// Should match the first System entry in `chat_history.jsonl` modulo trailing
 /// newlines (`canonical_system_prompt_eq`); a trailing-newline-only difference
@@ -1362,7 +1330,7 @@ pub(crate) fn load_system_prompt(session_info: &SessionInfo) -> Option<String> {
     let dir = crate::session::persistence::session_dir(session_info);
     load_system_prompt_from_dir(&dir)
 }
-fn load_system_prompt_from_dir(session_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn load_system_prompt_from_dir(session_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(session_dir.join(SYSTEM_PROMPT_FILENAME)).ok()
 }
 /// Load the canonical prompt context from `{session_dir}/prompt_context.json`.

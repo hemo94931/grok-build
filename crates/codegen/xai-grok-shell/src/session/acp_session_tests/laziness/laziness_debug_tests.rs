@@ -162,6 +162,7 @@ fn flatten_collapses_newlines_to_keep_one_line_per_item() {
 fn flatten_handles_system_items() {
     let items = vec![ConversationItem::System(SystemItem {
         content: "remember X".into(),
+        source: Default::default(),
     })];
     let out = flatten_transcript_for_classifier(&items, true);
     assert_eq!(out, "[system] remember X\n");

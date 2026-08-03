@@ -6,7 +6,9 @@
 use std::io;
 
 use tokio::sync::{mpsc, oneshot};
-use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
+use xai_chat_state::{
+    ChatPersistence, HistoryReplaceError, StrictAppendAck, StrictAppendError, TailAppend,
+};
 use xai_grok_sampling_types::ConversationItem;
 
 use super::persistence::PersistenceMsg;
@@ -61,6 +63,54 @@ impl ChatPersistence for ChannelChatPersistence {
         let _ = self
             .tx
             .send(PersistenceMsg::ReplaceChatHistory(items.to_vec()));
+    }
+
+    fn replace_history_and_ack(
+        &mut self,
+        operation_id: &str,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(PersistenceMsg::ReplaceChatHistoryAndAck {
+                operation_id: operation_id.to_string(),
+                messages: items.to_vec(),
+                respond_to: reply,
+            })
+            .is_err()
+        {
+            let (reply, receiver) = oneshot::channel();
+            let _ = reply.send(Err(HistoryReplaceError::Indeterminate(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor unavailable",
+            ))));
+            return receiver;
+        }
+        receiver
+    }
+
+    fn append_tail_and_ack(
+        &mut self,
+        append: &TailAppend,
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(PersistenceMsg::AppendChatTailAndAck {
+                append: append.clone(),
+                respond_to: reply,
+            })
+            .is_err()
+        {
+            let (reply, receiver) = oneshot::channel();
+            let _ = reply.send(Err(HistoryReplaceError::Indeterminate(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor unavailable",
+            ))));
+            return receiver;
+        }
+        receiver
     }
 
     fn flush(&mut self) {

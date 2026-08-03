@@ -13,6 +13,7 @@ async fn fake_running_turn(actor: &SessionActor) {
     actor.state.lock().await.running_task = Some(AgentTask {
         prompt_id: "running-turn".into(),
         handle: tokio::task::spawn_local(std::future::pending::<()>()).abort_handle(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
     });
 }
 

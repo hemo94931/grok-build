@@ -452,7 +452,23 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if compactions_remaining.is_some() || compaction_at_tokens.is_some() {
+        let send_inline_compaction_headers =
+            crate::session::responses_server_compaction::should_send_inline_compaction_headers(
+                &cfg.api_backend,
+            );
+        let mut env_http_headers = cfg.env_http_headers.clone();
+        if !send_inline_compaction_headers {
+            // Responses uses exactly one explicit compaction mechanism. Strip
+            // even user/model/env-injected inline controls so disabling the
+            // endpoint cannot silently re-enable provider compaction.
+            for name in ["x-compaction-at", "x-compactions-remaining"] {
+                extra_headers.shift_remove(name);
+                env_http_headers.shift_remove(name);
+            }
+        }
+        if send_inline_compaction_headers
+            && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
+        {
             let has_compaction_summary = self
                 .chat_state_handle
                 .get_last_compaction_prompt_index()
@@ -485,7 +501,7 @@ impl SessionActor {
             auth_scheme,
             extra_headers,
             query_params: cfg.query_params.clone(),
-            env_http_headers: cfg.env_http_headers.clone(),
+            env_http_headers,
             context_window: cfg.context_window.get(),
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
@@ -728,7 +744,7 @@ impl SessionActor {
     /// newly issued session token. The previous client cache inside
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> SamplingConfig {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
@@ -737,7 +753,55 @@ impl SessionActor {
             sampler_config.doom_loop_recovery = None;
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
-        self.sampler_handle.update_config(sampler_config);
+        self.sampler_handle.update_config(sampler_config.clone());
+        sampler_config
+    }
+    /// Stage-D3 (plan 阶段 7) stable cache routing for `model` on
+    /// `full_config`'s route: provider + normalized base URL + model cache
+    /// family + auth principal (the exact principal source the compaction
+    /// gate uses, `compact_credential`), with the persisted logical cache
+    /// namespace for this session dir. `None` when no credential is
+    /// available or the namespace file is unreadable — a cache key is
+    /// best-effort and must never fail a turn.
+    pub(super) fn cache_routing_for_config(
+        &self,
+        full_config: &xai_grok_sampler::SamplerConfig,
+        model: &str,
+    ) -> Option<crate::session::cache_routing::SessionCacheRouting> {
+        let (_, principal) = self.compact_credential(full_config)?;
+        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
+            "xai"
+        } else {
+            "openai_compatible"
+        };
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        match crate::session::cache_routing::load_or_create(
+            &session_dir,
+            provider_id,
+            &full_config.base_url,
+            model,
+            &principal,
+        ) {
+            Ok(routing) => Some(routing),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    ?error,
+                    "cache routing unavailable; request proceeds without a prompt cache key"
+                );
+                None
+            }
+        }
+    }
+    /// Stage-D3 routing for an auxiliary request (recap / side question)
+    /// on the session model route. Rebuilds the full sampler config once
+    /// (same source as `prepare_chat_completion`).
+    pub(super) async fn cache_routing_for_model(
+        &self,
+        model: &str,
+    ) -> Option<crate::session::cache_routing::SessionCacheRouting> {
+        let full_config = self.reconstruct_full_config().await;
+        self.cache_routing_for_config(&full_config, model)
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client
@@ -817,6 +881,14 @@ impl SessionActor {
         self: &Arc<Self>,
         error: xai_grok_sampler::SamplingErrorInfo,
     ) -> Result<SamplerFailureRecovery, acp::Error> {
+        self.handle_sampling_failure_for_request(error, None).await
+    }
+
+    async fn handle_sampling_failure_for_request(
+        self: &Arc<Self>,
+        error: xai_grok_sampler::SamplingErrorInfo,
+        normal_request: Option<ConversationRequest>,
+    ) -> Result<SamplerFailureRecovery, acp::Error> {
         use xai_grok_sampler::SamplingErrorKind;
         if self.tool_context.task_output_token_budget.is_some() {
             self.tool_context.fail_task_output_usage_closed();
@@ -864,7 +936,10 @@ impl SessionActor {
                     context_window: cw,
                     percentage,
                 };
-                if let Err(e) = self.run_compact_only(trigger_info).await {
+                if let Err(e) = self
+                    .run_compact_only_with_request(trigger_info, normal_request)
+                    .await
+                {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
@@ -1127,6 +1202,47 @@ impl SessionActor {
             )),
         )
     }
+    /// Compose current wire instructions: live base instructions (or the
+    /// persisted trusted base prompt), followed by current memory context.
+    /// Replay freezes this value in the resolved request body.
+    pub(crate) async fn current_wire_instructions(&self, request: &ConversationRequest) -> String {
+        let base_from_items: Vec<String> = request
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::System(system)
+                    if system.source == xai_grok_sampling_types::SystemSource::BaseInstructions =>
+                {
+                    let content = system.content.trim();
+                    (!content.is_empty()).then(|| content.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut parts = base_from_items;
+        if parts.is_empty() {
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            if let Some(base) =
+                crate::session::acp_session::load_system_prompt_from_dir(&session_dir)
+                    .map(|base| base.trim().to_string())
+                    .filter(|base| !base.is_empty())
+            {
+                parts.push(base);
+            }
+        }
+        for item in &request.items {
+            if let ConversationItem::System(system) = item
+                && system.source == xai_grok_sampling_types::SystemSource::MemoryContext
+            {
+                let content = system.content.trim();
+                if !content.is_empty() {
+                    parts.push(content.to_string());
+                }
+            }
+        }
+        parts.join(xai_grok_sampling_types::INSTRUCTIONS_MEMORY_SEPARATOR)
+    }
+
     /// Drive a single turn through the sampler-based path.
     ///
     /// Calls `prepare_sampler_for_turn` first (auth refresh + config
@@ -1134,16 +1250,62 @@ impl SessionActor {
     /// returns:
     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
-    ///    ran, the outer turn loop should `continue`.
+    ///   ran, the outer turn loop should `continue`.
     /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth 401
-    ///    recovery succeeded, credentials refreshed, retry once.
+    ///   recovery succeeded, credentials refreshed, retry once.
     /// * `Err(acp::Error)` - terminal failure already reported via
-    ///    `send_xai_notification(RetryState::Failed)`.
+    ///   `send_xai_notification(RetryState::Failed)`.
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        self.prepare_sampler_for_turn().await;
+        let full_config = self.prepare_sampler_for_turn().await;
+        let gate = self
+            .ensure_checkpoint_replayable_for_request(&request, &full_config)
+            .await?;
+        if gate.resubmit {
+            return Ok(SamplerTurnOutcome::CompactAndResubmit);
+        }
+        // Stable cache routing is applied before either dispatch is frozen.
+        // Resolved replay retries reuse the exact body, cache key, correlation,
+        // and credential snapshot selected here.
+        let routing_key = self
+            .cache_routing_for_config(
+                &full_config,
+                request.model.as_deref().unwrap_or(&full_config.model),
+            )
+            .map(|routing| routing.prompt_cache_key());
+        let dispatch = if let Some(replay) = gate.replay {
+            // Freeze the just-validated credential for this provider send. A
+            // later auth resubmit rebuilds config only after replay is verified
+            // again against the current request identity.
+            let mut request_config = full_config.clone();
+            request_config.bearer_resolver = None;
+            self.sampler_handle.update_config(request_config);
+            let mut frozen = request.clone();
+            let wire_instructions = self.current_wire_instructions(&request).await;
+            frozen.instructions = (!wire_instructions.is_empty()).then_some(wire_instructions);
+            frozen.prompt_cache_key = routing_key.clone();
+            full_config.apply_conversation_defaults_to(&mut frozen);
+            let resolved =
+                xai_grok_sampling_types::ResolvedResponsesRequest::from_validated_replay(
+                    &replay, &frozen,
+                )
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            xai_grok_sampler::SamplingDispatch::ResolvedResponses(std::sync::Arc::new(resolved))
+        } else {
+            if request
+                .items
+                .iter()
+                .any(ConversationItem::is_responses_checkpoint)
+            {
+                return Err(acp::Error::internal_error()
+                    .data("responses_compaction_checkpoint_without_replay"));
+            }
+            let mut normal = request.clone();
+            normal.prompt_cache_key = routing_key;
+            xai_grok_sampler::SamplingDispatch::Normal(Box::new(normal))
+        };
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1153,7 +1315,7 @@ impl SessionActor {
         let request_id_str = request_id.as_str().to_string();
         match self
             .sampler_handle
-            .submit_and_collect(request_id, request)
+            .submit_dispatch_and_collect(request_id, dispatch)
             .await
         {
             Ok((response, metrics)) => {
@@ -1183,7 +1345,10 @@ impl SessionActor {
             Err(rich_err) => {
                 self.turn_stream_drained.lock().take();
                 let info = xai_grok_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
+                match self
+                    .handle_sampling_failure_for_request(info, Some(request))
+                    .await?
+                {
                     SamplerFailureRecovery::CompactAndResubmit => {
                         Ok(SamplerTurnOutcome::CompactAndResubmit)
                     }
@@ -1397,6 +1562,45 @@ impl SessionActor {
                 let _ = handle.mark_usage_incomplete(true, true).await;
             });
         }
+    }
+    /// Stage-D3 observability: record the provider-reported prompt-cache
+    /// behavior of a completed main turn, keyed by normalized
+    /// deployment + model family. Provider cache capability
+    /// (`compact_seeds_prompt_cache`) has no reliable static signal, so it
+    /// is accumulated observationally; the `post_compact_first` kind is the
+    /// hard-gate signal once capability is promised. Best-effort: no
+    /// routing (credential/namespace) ⇒ no event.
+    pub(super) async fn record_prompt_cache_observation(
+        &self,
+        usage: &xai_grok_sampling_types::TokenUsage,
+        model: &str,
+    ) {
+        let state = self
+            .post_compact_usage_state
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let request_kind = match state {
+            2 => "post_compact_first",
+            1 => "post_compact_subsequent",
+            _ => "normal",
+        };
+        let Some(routing) = self.cache_routing_for_model(model).await else {
+            return;
+        };
+        if state != 0 {
+            self.post_compact_usage_state
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        xai_grok_telemetry::session_ctx::log_event(
+            xai_grok_telemetry::events::PromptCacheObservation {
+                provider_id: routing.provider_id().to_string(),
+                deployment_fingerprint: routing.route_fingerprint().to_string(),
+                model_cache_family: xai_grok_sampling_types::model_cache_family(model),
+                request_kind,
+                prompt_cache_key_present: true,
+                cached_tokens: u64::from(usage.cached_prompt_tokens),
+                prompt_tokens: u64::from(usage.prompt_tokens),
+            },
+        );
     }
     pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
         self.signals_handle().record_assistant_message();

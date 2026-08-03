@@ -163,6 +163,12 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
         AutoCompactStarted {
             percentage: u8,
         },
+        CompactionFallbackStarted {
+            reason: String,
+        },
+        CompactionMigrationStarted {
+            reason: String,
+        },
         AutoCompactCompleted {
             #[serde(default)]
             tokens_before: Option<u64>,
@@ -234,6 +240,12 @@ fn decode_session_notification(method: &str, params: &str) -> ExtEvent {
     match xai_notif.update {
         XaiUpdate::AutoCompactStarted { percentage } => {
             ExtEvent::Lifecycle(Lifecycle::CompactStarted { percentage })
+        }
+        XaiUpdate::CompactionFallbackStarted { reason } => {
+            ExtEvent::Lifecycle(Lifecycle::CompactionFallbackStarted { reason })
+        }
+        XaiUpdate::CompactionMigrationStarted { reason } => {
+            ExtEvent::Lifecycle(Lifecycle::CompactionMigrationStarted { reason })
         }
         XaiUpdate::AutoCompactCompleted { tokens_before } => {
             ExtEvent::Lifecycle(Lifecycle::CompactCompleted {

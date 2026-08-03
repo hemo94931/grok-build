@@ -6,10 +6,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
-use crate::StrictAppendAck;
 use crate::actor::ChatStateActor;
 use crate::events::ChatStateEvent;
 use crate::persistence::{MockChatPersistence, MockPersistenceReceiver, PersistenceRecord};
+use crate::{ReplaceSystemHeadResult, StrictAppendAck};
 
 /// Helper to build a `SamplingConfig` for tests.
 fn test_config() -> SamplingConfig {
@@ -1011,7 +1011,7 @@ async fn replace_system_head_swaps_head_and_preserves_turns() {
         ConversationItem::assistant("yo"),
     ]);
     let changed = h.handle.replace_system_head("new prompt").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(conv.len(), 3, "must not wipe user/assistant turns");
     assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "new prompt"));
@@ -1029,7 +1029,7 @@ async fn replace_system_head_noop_when_head_matches_modulo_newline() {
     let changed = h.handle.replace_system_head("same").await;
     assert_eq!(
         changed,
-        Some(false),
+        Some(ReplaceSystemHeadResult::Unchanged),
         "trailing-newline-only diff is a no-op"
     );
     let conv = h.handle.get_conversation().await;
@@ -1044,7 +1044,7 @@ async fn replace_system_head_noop_when_head_matches_modulo_newline() {
 async fn replace_system_head_inserts_when_absent() {
     let h = TestHarness::with_conversation(vec![ConversationItem::user("hi")]);
     let changed = h.handle.replace_system_head("sys").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(conv.len(), 2, "inserts System at head, keeps the user turn");
     assert!(matches!(&conv[0], ConversationItem::System(s) if s.content.as_ref() == "sys"));
@@ -1061,7 +1061,7 @@ async fn replace_system_head_retains_concurrently_pushed_item() {
     h.handle
         .push_assistant_response(ConversationItem::assistant("in-flight turn output"));
     let changed = h.handle.replace_system_head("new").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
     let conv = h.handle.get_conversation().await;
     assert_eq!(
         conv.len(),
@@ -1085,7 +1085,7 @@ async fn replace_system_head_preserves_active_turn_capture() {
         .push_assistant_response(ConversationItem::assistant("in-flight"));
 
     let changed = h.handle.replace_system_head("new prompt").await;
-    assert_eq!(changed, Some(true));
+    assert_eq!(changed, Some(ReplaceSystemHeadResult::Replaced));
 
     let capture = h
         .handle
@@ -1420,6 +1420,11 @@ async fn build_request_includes_all_messages() {
     assert_eq!(request.items.len(), 2);
     assert_eq!(request.x_grok_conv_id, Some("conv-1".to_string()));
     assert_eq!(request.x_grok_req_id, Some("req-1".to_string()));
+    assert_eq!(
+        request.parallel_tool_calls,
+        Some(true),
+        "normal and compact envelopes must bind identical tool semantics"
+    );
 }
 
 #[tokio::test]
@@ -1471,12 +1476,16 @@ async fn build_request_injects_memory_reminder() {
         .await
         .unwrap();
 
-    if let ConversationItem::System(ref sys) = request.items[0] {
-        assert!(sys.content.contains("Remember: user prefers Rust"));
-        assert!(sys.content.starts_with("You are helpful."));
-    } else {
-        panic!("expected System item");
-    }
+    // Base instructions stay untouched; memory is a dedicated item.
+    assert_eq!(request.items[0].text_content(), "You are helpful.");
+    let ConversationItem::System(ref memory) = request.items[1] else {
+        panic!("expected dedicated memory System item");
+    };
+    assert_eq!(memory.content.as_ref(), "Remember: user prefers Rust");
+    assert_eq!(
+        memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 }
 
 #[tokio::test]
@@ -1631,24 +1640,34 @@ async fn build_request_can_persist_memory_into_actor_state() {
         .await
         .unwrap();
 
-    if let ConversationItem::System(ref sys) = request.items[0] {
-        assert!(sys.content.contains("Remember this"));
-    } else {
-        panic!("expected System item in request");
-    }
+    // Base instructions stay untouched; the request carries the memory as
+    // its own marked item.
+    assert_eq!(request.items[0].text_content(), "sys");
+    let ConversationItem::System(ref memory) = request.items[1] else {
+        panic!("expected dedicated memory System item in request");
+    };
+    assert!(memory.content.contains("Remember this"));
+    assert_eq!(
+        memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 
     let conv = h.handle.get_conversation().await;
-    if let ConversationItem::System(ref sys) = conv[0] {
-        assert!(sys.content.contains("Remember this"));
-    } else {
-        panic!("expected persisted System item");
-    }
+    assert_eq!(conv[0].text_content(), "sys");
+    let ConversationItem::System(ref persisted_memory) = conv[1] else {
+        panic!("expected persisted memory System item");
+    };
+    assert!(persisted_memory.content.contains("Remember this"));
+    assert_eq!(
+        persisted_memory.source,
+        xai_grok_sampling_types::SystemSource::MemoryContext
+    );
 
     let records = h.drain_persistence();
     assert!(
         records
             .iter()
-            .any(|r| matches!(r, PersistenceRecord::ReplaceHistory(items) if matches!(items.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Remember this"))))
+            .any(|r| matches!(r, PersistenceRecord::ReplaceHistory(items) if items.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Remember this")))))
     );
 }
 

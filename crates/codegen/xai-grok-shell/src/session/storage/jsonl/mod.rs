@@ -1,4 +1,5 @@
 use super::{PersistedData, SessionUpdateEnvelope, StorageAdapter, updates_truncate_for_prompt};
+use super::{SessionUpdate, responses_compaction};
 use crate::sampling::types::ChatRequestMessage;
 use crate::sampling::{
     ContentPart, ConversationItem, conversation_truncate_for_prompt, transform_conversation_cwd,
@@ -14,6 +15,8 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use xai_chat_state::StrictAppendAck;
 use xai_grok_workspace::session::file_state::RewindPoint;
+
+mod responses_recovery;
 #[derive(Clone)]
 enum SessionDirMode {
     FromRoot(PathBuf),
@@ -775,8 +778,8 @@ impl JsonlStorageAdapter {
     /// record. Unparseable / undecodable lines are therefore *skipped* with a
     /// warning, and the first time corruption is detected the raw file is
     /// preserved as `chat_history.jsonl.corrupt` next to the original — the
-    /// post-load snapshot rewrite (`persist_chat_history_jsonl_sync`) scrubs
-    /// the bad lines from the live file, so the quarantine copy is the only
+    /// later acknowledged history rewrite scrubs the bad lines from the live
+    /// file, so the quarantine copy is the only
     /// surviving evidence for debugging / manual recovery.
     ///
     /// Lines are split on raw `\n` bytes and parsed with `from_slice` so a
@@ -810,6 +813,29 @@ impl JsonlStorageAdapter {
             return Ok(Vec::new());
         }
         let contents = std::fs::read(&path)?;
+        let has_checkpoint_boundary = contents
+            .windows(b"\"persisted_entry\"".len())
+            .any(|window| window == b"\"persisted_entry\"")
+            || contents
+                .windows(b"\"type\":\"responses_compaction_checkpoint\"".len())
+                .any(|window| window == b"\"type\":\"responses_compaction_checkpoint\"");
+        if has_checkpoint_boundary {
+            let history = super::responses_compaction::read_history(&path)?;
+            if let Some(checkpoint) = history
+                .conversation
+                .first()
+                .and_then(ConversationItem::as_responses_checkpoint)
+            {
+                let session_dir = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chat history has no session dir",
+                    )
+                })?;
+                super::responses_compaction::read_checkpoint_for_wrapper(session_dir, checkpoint)?;
+            }
+            return Ok(history.conversation);
+        }
         let mut sibling_btc_ids_seen: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut upgraded_reasoning_count: usize = 0;
@@ -1002,6 +1028,12 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
     let mut i = 0;
     while i < items.len() {
         match &items[i] {
+            // The one Responses checkpoint wrapper is opaque compacted
+            // history at index 0 and is preserved as-is.
+            item if i == 0 && item.is_responses_checkpoint() => {
+                last_complete_end = 1;
+                i += 1;
+            }
             ConversationItem::System(_) => {
                 last_complete_end = i + 1;
                 i += 1;
@@ -1062,15 +1094,35 @@ impl JsonlStorageAdapter {
         let chat_format_version = source_summary.chat_format_version;
         let mut chat_to_copy: Vec<ConversationItem> =
             self.read_chat_history_sync(self.chat_file(source_info), chat_format_version)?;
+        self.repair_responses_recovery_sync(source_info, &chat_to_copy)?;
         let mut updates_to_copy: Vec<super::SessionUpdate> =
             self.read_updates_jsonl(self.updates_file(source_info))?;
+        // Validate before fork filtering/truncation can clear or hide marker
+        // records. Removed/unknown formats are never upgraded during copy.
+        crate::session::helpers::replay::validate_compaction_marker_kinds(&updates_to_copy)?;
         if let Some(target_idx) = options.target_prompt_index {
             updates_to_copy = super::filter_rewind_updates(updates_to_copy);
             updates_to_copy.truncate(updates_truncate_for_prompt(&updates_to_copy, target_idx));
-            chat_to_copy.truncate(conversation_truncate_after_prompt(
-                &chat_to_copy,
-                target_idx,
-            ));
+            if chat_to_copy
+                .first()
+                .is_some_and(ConversationItem::is_responses_checkpoint)
+            {
+                // Pass the live checkpoint so the Responses marker can bind
+                // its sidecar.
+                let live_checkpoint = chat_to_copy.first();
+                chat_to_copy = crate::session::helpers::replay::replay_to_prompt(
+                    &self.updates_file(source_info),
+                    &self.session_dir(source_info),
+                    live_checkpoint,
+                    target_idx,
+                )?
+                .conversation;
+            } else {
+                chat_to_copy.truncate(conversation_truncate_after_prompt(
+                    &chat_to_copy,
+                    target_idx,
+                ));
+            }
         }
         if options.fork_filter {
             fork_filter_chat(&mut chat_to_copy);
@@ -1078,7 +1130,20 @@ impl JsonlStorageAdapter {
         } else {
             updates_to_copy.retain(|update| !is_orchestration_projection_update(update));
         }
-        let checkpoint_files: std::collections::BTreeSet<String> = updates_to_copy
+        // Fork and rewind rotate the active branch so abandoned future tail
+        // journal records can never match the copied history.
+        let checkpoint_branch_rotated = (options.target_prompt_index.is_some()
+            || options.fork_filter)
+            && chat_to_copy
+                .first()
+                .is_some_and(ConversationItem::is_responses_checkpoint);
+        if checkpoint_branch_rotated
+            && let Some(ConversationItem::ResponsesCompactionCheckpoint(wrapper)) =
+                chat_to_copy.first_mut()
+        {
+            wrapper.branch_id = uuid::Uuid::now_v7().to_string();
+        }
+        let mut checkpoint_files: std::collections::BTreeSet<String> = updates_to_copy
             .iter()
             .filter_map(|update| {
                 let super::SessionUpdate::Xai(notification) = update else {
@@ -1092,6 +1157,53 @@ impl JsonlStorageAdapter {
                 Some(info.checkpoint_file.clone())
             })
             .collect();
+        // Copy every marker sidecar plus the live wrapper's portable history.
+        if let Some(checkpoint) = chat_to_copy
+            .first()
+            .and_then(ConversationItem::as_responses_checkpoint)
+        {
+            checkpoint_files.insert(checkpoint.portable_history_path.clone());
+        }
+        // Mirror replay/rebuild dispatch: builtin markers are copied as
+        // ordinary checkpoint artifacts; Responses markers are strongly
+        // validated; unknown kinds fail closed.
+        for update in &updates_to_copy {
+            let super::SessionUpdate::Xai(notification) = update else {
+                continue;
+            };
+            let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+                &notification.update
+            else {
+                continue;
+            };
+            match marker.kind {
+                crate::extensions::notification::CompactionCheckpointKind::Builtin => {}
+                crate::extensions::notification::CompactionCheckpointKind::ResponsesServer => {
+                    let checkpoint = super::responses_compaction::read_checkpoint(
+                        &self.session_dir(source_info),
+                        &marker.checkpoint_file,
+                        &marker.checkpoint_id,
+                        marker.prompt_index_at_compaction,
+                        marker.portable_history_sha256.as_deref().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Responses checkpoint marker has no portable digest",
+                            )
+                        })?,
+                    )?;
+                    super::responses_compaction::validate_marker_for_wrapper(
+                        marker,
+                        &checkpoint.wrapper,
+                    )?;
+                }
+                crate::extensions::notification::CompactionCheckpointKind::Unknown => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown compaction checkpoint kind; refusing to copy the session",
+                    ));
+                }
+            }
+        }
         for target in [
             self.workflows_dir(target_info),
             self.goal_mode_state_file(target_info)
@@ -1115,6 +1227,52 @@ impl JsonlStorageAdapter {
         }
         if options.strip_reasoning {
             chat_to_copy = xai_chat_state::compaction_utils::strip_reasoning_blocks(chat_to_copy);
+        }
+        // A copied checkpoint history is a new durable branch boundary. Add
+        // its marker and complete typed-tail baseline directly to the target
+        // update stream; fork bootstrap may load the child history before a
+        // normal resume repair has a chance to run.
+        let checkpoint_replacement_operation_id = chat_to_copy
+            .first()
+            .and_then(ConversationItem::as_responses_checkpoint)
+            .map(|_| format!("fork-{}", uuid::Uuid::now_v7()));
+        if let (Some(operation_id), Some(wrapper)) = (
+            checkpoint_replacement_operation_id.as_deref(),
+            chat_to_copy
+                .first()
+                .and_then(ConversationItem::as_responses_checkpoint),
+        ) {
+            let wrap_update = |update| {
+                super::SessionUpdate::Xai(Box::new(
+                    crate::extensions::notification::SessionNotification {
+                        session_id: source_info.id.clone(),
+                        update,
+                        meta: None,
+                    },
+                ))
+            };
+            updates_to_copy.push(wrap_update(
+                crate::extensions::notification::SessionUpdate::CompactionCheckpoint(Box::new(
+                    super::responses_compaction::marker_for_wrapper(wrapper),
+                )),
+            ));
+            for (prepared, committed) in
+                super::responses_compaction::tail_journal_repairs_for_replacement(
+                    operation_id,
+                    &chat_to_copy,
+                )?
+            {
+                updates_to_copy.push(wrap_update(
+                    crate::extensions::notification::SessionUpdate::ConversationAppendPrepared(
+                        Box::new(prepared),
+                    ),
+                ));
+                updates_to_copy.push(wrap_update(
+                    crate::extensions::notification::SessionUpdate::ConversationAppendCommitted(
+                        committed,
+                    ),
+                ));
+            }
         }
         let num_chat_messages = chat_to_copy.len();
         let cwd_switch_bookkeeping_generation = chat_to_copy
@@ -1168,14 +1326,31 @@ impl JsonlStorageAdapter {
         let summary_bytes = serde_json::to_vec_pretty(&target_summary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(self.summary_file(target_info), summary_bytes)?;
-        let mut chat_content = Vec::new();
-        for item in &chat_to_copy {
-            let mut line = serde_json::to_vec(item)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            line.push(b'\n');
-            chat_content.extend(line);
+        // Checkpoint histories always use the typed persisted-entry path.
+        if chat_to_copy
+            .first()
+            .is_some_and(ConversationItem::is_responses_checkpoint)
+        {
+            let entries = super::responses_compaction::persisted_entries_for_replacement(
+                checkpoint_replacement_operation_id
+                    .as_deref()
+                    .expect("checkpoint replacement operation was allocated"),
+                &chat_to_copy,
+            )?;
+            super::responses_compaction::write_history_durable(
+                &self.chat_file(target_info),
+                &entries,
+            )?;
+        } else {
+            let mut chat_content = Vec::new();
+            for item in &chat_to_copy {
+                let mut line = serde_json::to_vec(item)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                line.push(b'\n');
+                chat_content.extend(line);
+            }
+            std::fs::write(self.chat_file(target_info), chat_content)?;
         }
-        std::fs::write(self.chat_file(target_info), chat_content)?;
         let transformed_updates: Vec<super::SessionUpdate> = updates_to_copy
             .into_iter()
             .map(|u| transform_session_id_in_update(u, &target_info.id))
@@ -1291,25 +1466,15 @@ impl JsonlStorageAdapter {
         let checkpoint_dir_usable = if checkpoint_files.is_empty() {
             false
         } else {
-            match std::fs::symlink_metadata(source_session_dir.join("compaction_checkpoints")) {
-                Ok(meta) if meta.file_type().is_dir() => true,
-                Ok(meta) => {
-                    tracing::warn!(
-                        file_type = ?meta.file_type(),
-                        session_id = %source_info.id,
-                        "compaction_checkpoints is not a real directory; skipping checkpoint copy",
-                    );
-                    false
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    tracing::warn!(
-                        session_id = %source_info.id,
-                        "compaction_checkpoints directory missing; skipping checkpoint copy",
-                    );
-                    false
-                }
-                Err(error) => return Err(error),
+            let metadata =
+                std::fs::symlink_metadata(source_session_dir.join("compaction_checkpoints"))?;
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compaction_checkpoints is not a real directory",
+                ));
             }
+            true
         };
         if checkpoint_dir_usable {
             for checkpoint_file in &checkpoint_files {
@@ -1317,34 +1482,18 @@ impl JsonlStorageAdapter {
                 let well_formed = relative.parent() == Some(Path::new("compaction_checkpoints"))
                     && relative.extension() == Some("json".as_ref());
                 if !well_formed {
-                    tracing::warn!(
-                        checkpoint_file = %checkpoint_file,
-                        session_id = %source_info.id,
-                        "skipping compaction checkpoint with unexpected path during copy",
-                    );
-                    continue;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsafe compaction checkpoint path during fork",
+                    ));
                 }
                 let src = source_session_dir.join(relative);
-                match std::fs::symlink_metadata(&src) {
-                    Ok(meta) if meta.file_type().is_file() => {}
-                    Ok(meta) => {
-                        tracing::warn!(
-                            path = %src.display(),
-                            file_type = ?meta.file_type(),
-                            session_id = %source_info.id,
-                            "compaction checkpoint source is not a regular file; skipping copy",
-                        );
-                        continue;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        tracing::warn!(
-                            path = %src.display(),
-                            session_id = %source_info.id,
-                            "compaction checkpoint file missing from source; skipping copy",
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
+                let metadata = std::fs::symlink_metadata(&src)?;
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compaction checkpoint source is not a regular file",
+                    ));
                 }
                 let dst = target_dir.join(relative);
                 if let Some(parent) = dst.parent() {
@@ -1461,6 +1610,38 @@ impl StorageAdapter for JsonlStorageAdapter {
             },
         )
         .await
+    }
+    async fn append_chat_tail_durable(
+        &self,
+        info: &Info,
+        tail: &super::responses_compaction::PersistedTail,
+    ) -> Result<bool, super::AppendTailError> {
+        let path = self.chat_file(info);
+        let tail = tail.clone();
+        let appended = tokio::task::spawn_blocking(move || {
+            super::responses_compaction::append_history_tail_durable(&path, &tail)
+        })
+        .await
+        .map_err(|error| {
+            super::AppendTailError::NotCommitted(io::Error::other(format!(
+                "typed tail append task failed: {error}"
+            )))
+        })?
+        .map_err(super::AppendTailError::NotCommitted)?;
+        if appended {
+            self.apply_summary_patch(
+                info,
+                super::summary_write::SummaryPatch {
+                    record_activity: true,
+                    chat_messages: Some(super::summary_write::CounterOp::Increment(1)),
+                    chat_format_version: Some(CHAT_FORMAT_VERSION),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(super::AppendTailError::Committed)?;
+        }
+        Ok(appended)
     }
     async fn append_cwd_switch_commit_aware(
         &self,
@@ -1655,6 +1836,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let chat_file = self.chat_file(info);
         self.ensure_chat_history(info, summary.chat_format_version)?;
         let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
+        self.repair_responses_recovery_sync(info, &chat_history)?;
         let updates = self.read_updates_jsonl(self.updates_file(info))?;
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
@@ -1710,6 +1892,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let chat_file = self.chat_file(info);
         self.ensure_chat_history(info, summary.chat_format_version)?;
         let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
+        self.repair_responses_recovery_sync(info, &chat_history)?;
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
             .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
@@ -1854,6 +2037,53 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn replace_chat_history_durable(
+        &self,
+        info: &Info,
+        operation_id: &str,
+        messages: &[ConversationItem],
+    ) -> Result<(), xai_chat_state::HistoryReplaceError> {
+        let path = self.chat_file(info);
+        let entries =
+            super::responses_compaction::persisted_entries_for_replacement(operation_id, messages)
+                .map_err(xai_chat_state::HistoryReplaceError::NotCommitted)?;
+        let path_for_write = path.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            super::responses_compaction::write_history_durable(&path_for_write, &entries)
+        })
+        .await
+        .map_err(|error| {
+            xai_chat_state::HistoryReplaceError::Indeterminate(io::Error::other(error))
+        })?;
+        if let Err(error) = write_result {
+            let committed = super::responses_compaction::read_history(&path)
+                .ok()
+                .and_then(|recovered| serde_json::to_value(recovered.conversation).ok())
+                == serde_json::to_value(messages).ok();
+            return Err(if committed {
+                xai_chat_state::HistoryReplaceError::Committed(error)
+            } else {
+                xai_chat_state::HistoryReplaceError::NotCommitted(error)
+            });
+        }
+
+        let cwd_switch_bookkeeping_generation = messages
+            .iter()
+            .filter_map(ConversationItem::working_directory_switch_generation)
+            .max()
+            .unwrap_or(0);
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                chat_messages: Some(super::summary_write::CounterOp::Set(messages.len())),
+                chat_format_version: Some(CHAT_FORMAT_VERSION),
+                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(xai_chat_state::HistoryReplaceError::Committed)
+    }
     async fn copy_session_data(
         &self,
         source_info: &Info,
@@ -1940,12 +2170,72 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
     ) -> io::Result<()> {
+        if checkpoint.kind != crate::extensions::notification::CompactionCheckpointKind::Builtin {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "builtin checkpoint writer received a non-builtin artifact",
+            ));
+        }
         let dir = self.session_dir(info).join("compaction_checkpoints");
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", checkpoint.checkpoint_id));
         let bytes = serde_json::to_vec_pretty(checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(path, bytes).await
+    }
+    async fn write_responses_compaction_checkpoint(
+        &self,
+        info: &Info,
+        relative_path: &str,
+        checkpoint: &super::responses_compaction::CompactionCheckpointFile,
+    ) -> io::Result<()> {
+        let session_dir = self.session_dir(info);
+        let relative_path = relative_path.to_string();
+        let checkpoint = checkpoint.clone();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::write_checkpoint_durable(
+                &session_dir,
+                &relative_path,
+                &checkpoint,
+            )
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+    async fn stage_responses_compaction_segment(
+        &self,
+        info: &Info,
+        staging: &super::responses_compaction::ResponsesCompactionSegmentStaging,
+    ) -> io::Result<()> {
+        let session_dir = self.session_dir(info);
+        let staging = staging.clone();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::stage_compaction_segment_durable(&session_dir, &staging)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+    async fn publish_responses_compaction_segment(
+        &self,
+        info: &Info,
+        checkpoint_id: &str,
+        operation_id: &str,
+        wrapper_digest: &str,
+    ) -> io::Result<super::responses_compaction::PublishedCompactionSegment> {
+        let session_dir = self.session_dir(info);
+        let checkpoint_id = checkpoint_id.to_string();
+        let operation_id = operation_id.to_string();
+        let wrapper_digest = wrapper_digest.to_string();
+        tokio::task::spawn_blocking(move || {
+            super::responses_compaction::publish_staged_compaction_segment_durable(
+                &session_dir,
+                &checkpoint_id,
+                &operation_id,
+                &wrapper_digest,
+            )
+        })
+        .await
+        .map_err(io::Error::other)?
     }
     async fn write_compaction_request(
         &self,

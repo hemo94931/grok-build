@@ -521,6 +521,7 @@ impl SessionActor {
         let items = vec![
             ConversationItem::System(xai_grok_sampling_types::SystemItem {
                 content: std::sync::Arc::<str>::from(LAZINESS_CLASSIFIER_PROMPT),
+                source: xai_grok_sampling_types::SystemSource::BaseInstructions,
             }),
             ConversationItem::User(xai_grok_sampling_types::UserItem {
                 content: vec![xai_grok_sampling_types::ContentPart::Text {

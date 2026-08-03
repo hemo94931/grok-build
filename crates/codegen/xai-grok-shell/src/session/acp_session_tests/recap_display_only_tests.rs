@@ -796,10 +796,10 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
     );
 }
 
-/// Recap wire shape: main-turn tools + `prompt_cache_key` = session id, so the
-/// request rides the parent turn's prefix cache instead of cold-prefilling.
+/// Recap wire shape: main-turn tools plus a stable, credential-bound cache key
+/// in a namespace isolated from both the main turn and other auxiliary calls.
 #[tokio::test(flavor = "current_thread")]
-async fn recap_request_rides_parent_prompt_cache() {
+async fn recap_request_uses_isolated_stable_prompt_cache() {
     use xai_grok_test_support::MockInferenceServer;
 
     let local = tokio::task::LocalSet::new();
@@ -818,7 +818,17 @@ async fn recap_request_rides_parent_prompt_cache() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            let model = cfg.model.clone();
             actor.chat_state_handle.update_sampling_config(cfg);
+            let mut credentials = actor.chat_state_handle.get_credentials().await;
+            credentials.api_key = Some("test-key".to_string());
+            credentials.auth_type = xai_chat_state::AuthType::ApiKey;
+            actor.chat_state_handle.update_credentials(credentials);
+            let expected_cache_key = actor
+                .cache_routing_for_model(&model)
+                .await
+                .expect("an API key must produce credential-bound cache routing")
+                .aux_prompt_cache_key("recap");
 
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("you are a coding agent"),
@@ -848,10 +858,18 @@ async fn recap_request_rides_parent_prompt_cache() {
             );
 
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
+            let sent_cache_key = body["prompt_cache_key"]
+                .as_str()
+                .expect("credential-bound recap must send a cache key");
             assert_eq!(
-                body["prompt_cache_key"].as_str(),
-                Some(actor.session_info.id.to_string().as_str()),
-                "prompt_cache_key must be the parent session id for sticky routing"
+                sent_cache_key,
+                expected_cache_key.as_str(),
+                "recap must reuse its stable isolated cache namespace"
+            );
+            assert_ne!(
+                sent_cache_key,
+                actor.session_info.id.to_string().as_str(),
+                "recap cache routing must not expose or reuse the main session id"
             );
             let main_turn_specs =
                 actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
@@ -1026,9 +1044,10 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
         .await;
 }
 
-/// A `/btw` call sends the main turn's tools and the session id as `prompt_cache_key`, so it reuses the parent's cached prefix.
+/// A `/btw` call sends the main turn's tools and uses a stable,
+/// credential-bound cache namespace isolated from the parent and recap.
 #[tokio::test(flavor = "current_thread")]
-async fn side_question_request_rides_parent_prompt_cache() {
+async fn side_question_request_uses_isolated_stable_prompt_cache() {
     use xai_grok_test_support::MockInferenceServer;
 
     let local = tokio::task::LocalSet::new();
@@ -1045,7 +1064,17 @@ async fn side_question_request_rides_parent_prompt_cache() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = server.url();
             cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            let model = cfg.model.clone();
             actor.chat_state_handle.update_sampling_config(cfg);
+            let mut credentials = actor.chat_state_handle.get_credentials().await;
+            credentials.api_key = Some("test-key".to_string());
+            credentials.auth_type = xai_chat_state::AuthType::ApiKey;
+            actor.chat_state_handle.update_credentials(credentials);
+            let expected_cache_key = actor
+                .cache_routing_for_model(&model)
+                .await
+                .expect("an API key must produce credential-bound cache routing")
+                .aux_prompt_cache_key("side_question");
 
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("you are a coding agent"),
@@ -1079,10 +1108,18 @@ async fn side_question_request_rides_parent_prompt_cache() {
             );
 
             let body = btw_req.body.as_ref().expect("btw body must be JSON");
+            let sent_cache_key = body["prompt_cache_key"]
+                .as_str()
+                .expect("credential-bound side question must send a cache key");
             assert_eq!(
-                body["prompt_cache_key"].as_str(),
-                Some(actor.session_info.id.to_string().as_str()),
-                "prompt_cache_key must be the parent session id for sticky routing"
+                sent_cache_key,
+                expected_cache_key.as_str(),
+                "side question must reuse its stable isolated cache namespace"
+            );
+            assert_ne!(
+                sent_cache_key,
+                actor.session_info.id.to_string().as_str(),
+                "side-question cache routing must not expose or reuse the main session id"
             );
             let tools = body["tools"].as_array().expect("tools must be present");
 

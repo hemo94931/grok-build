@@ -54,7 +54,9 @@ fn log_prompt_cache_hit(
     );
 }
 
-/// What differs between the two calls that ride the parent's prompt cache. The shared parts live in [`SessionActor::parent_cached_request`].
+/// What differs between the two auxiliary calls that replay the parent's
+/// cacheable prefix under their own isolated cache namespaces. The shared
+/// parts live in [`SessionActor::parent_cached_request`].
 struct AuxCall {
     items: Vec<ConversationItem>,
     tools: Vec<ToolSpec>,
@@ -66,6 +68,8 @@ struct AuxCall {
     backend: crate::sampling::ApiBackend,
     conv_id: String,
     req_id: String,
+    /// Stable namespace for this auxiliary request, isolated from the main turn.
+    prompt_cache_key: Option<String>,
 }
 
 impl SessionActor {
@@ -79,13 +83,21 @@ impl SessionActor {
         let parent_session_id = self.session_info.id.to_string();
         let asked_at = chrono::Utc::now();
 
+        // Full conversation snapshot including system prompt, tool calls, and results.
+        // A live server checkpoint is expanded into its validated lossless
+        // portable history first; if that fails the side question fails
+        // closed before preparing a client or sending any HTTP request.
+        let conversation = self
+            .portable_history_for_request(&self.chat_state_handle.get_conversation().await)
+            .map_err(SideQuestionError::CheckpointHistory)?;
+
         let sampling_client = self
             .prepare_chat_completion(false)
             .await
             .map_err(|e| SideQuestionError::PrepareClient(e.to_string()))?;
-
-        // Full conversation snapshot including system prompt, tool calls, and results.
-        let conversation = self.chat_state_handle.get_conversation().await;
+        // The Messages backend rejects thinking blocks when no top-level
+        // thinking configuration is present; other backends keep reasoning so
+        // their cached prefix remains identical to the parent turn.
         let mut items: Vec<ConversationItem> =
             if sampling_client.api_backend().requires_reasoning_strip() {
                 xai_chat_state::compaction_utils::strip_reasoning_blocks(conversation)
@@ -103,6 +115,16 @@ impl SessionActor {
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
         let reasoning_effort = sampling_config.as_ref().and_then(|c| c.reasoning_effort);
         let model = sampling_config.map(|c| c.model).unwrap_or_default();
+
+        // Stage-D3 stable cache routing: auxiliary requests get a stable
+        // but isolated cache namespace — side-question tokens must never
+        // share or pollute the main session's prompt-cache route (or its
+        // cache-affinity metrics). Best-effort: no key when routing is
+        // unavailable.
+        let prompt_cache_key = self
+            .cache_routing_for_model(&model)
+            .await
+            .map(|routing| routing.aux_prompt_cache_key("side_question"));
 
         let persist = |answer: String, success: bool, error: Option<String>, attempts: u32| {
             let _ = self.notifications.persistence_tx.send(PersistenceMsg::Btw(
@@ -130,6 +152,7 @@ impl SessionActor {
             backend: sampling_client.api_backend(),
             conv_id: btw_session_id.clone(),
             req_id: format!("xai-btw-{}", uuid::Uuid::new_v4()),
+            prompt_cache_key,
         });
 
         // conversation_collect is one-shot (no sampler-actor retry); /btw adds
@@ -203,8 +226,11 @@ impl SessionActor {
         (instruction, tool_specs, self.hosted_tools_for_turn())
     }
 
-    /// Request skeleton for an auxiliary call that replays the parent conversation under the parent's `prompt_cache_key`.
-    /// Temperature stays unset: cli-chat-proxy may inject a `thinking` config, and the Messages API then requires temperature == 1.
+    /// Request skeleton for an auxiliary call that replays the parent
+    /// conversation and forwards the caller's credential-bound, isolated
+    /// `prompt_cache_key` when one can be derived safely.
+    /// Temperature stays unset: cli-chat-proxy may inject a `thinking` config,
+    /// and the Messages API then requires temperature == 1.
     fn parent_cached_request(&self, call: AuxCall) -> ConversationRequest {
         let session_id = self.session_info.id.to_string();
         // Only the Responses mapping sends the cache key. On the other backends the conv id is what ties a call to its conversation,
@@ -224,9 +250,9 @@ impl SessionActor {
             reasoning_effort: call.reasoning_effort,
             x_grok_conv_id: Some(conv_id),
             x_grok_req_id: Some(call.req_id),
-            x_grok_session_id: Some(session_id.clone()),
+            x_grok_session_id: Some(session_id),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            prompt_cache_key: Some(session_id),
+            prompt_cache_key: call.prompt_cache_key,
             ..Default::default()
         }
     }
@@ -250,6 +276,21 @@ impl SessionActor {
         let recap_epoch = self.recap_epoch.get();
 
         let conversation = self.chat_state_handle.get_conversation().await;
+        // Checkpoint-aware expansion: when a server checkpoint is live, the
+        // recap must be built from the validated lossless portable history +
+        // typed tail — never from the checkpoint wrapper/output. If the
+        // sidecar cannot be read losslessly the recap fails closed (no HTTP),
+        // and it never triggers lossy salvage.
+        let conversation = match self.portable_history_for_request(&conversation) {
+            Ok(conversation) => conversation,
+            Err(error) => {
+                tracing::warn!(?error, "recap: checkpoint portable history unavailable");
+                if !auto {
+                    self.emit_recap_unavailable().await;
+                }
+                return;
+            }
+        };
         let main_turns = session_recap::main_turn_count(&conversation);
 
         let stored = self.last_recap_main_turn.get();
@@ -355,6 +396,12 @@ impl SessionActor {
             backend: sampling_client.api_backend(),
             conv_id: x_grok_conv_id.clone(),
             req_id: x_grok_req_id.clone(),
+            // Recap shares the parent's provider route while using a stable
+            // namespace isolated from both main turns and side questions.
+            prompt_cache_key: self
+                .cache_routing_for_model(&model)
+                .await
+                .map(|routing| routing.aux_prompt_cache_key("recap")),
         });
 
         let response = match sampling_client.conversation_collect(request).await {

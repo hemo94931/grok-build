@@ -2092,15 +2092,6 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none() {
                 self.refresh_token_if_expired().await;
             }
-            if self.tool_context.task_output_token_budget.is_none()
-                && let Some(trigger_info) = self.check_auto_compact_needed().await
-                && let Err(e) = self.run_compact_only(trigger_info).await
-            {
-                tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
-                if Self::is_auth_compact_error(&e) {
-                    return Err(self.surface_compact_auth_failure(e).await);
-                }
-            }
             let backend_search_active = self.backend_search_active();
             tracing::debug!(
                 backend_search_active,
@@ -2169,6 +2160,28 @@ impl SessionActor {
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
+            if self.tool_context.task_output_token_budget.is_none()
+                && let Some(trigger_info) = self.check_auto_compact_needed().await
+            {
+                match self
+                    .run_compact_only_with_request(trigger_info, Some(request.clone()))
+                    .await
+                {
+                    Ok(()) => {
+                        auth_retry_schedule.reset_on_success();
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Pre-sampling auto-compaction failed");
+                        if Self::is_compaction_cancelled(&error) {
+                            return Err(error);
+                        }
+                        if Self::is_auth_compact_error(&error) {
+                            return Err(self.surface_compact_auth_failure(error).await);
+                        }
+                    }
+                }
+            }
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2399,6 +2412,10 @@ impl SessionActor {
                 );
             }
             self.record_response_token_usage(&response, Some(model_duration_ms));
+            if let Some(usage) = response.usage.as_ref() {
+                let model_id = self.current_model_id().await;
+                self.record_prompt_cache_observation(usage, &model_id).await;
+            }
             let response_completed = self.response_completed_update(&response);
             if let Some(pt) = prompt_timing.take() {
                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;
@@ -2696,14 +2713,14 @@ impl SessionActor {
             }
             tool_turn_count = next_turn;
             if self.tool_context.task_output_token_budget.is_none()
-                && let Some(trigger_info) = self.check_preflight_overflow().await
+                && self.check_preflight_overflow().await.is_some()
             {
-                if let Err(e) = self.run_compact_only(trigger_info).await {
-                    tracing::error!(error = %e, "Preflight overflow compaction failed");
-                    if Self::is_auth_compact_error(&e) {
-                        return Err(self.surface_compact_auth_failure(e).await);
-                    }
-                }
+                // Re-enter through the exact-request pre-provider stage on the
+                // next loop; that stage freezes the new tool-result tail before
+                // invoking server-first compaction.
+                self.compaction
+                    .force_compact
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
         }

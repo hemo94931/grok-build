@@ -234,6 +234,8 @@ pub(crate) async fn spawn_session_actor(
     compaction_verbatim_input: bool,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
+    server_compaction_enabled: bool,
+    compact_model: Option<String>,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -559,11 +561,20 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
+    let mut resumed_checkpoint_active = false;
     if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
         || initial_last_compaction.is_some())
         && let Some(mut snap) = chat_state_handle.snapshot().await
     {
+        // Stage-D3 hint: a resumed session whose conversation already
+        // carries a checkpoint classifies subsequent usage as
+        // post_compact_subsequent (a checkpoint committed before any
+        // post-compact usage still reports post_compact_first).
+        resumed_checkpoint_active = snap
+            .conversation
+            .first()
+            .is_some_and(|item| item.is_responses_checkpoint());
         snap.prompt_index = initial_prompt_texts.len();
         snap.prompt_texts = initial_prompt_texts;
         if initial_total_tokens > 0 {
@@ -745,7 +756,8 @@ pub(crate) async fn spawn_session_actor(
     let initial_agent_type = Some(initial_agent_name.clone());
     let compaction_policy = xai_grok_agent::CompactionPolicy {
         auto_compact_threshold_percent: auto_compact_threshold_percent as u32,
-        compact_model: None,
+        compact_model,
+        server_compaction: server_compaction_enabled,
         memory_flush_enabled: memory_config.as_ref().is_some_and(|mc| mc.flush.enabled),
         wall_clock_budget_secs: crate::util::config::resolve_compaction_wall_clock_budget_secs(
             remote_settings
@@ -1104,7 +1116,13 @@ pub(crate) async fn spawn_session_actor(
         startup_hints.preserve_inherited_system,
         &system_prompt,
     );
-    if !startup_hints.preserve_inherited_system
+    // Variant-aware: both the V1 wrapper and the V2 wrapper are local-only
+    // checkpoint items that must not be re-installed over or re-sent.
+    let has_active_wrapper = conversation
+        .first()
+        .is_some_and(ConversationItem::is_responses_checkpoint);
+    if !has_active_wrapper
+        && !startup_hints.preserve_inherited_system
         && !conversation_has_project_instructions(&conversation)
         && let Some(agents_md_reminder) = agent.agents_md_user_reminder()
     {
@@ -1140,8 +1158,9 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
-    persist_chat_history_jsonl_sync(&session_info, &conversation);
-    chat_state_handle.replace_conversation(conversation);
+    if !has_active_wrapper {
+        chat_state_handle.replace_conversation(conversation);
+    }
     let feedback_client = feedback_proxy_url.map(|base_url| {
         let mut client =
             crate::agent::feedback_client::FeedbackClient::new(base_url, feedback_user_token)
@@ -1590,6 +1609,7 @@ pub(crate) async fn spawn_session_actor(
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
@@ -1759,6 +1779,9 @@ pub(crate) async fn spawn_session_actor(
         session_turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
+        post_compact_usage_state: std::sync::atomic::AtomicU8::new(u8::from(
+            resumed_checkpoint_active,
+        )),
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
@@ -2189,6 +2212,8 @@ pub(crate) async fn spawn_session_on_thread(
     compaction_verbatim_input: bool,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
+    server_compaction_enabled: bool,
+    compact_model: Option<String>,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -2363,6 +2388,8 @@ pub(crate) async fn spawn_session_on_thread(
                         compaction_verbatim_input,
                         compaction_tool_choice,
                         two_pass_enabled,
+                        server_compaction_enabled,
+                        compact_model,
                         buffering_settings,
                         origin_client,
                         codebase_indexes,

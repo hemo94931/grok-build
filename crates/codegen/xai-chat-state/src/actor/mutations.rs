@@ -8,7 +8,11 @@ use xai_grok_sampling_types::{
 use super::ChatStateActor;
 use super::request_builder::HARD_CLEAR_PLACEHOLDER;
 use crate::events::ChatStateEvent;
-use crate::types::ChatStateSnapshot;
+use crate::types::{
+    ChatCompactionSnapshot, ChatStateSnapshot, CheckpointReplayStatus, CommitCompaction,
+    CommitCompactionResult, ReplaceSystemHeadResult, RequestIdentityBindResult,
+    RequestIdentityBinding,
+};
 
 /// Static string label for tracing on `ConversationItem` (avoids pulling
 /// the `Role` enum into the format string).
@@ -20,6 +24,7 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::ToolResult(_) => "tool_result",
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
         ConversationItem::Reasoning(_) => "reasoning",
+        ConversationItem::ResponsesCompactionCheckpoint(_) => "responses_compaction_checkpoint",
     }
 }
 
@@ -40,15 +45,80 @@ impl ChatStateActor {
     /// over (`ChatState::new()`, `push_user_message()`, `BuildConversationRequest`).
     /// Do NOT call from read handlers — background tasks run concurrently with
     /// tool execution and would misidentify in-flight calls as dangling.
-    pub(super) fn ensure_conversation_integrity(&mut self) {
-        self.ensure_conversation_integrity_with_reason(DanglingToolCallReason::UserCancelled);
+    pub(super) async fn ensure_conversation_integrity(&mut self) {
+        self.ensure_conversation_integrity_with_reason(DanglingToolCallReason::UserCancelled)
+            .await;
     }
 
     /// Like [`Self::ensure_conversation_integrity`] but takes an explicit reason.
-    pub(super) fn ensure_conversation_integrity_with_reason(
+    pub(super) async fn ensure_conversation_integrity_with_reason(
         &mut self,
         reason: DanglingToolCallReason,
     ) {
+        if let Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) =
+            self.state.conversation.first()
+        {
+            // Keep the raw canonical prefix opaque: repair only a typed-tail copy,
+            // then cross the same durable replace boundary before exposing it.
+            let checkpoint_id = checkpoint.checkpoint_id.clone();
+            let mut tail = self.state.conversation[1..].to_vec();
+            let deduped = dedup_duplicate_tool_results(&mut tail);
+            let repaired = repair_dangling_tool_calls(&mut tail, reason);
+            if repaired == 0 && deduped == 0 {
+                return;
+            }
+            let mut replacement = vec![self.state.conversation[0].clone()];
+            replacement.extend(tail);
+            let operation_id = format!(
+                "repair-{checkpoint_id}-{}",
+                self.state.history_revision.saturating_add(1)
+            );
+            let persisted = self
+                .persistence
+                .replace_history_and_ack(&operation_id, &replacement)
+                .await;
+            match persisted {
+                Ok(Ok(())) => {}
+                Ok(Err(crate::persistence::HistoryReplaceError::Committed(error))) => {
+                    tracing::warn!(%error, "repaired checkpoint tail committed but acknowledgement was lost");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "checkpoint tail repair was not committed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::error!("checkpoint tail repair acknowledgement was dropped");
+                    return;
+                }
+            }
+            tracing::info!(
+                deduped_count = deduped,
+                repaired_count = repaired,
+                "Repaired typed checkpoint tail"
+            );
+            self.snapshot_turn_slice();
+            let before_tokens =
+                super::state::estimate_conversation_tokens(&self.state.conversation);
+            let after_tokens = super::state::estimate_conversation_tokens(&replacement);
+            if after_tokens >= before_tokens {
+                self.state.estimated_tokens_since_model = self
+                    .state
+                    .estimated_tokens_since_model
+                    .saturating_add(after_tokens - before_tokens);
+            } else {
+                self.state.estimated_tokens_since_model = self
+                    .state
+                    .estimated_tokens_since_model
+                    .saturating_sub(before_tokens - after_tokens);
+            }
+            self.state.conversation = replacement;
+            self.state.active_tail_sequence =
+                self.state.conversation.len().saturating_sub(1) as u64;
+            self.state.bump_history_revision();
+            self.rebase_turn_capture_offset();
+            return;
+        }
+
         // In-place integrity repair can add/remove items ahead of an active capture's
         // boundary, so snapshot + rebase the offset like the replace/restore paths.
         self.snapshot_turn_slice();
@@ -66,15 +136,17 @@ impl ChatStateActor {
                 "Repaired dangling tool calls in conversation"
             );
             self.persistence.replace_history(&self.state.conversation);
+            self.state.bump_history_revision();
         }
         self.rebase_turn_capture_offset();
     }
 
     /// Repair dangling tool calls after a harness-initiated halt.
-    pub(super) fn repair_dangling_after_harness_halt(&mut self, class: &'static str) {
+    pub(super) async fn repair_dangling_after_harness_halt(&mut self, class: &'static str) {
         self.ensure_conversation_integrity_with_reason(DanglingToolCallReason::HarnessHalted {
             class,
-        });
+        })
+        .await;
     }
 
     /// Out-of-band history repair (`x.ai/session/repair`): run
@@ -133,15 +205,60 @@ impl ChatStateActor {
                     .saturating_sub(old_tokens - new_tokens)
             };
             *existing = authoritative;
+            self.state.bump_history_revision();
         } else {
             self.state.estimated_tokens_since_model +=
                 super::state::estimate_item_tokens(&authoritative);
             self.state.conversation.push(authoritative);
+            self.state.bump_history_revision();
         }
     }
 
-    /// Push any conversation item (user, assistant, or tool result) and persist it.
-    pub(super) fn push_message(&mut self, item: ConversationItem) {
+    /// Persist one provider-visible item, using the typed journal whenever a
+    /// server checkpoint is active. Memory is updated only after persistence
+    /// reports that the authoritative history contains the item.
+    pub(super) async fn persist_append(&mut self, item: &ConversationItem) -> bool {
+        let Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) =
+            self.state.conversation.first()
+        else {
+            self.persistence.persist_message(item);
+            return true;
+        };
+        let sequence = self.state.active_tail_sequence.saturating_add(1);
+        let append = crate::types::TailAppend {
+            operation_id: format!(
+                "tail-{}-{}-{sequence}",
+                checkpoint.checkpoint_id, checkpoint.branch_id
+            ),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            branch_id: checkpoint.branch_id.clone(),
+            sequence,
+            prompt_index: self.state.prompt_index,
+            item: item.clone(),
+        };
+        let persisted = self.persistence.append_tail_and_ack(&append).await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(crate::persistence::HistoryReplaceError::Committed(error))) => {
+                tracing::warn!(%error, sequence, "typed checkpoint tail committed but acknowledgement was lost");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, sequence, "typed checkpoint tail was not committed");
+                return false;
+            }
+            Err(_) => {
+                tracing::error!(
+                    sequence,
+                    "typed checkpoint tail acknowledgement was dropped"
+                );
+                return false;
+            }
+        }
+        self.state.active_tail_sequence = sequence;
+        true
+    }
+
+    pub(super) fn apply_pushed_message(&mut self, item: ConversationItem) {
         let count_in_delta = !matches!(item, ConversationItem::Assistant(_));
         if count_in_delta {
             let estimated_tokens = super::state::estimate_item_tokens(&item);
@@ -154,8 +271,15 @@ impl ChatStateActor {
                 "ChatState: push_message updated estimated_tokens_since_model"
             );
         }
-        self.persistence.persist_message(&item);
         self.state.conversation.push(item);
+        self.state.bump_history_revision();
+    }
+
+    /// Push any conversation item (user, assistant, or tool result) and persist it.
+    pub(super) async fn push_message(&mut self, item: ConversationItem) {
+        if self.persist_append(&item).await {
+            self.apply_pushed_message(item);
+        }
     }
 
     /// Push a user message, ensuring conversation integrity first.
@@ -168,29 +292,22 @@ impl ChatStateActor {
     /// Also runs [`prune_retained_conversation`] to eagerly hard-clear very
     /// old tool results from the in-memory state, bounding long-session
     /// retained memory without waiting for the context-window threshold.
-    pub(super) fn push_user_message(&mut self, item: ConversationItem) {
-        self.push_user_message_with_repair_reason(item, DanglingToolCallReason::UserCancelled);
+    pub(super) async fn push_user_message(&mut self, item: ConversationItem) {
+        self.push_user_message_with_repair_reason(item, DanglingToolCallReason::UserCancelled)
+            .await;
     }
 
     /// Like [`Self::push_user_message`] but takes an explicit repair reason.
-    pub(super) fn push_user_message_with_repair_reason(
+    pub(super) async fn push_user_message_with_repair_reason(
         &mut self,
         item: ConversationItem,
         reason: DanglingToolCallReason,
     ) {
-        self.ensure_conversation_integrity_with_reason(reason);
-        let estimated_tokens = super::state::estimate_item_tokens(&item);
-        self.state.estimated_tokens_since_model += estimated_tokens;
-        tracing::debug!(
-            item_kind = item_kind_str(&item),
-            estimated_tokens_delta = estimated_tokens,
-            estimated_total = self.state.total_tokens + self.state.estimated_tokens_since_model,
-            model_reported_total = self.state.total_tokens,
-            "ChatState: push_user_message updated estimated_tokens_since_model"
-        );
-        self.persistence.persist_message(&item);
-        self.state.conversation.push(item);
-        self.prune_retained_conversation();
+        self.ensure_conversation_integrity_with_reason(reason).await;
+        if self.persist_append(&item).await {
+            self.apply_pushed_message(item);
+            self.prune_retained_conversation();
+        }
     }
 
     /// Eagerly hard-clear tool results from very old turns in the retained
@@ -235,7 +352,12 @@ impl ChatStateActor {
     /// on disk mirrors the in-memory state — both lose old bulk content but
     /// `updates.jsonl` retains the original data for replay.
     pub(super) fn prune_retained_conversation(&mut self) -> usize {
-        if !self.pruning_config.enabled {
+        if !self.pruning_config.enabled
+            || matches!(
+                self.state.conversation.first(),
+                Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+            )
+        {
             return 0;
         }
         // Fast exit: not enough turns have elapsed for any hard-clear to apply.
@@ -303,6 +425,7 @@ impl ChatStateActor {
                 "ChatState: in-memory tool-result prune"
             );
             self.persistence.replace_history(&self.state.conversation);
+            self.state.bump_history_revision();
         }
 
         cleared
@@ -333,6 +456,7 @@ impl ChatStateActor {
                     xai_grok_sampling_types::reasoning_item_text(r).len()
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
                 }
+                ConversationItem::ResponsesCompactionCheckpoint(_) => 0,
             })
             .sum()
     }
@@ -421,6 +545,150 @@ impl ChatStateActor {
         });
     }
 
+    pub(super) fn bind_request_identity(
+        &mut self,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
+    ) -> RequestIdentityBinding {
+        if self.state.bound_request_identity.as_ref() != Some(&identity) {
+            self.state.request_identity_generation =
+                self.state.request_identity_generation.saturating_add(1);
+            self.state.bound_request_identity = Some(identity.clone());
+        }
+        let checkpoint_count = self
+            .state
+            .conversation
+            .iter()
+            .filter(|item| item.is_responses_checkpoint())
+            .count();
+        let first_checkpoint = self
+            .state
+            .conversation
+            .first()
+            .and_then(|item| item.as_responses_checkpoint());
+        let checkpoint_status = match first_checkpoint {
+            Some(checkpoint) if checkpoint_count == 1 => {
+                if checkpoint.identity == identity {
+                    CheckpointReplayStatus::Replayable
+                } else {
+                    CheckpointReplayStatus::MigrationRequired
+                }
+            }
+            Some(_) => CheckpointReplayStatus::InvalidCheckpoint,
+            None if checkpoint_count == 0 => CheckpointReplayStatus::NoCheckpoint,
+            None => CheckpointReplayStatus::InvalidCheckpoint,
+        };
+        RequestIdentityBinding {
+            request_identity_generation: self.state.request_identity_generation,
+            checkpoint_status,
+        }
+    }
+
+    pub(super) fn bind_request_identity_at_revision(
+        &mut self,
+        identity: xai_grok_sampling_types::CheckpointIdentity,
+        expected_history_revision: u64,
+    ) -> RequestIdentityBindResult {
+        if self.state.history_revision != expected_history_revision {
+            return RequestIdentityBindResult::StaleHistory {
+                current_revision: self.state.history_revision,
+            };
+        }
+        RequestIdentityBindResult::Bound {
+            binding: self.bind_request_identity(identity),
+            compaction_snapshot: Box::new(self.compaction_snapshot()),
+        }
+    }
+
+    pub(super) fn compaction_snapshot(&self) -> ChatCompactionSnapshot {
+        ChatCompactionSnapshot {
+            history_revision: self.state.history_revision,
+            request_identity_generation: self.state.request_identity_generation,
+            prompt_index: self.state.prompt_index,
+            total_tokens: self
+                .state
+                .total_tokens
+                .saturating_add(self.state.estimated_tokens_since_model),
+            conversation: self.state.conversation.clone(),
+            sampling_config: self.state.sampling_config.clone(),
+            bound_request_identity: self.state.bound_request_identity.clone(),
+        }
+    }
+
+    pub(super) async fn commit_compaction(
+        &mut self,
+        commit: CommitCompaction,
+    ) -> CommitCompactionResult {
+        if self.state.history_revision != commit.expected_history_revision
+            || self.state.request_identity_generation != commit.expected_request_identity_generation
+        {
+            return CommitCompactionResult::Superseded {
+                history_revision: self.state.history_revision,
+                request_identity_generation: self.state.request_identity_generation,
+            };
+        }
+        let validation = xai_grok_sampling_types::ConversationRequest {
+            items: commit.replacement.clone(),
+            ..Default::default()
+        }
+        .validate_for_backend(&xai_grok_sampling_types::ApiBackend::Responses);
+        if let Err(error) = validation {
+            return CommitCompactionResult::PersistenceFailed(
+                crate::persistence::HistoryReplaceError::NotCommitted(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                )),
+            );
+        }
+        let persistence_result = self
+            .persistence
+            .replace_history_and_ack(&commit.operation_id, &commit.replacement)
+            .await;
+        match persistence_result {
+            Ok(Ok(())) => {}
+            Ok(Err(crate::persistence::HistoryReplaceError::Committed(error))) => {
+                tracing::warn!(%error, "history committed but persistence acknowledgement was lost");
+            }
+            Ok(Err(error)) => return CommitCompactionResult::PersistenceFailed(error),
+            Err(_) => {
+                return CommitCompactionResult::PersistenceFailed(
+                    crate::persistence::HistoryReplaceError::Indeterminate(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "history replacement acknowledgement dropped",
+                    )),
+                );
+            }
+        }
+
+        self.snapshot_turn_slice();
+        if let Some(capture) = &mut self.state.turn_capture {
+            capture.compaction_occurred = true;
+        }
+        self.state.conversation = commit.replacement;
+        self.state.active_tail_sequence = if matches!(
+            self.state.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            self.state.conversation.len().saturating_sub(1) as u64
+        } else {
+            0
+        };
+        self.state.bump_history_revision();
+        self.state.total_tokens = commit.committed_total_tokens;
+        self.state.estimate_at_last_response = commit.committed_total_tokens;
+        self.state.estimated_tokens_since_model = 0;
+        self.rebase_turn_capture_offset();
+        self.send_event(ChatStateEvent::ConversationReset {
+            new_len: self.state.conversation.len(),
+        });
+        self.send_event(ChatStateEvent::TokensUpdated {
+            total_tokens: commit.committed_total_tokens,
+        });
+        CommitCompactionResult::Committed {
+            history_revision: self.state.history_revision,
+            request_identity_generation: self.state.request_identity_generation,
+        }
+    }
+
     /// Replace the entire conversation, persist, re-estimate `total_tokens`,
     /// and emit reset + token-update events.
     ///
@@ -434,6 +702,20 @@ impl ChatStateActor {
         items: Vec<ConversationItem>,
         is_compaction: bool,
     ) {
+        if matches!(
+            self.state.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            let unchanged = serde_json::to_value(&self.state.conversation).ok()
+                == serde_json::to_value(&items).ok();
+            if !unchanged {
+                self.state.invalidate_request_identity();
+                tracing::warn!(
+                    "generic history replacement rejected while a Responses checkpoint is active"
+                );
+            }
+            return;
+        }
         self.snapshot_turn_slice();
         if is_compaction && let Some(cap) = &mut self.state.turn_capture {
             cap.compaction_occurred = true;
@@ -444,18 +726,34 @@ impl ChatStateActor {
         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
         self.persistence.replace_history(&items);
         let base_estimate = super::state::estimate_conversation_tokens(&items);
-        let mut estimated_tokens =
-            if is_compaction && pre_replace_total > 0 && self.state.estimate_at_last_response > 0 {
-                let ratio = pre_replace_total as f64 / self.state.estimate_at_last_response as f64;
-                (base_estimate as f64 * ratio).round() as u64
-            } else {
-                base_estimate
-            };
-        // Compaction must never appear to increase usage.
-        if is_compaction && pre_replace_total > 0 {
+        let is_server_checkpoint = matches!(
+            items.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        );
+        let mut estimated_tokens = if is_server_checkpoint {
+            base_estimate
+        } else if is_compaction && pre_replace_total > 0 && self.state.estimate_at_last_response > 0
+        {
+            let ratio = pre_replace_total as f64 / self.state.estimate_at_last_response as f64;
+            (base_estimate as f64 * ratio).round() as u64
+        } else {
+            base_estimate
+        };
+        // Builtin compaction must never appear to increase usage. Server
+        // checkpoints use their validated exact seed instead of a cap.
+        if is_compaction && !is_server_checkpoint && pre_replace_total > 0 {
             estimated_tokens = estimated_tokens.min(pre_replace_total);
         }
         self.state.conversation = items;
+        self.state.active_tail_sequence = if matches!(
+            self.state.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            self.state.conversation.len().saturating_sub(1) as u64
+        } else {
+            0
+        };
+        self.state.bump_history_revision();
         self.state.estimated_tokens_since_model = 0;
         self.state.total_tokens = estimated_tokens;
         self.state.estimate_at_last_response =
@@ -478,18 +776,33 @@ impl ChatStateActor {
     /// shallow) rather than `mem::take`n: `replace_conversation` snapshots the
     /// in-flight turn-capture tail from `state.conversation` before swapping,
     /// so the state must stay intact until then.
-    pub(super) fn replace_system_head(&mut self, prompt: &str) -> bool {
+    pub(super) fn replace_system_head(&mut self, prompt: &str) -> ReplaceSystemHeadResult {
+        if let Some(ConversationItem::ResponsesCompactionCheckpoint(checkpoint)) =
+            self.state.conversation.first()
+        {
+            // Checkpoint compatibility is bound to the base-instructions hash.
+            // A different system head requires migration without mutating the
+            // active checkpoint or its typed tail.
+            let matches = xai_grok_sampling_types::base_instructions_sha256(prompt.trim())
+                == checkpoint.identity.base_instructions_sha256;
+            if matches {
+                return ReplaceSystemHeadResult::Unchanged;
+            }
+            self.state.invalidate_request_identity();
+            return ReplaceSystemHeadResult::MigrationRequired;
+        }
         if let Some(ConversationItem::System(sys)) = self.state.conversation.first()
             && crate::conversation_util::canonical_system_prompt_eq(sys.content.as_ref(), prompt)
         {
-            return false;
+            return ReplaceSystemHeadResult::Unchanged;
         }
         let mut conversation = self.state.conversation.clone();
         let changed =
             crate::conversation_util::replace_or_insert_system_head(&mut conversation, prompt);
         debug_assert!(changed, "head mismatch must produce a change");
+        self.state.invalidate_request_identity();
         self.replace_conversation(conversation, false);
-        changed
+        ReplaceSystemHeadResult::Replaced
     }
 
     /// Restore all state fields from a snapshot.
@@ -498,6 +811,14 @@ impl ChatStateActor {
         // Harness trace buffers are transient (not part of the snapshot) and
         // intentionally survive a restore — see `replace_conversation`.
         self.state.conversation = snap.conversation;
+        self.state.active_tail_sequence = if matches!(
+            self.state.conversation.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ) {
+            self.state.conversation.len().saturating_sub(1) as u64
+        } else {
+            0
+        };
         self.rebase_turn_capture_offset();
         self.state.sampling_config = snap.sampling_config;
         self.state.prompt_index = snap.prompt_index;
@@ -514,6 +835,17 @@ impl ChatStateActor {
         self.state.turn_start_ms = snap.turn_start_ms;
         self.state.last_compaction_prompt_index = snap.last_compaction_prompt_index;
         self.state.credentials = snap.credentials;
+        self.state.history_revision = self
+            .state
+            .history_revision
+            .max(snap.history_revision)
+            .saturating_add(1);
+        self.state.request_identity_generation = self
+            .state
+            .request_identity_generation
+            .max(snap.request_identity_generation)
+            .saturating_add(1);
+        self.state.bound_request_identity = snap.bound_request_identity;
         // Drop abandoned prompt billing; session ledger is lifetime.
         self.state.prompt_usage = None;
     }

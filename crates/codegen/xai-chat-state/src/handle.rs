@@ -4,14 +4,15 @@ use std::collections::BTreeSet;
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DanglingToolCallReason, SamplingConfig, TokenUsage,
-    ToolSpec, TraceContext,
+    CheckpointIdentity, ConversationItem, ConversationRequest, DanglingToolCallReason,
+    SamplingConfig, TokenUsage, ToolSpec, TraceContext,
 };
 
 use crate::commands::{ChatStateCommand, RepairHistoryBlocked, StrictAppendAck, StrictAppendError};
 use crate::types::{
-    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    TurnCapture,
+    AutoCompactTrigger, ChatCompactionSnapshot, ChatStateSnapshot, CommitCompaction,
+    CommitCompactionResult, ConversationCounts, Credentials, NotificationMeta,
+    ReplaceSystemHeadResult, RequestIdentityBindResult, RequestIdentityBinding, TurnCapture,
 };
 
 /// Handle to communicate with ChatStateActor.
@@ -170,6 +171,37 @@ impl ChatStateHandle {
             .send(ChatStateCommand::UpdateSamplingConfig { config });
     }
 
+    pub fn invalidate_request_identity(&self) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::InvalidateRequestIdentity);
+    }
+
+    pub async fn bind_request_identity(
+        &self,
+        identity: CheckpointIdentity,
+    ) -> Option<RequestIdentityBinding> {
+        self.query("BindRequestIdentity", |reply| {
+            ChatStateCommand::BindRequestIdentity { identity, reply }
+        })
+        .await
+    }
+
+    pub async fn bind_request_identity_at_revision(
+        &self,
+        identity: CheckpointIdentity,
+        expected_history_revision: u64,
+    ) -> Option<RequestIdentityBindResult> {
+        self.query("BindRequestIdentityAtRevision", |reply| {
+            ChatStateCommand::BindRequestIdentityAtRevision {
+                identity,
+                expected_history_revision,
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self
@@ -209,6 +241,16 @@ impl ChatStateHandle {
         });
     }
 
+    pub async fn commit_compaction(
+        &self,
+        commit: CommitCompaction,
+    ) -> Option<CommitCompactionResult> {
+        self.query("CommitCompaction", |reply| {
+            ChatStateCommand::CommitCompaction { commit, reply }
+        })
+        .await
+    }
+
     /// Out-of-band history repair (`x.ai/session/repair`); see
     /// [`ChatStateCommand::RepairHistory`]. Returns `None` if the actor is
     /// dead, `Some(Err(_))` if a turn was in flight at processing time.
@@ -228,8 +270,8 @@ impl ChatStateHandle {
     /// Atomically align the leading `System` message with `prompt` (insert one
     /// if absent), persisting when changed. Serializes with turn pushes inside
     /// the actor, so a mid-turn reconnect can't drop concurrent updates.
-    /// Returns `Some(changed)`, or `None` if the actor is dead.
-    pub async fn replace_system_head(&self, prompt: &str) -> Option<bool> {
+    /// Returns a wrapper-aware result, or `None` if the actor is dead.
+    pub async fn replace_system_head(&self, prompt: &str) -> Option<ReplaceSystemHeadResult> {
         let prompt = prompt.to_owned();
         self.query("ReplaceSystemHead", |reply| {
             ChatStateCommand::ReplaceSystemHead { prompt, reply }
@@ -350,6 +392,13 @@ impl ChatStateHandle {
                 req_id,
                 reply,
             }
+        })
+        .await
+    }
+
+    pub async fn get_compaction_snapshot(&self) -> Option<ChatCompactionSnapshot> {
+        self.query("GetCompactionSnapshot", |reply| {
+            ChatStateCommand::GetCompactionSnapshot { reply }
         })
         .await
     }

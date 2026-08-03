@@ -2324,6 +2324,29 @@ impl Config {
     pub(crate) fn is_two_pass_compaction_enabled(&self) -> bool {
         self.resolve_two_pass_compaction().value
     }
+    pub fn is_server_compaction_enabled(&self) -> bool {
+        let remote = self
+            .remote_settings
+            .as_ref()
+            .and_then(|settings| settings.server_compaction_enabled);
+        BoolFlag::env("GROK_SERVER_COMPACTION")
+            .config(self.features.server_compaction)
+            .feature_flag(remote)
+            .default(true)
+            .resolve()
+            .value
+    }
+    pub fn resolve_compact_model_override(&self) -> Option<String> {
+        resolve_string_flag(
+            None,
+            "GROK_COMPACT_MODEL",
+            self.features.compact_model.as_deref(),
+            self.remote_settings
+                .as_ref()
+                .and_then(|settings| settings.compact_model.as_deref()),
+        )
+        .map(|resolved| resolved.value)
+    }
     pub(crate) fn resolve_telemetry_mode(&self) -> Resolved<TelemetryMode> {
         if let Some(mode) = self.requirements.telemetry.pinned() {
             return Resolved::new(mode, ConfigSource::Requirement);
@@ -4576,6 +4599,12 @@ pub struct Features {
     /// compaction. `None` = defer to remote settings / env / default (`false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_pass_compaction: Option<bool>,
+    /// Standalone Responses server compaction. Defaults on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_compaction: Option<bool>,
+    /// Model used by builtin compaction/fallback. `None` inherits the session model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_model: Option<String>,
     /// `image_gen` / `/imagine`. `None` = env / remote / default (`true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_gen: Option<bool>,

@@ -101,6 +101,11 @@ impl SessionRegistry {
     pub(super) fn clear_resident(&self, id: &acp::SessionId) {
         self.clear(id, |e| e.resident = None);
     }
+    pub(super) fn mark_require_gateway(&self, id: &acp::SessionId) {
+        self.edit(id, |entry| {
+            entry.resident.get_or_insert_default().require_gateway = true;
+        });
+    }
     pub(super) fn set_unavailable_model(&self, id: &acp::SessionId, model: acp::ModelId) {
         self.edit(id, |e| e.unavailable_model = Some(model));
     }

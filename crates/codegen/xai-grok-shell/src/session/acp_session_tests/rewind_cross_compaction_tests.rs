@@ -1,13 +1,28 @@
 use super::support::create_test_actor;
 
 use crate::extensions::notification::{
-    CompactionCheckpointFile, CompactionCheckpointInfo, SessionNotification as XaiNotification,
-    SessionUpdate as XaiSessionUpdate,
+    CompactionCheckpointFile, CompactionCheckpointInfo, CompactionCheckpointKind,
+    SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
 };
 use crate::sampling::ConversationItem;
+use crate::session::persistence::PersistenceMsg;
 use crate::session::storage::{SessionUpdate, SessionUpdateEnvelope};
 use crate::session::{RewindMode, RewindRequest};
 use agent_client_protocol as acp;
+
+/// Simulate the persistence actor's durable-update acknowledgement. Rewind
+/// waits for this exact record before it can expose the new branch.
+fn acknowledge_durable_updates(
+    mut persistence_rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(message) = persistence_rx.recv().await {
+            if let PersistenceMsg::AppendUpdateDurablyAndAck { respond_to, .. } = message {
+                let _ = respond_to.send(Ok(()));
+            }
+        }
+    });
+}
 
 fn user_chunk(text: &str, prompt_index: usize) -> SessionUpdate {
     SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
@@ -38,11 +53,18 @@ fn checkpoint_update(id: &str, prompt_index_at_compaction: usize) -> SessionUpda
     SessionUpdate::Xai(Box::new(XaiNotification {
         session_id: acp::SessionId::new("s"),
         update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+            kind: CompactionCheckpointKind::Builtin,
             checkpoint_id: id.to_string(),
             prompt_index_at_compaction,
             checkpoint_file: format!("compaction_checkpoints/{id}.json"),
             auto_continue: None,
-            schema_version: 1,
+            operation_id: None,
+            branch_id: None,
+            portable_history_sha256: None,
+            responses_mode: None,
+            responses_auto_continue: None,
+            wrapper_digest: None,
+            prior_checkpoint_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         })),
         meta: None,
@@ -56,13 +78,13 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
     std::fs::create_dir_all(session_dir.join("compaction_checkpoints")).unwrap();
 
     let ckpt_file = CompactionCheckpointFile {
+        kind: CompactionCheckpointKind::Builtin,
         checkpoint_id: ckpt_id.to_string(),
         prompt_index_at_compaction: 5,
         compacted_history: vec![
             ConversationItem::system("SYS"),
             ConversationItem::user("SUMMARY"),
         ],
-        schema_version: 1,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         original_user_info: Some("UI0".to_string()),
         reread_file_paths: vec![],
@@ -101,7 +123,8 @@ async fn rewind_pre_compaction_with_cancelled_turns_truncates_context_gb2961() {
 
 async fn run_rewind_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()
@@ -176,7 +199,8 @@ async fn files_only_rewind_is_exempt_from_chat_state_bound() {
 
 async fn run_files_only_bound_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -246,7 +270,8 @@ async fn run_file_counts_scenario() {
     use std::path::Path;
 
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let cwd = Path::new("/tmp");
@@ -283,7 +308,8 @@ async fn rewind_before_compaction_clears_stale_compaction_marker() {
 async fn run_clears_marker_scenario() {
     use xai_grok_sampling_types::CompactionsRemaining;
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()
@@ -372,7 +398,8 @@ async fn run_forked_rewind_scenario() {
     use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
 
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()

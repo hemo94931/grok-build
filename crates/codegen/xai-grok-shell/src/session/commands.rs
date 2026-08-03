@@ -31,6 +31,8 @@ pub enum SideQuestionError {
     Sampling(#[from] xai_grok_sampling_types::SamplingError),
     #[error("failed to prepare client: {0}")]
     PrepareClient(String),
+    #[error("checkpoint portable history unavailable: {0}")]
+    CheckpointHistory(#[source] std::io::Error),
     #[error("No response from model")]
     EmptyResponse,
 }

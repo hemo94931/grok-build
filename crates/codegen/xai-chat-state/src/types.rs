@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
+use xai_grok_sampling_types::{CheckpointIdentity, ConversationItem, SamplingConfig};
 
 /// Canonical marker for an injected memory-context block. Shared by the
 /// emitter in `xai-grok-shell` and the upsert/detection here — a drift would
@@ -53,6 +53,95 @@ pub struct ChatStateSnapshot {
     /// Opaque credential secrets (API key, optional extra auth, client version).
     #[serde(default)]
     pub credentials: Credentials,
+    /// Monotonic provider-visible history generation.
+    #[serde(default)]
+    pub history_revision: u64,
+    /// Monotonic request continuity-identity generation.
+    #[serde(default)]
+    pub request_identity_generation: u64,
+    /// Concrete identity bound by the most recent final request preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_request_identity: Option<CheckpointIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointReplayStatus {
+    NoCheckpoint,
+    Replayable,
+    MigrationRequired,
+    InvalidCheckpoint,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestIdentityBinding {
+    pub request_identity_generation: u64,
+    pub checkpoint_status: CheckpointReplayStatus,
+}
+
+#[derive(Debug, Clone)]
+pub enum RequestIdentityBindResult {
+    Bound {
+        binding: RequestIdentityBinding,
+        compaction_snapshot: Box<ChatCompactionSnapshot>,
+    },
+    StaleHistory {
+        current_revision: u64,
+    },
+}
+
+/// Atomic actor snapshot used by one compaction acquisition.
+#[derive(Debug, Clone)]
+pub struct ChatCompactionSnapshot {
+    pub history_revision: u64,
+    pub request_identity_generation: u64,
+    pub prompt_index: usize,
+    /// Current compaction baseline: the last provider total plus estimated
+    /// user/tool tokens appended since that response.
+    pub total_tokens: u64,
+    pub conversation: Vec<ConversationItem>,
+    pub sampling_config: SamplingConfig,
+    pub bound_request_identity: Option<CheckpointIdentity>,
+}
+
+/// CAS input for the single acknowledged compaction mutation boundary.
+#[derive(Debug, Clone)]
+pub struct CommitCompaction {
+    pub operation_id: String,
+    pub expected_history_revision: u64,
+    pub expected_request_identity_generation: u64,
+    pub replacement: Vec<ConversationItem>,
+    pub committed_total_tokens: u64,
+}
+
+/// One provider-visible append after an active Responses checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailAppend {
+    pub operation_id: String,
+    pub checkpoint_id: String,
+    pub branch_id: String,
+    pub sequence: u64,
+    pub prompt_index: usize,
+    pub item: ConversationItem,
+}
+
+#[derive(Debug)]
+pub enum CommitCompactionResult {
+    Committed {
+        history_revision: u64,
+        request_identity_generation: u64,
+    },
+    Superseded {
+        history_revision: u64,
+        request_identity_generation: u64,
+    },
+    PersistenceFailed(crate::persistence::HistoryReplaceError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceSystemHeadResult {
+    Unchanged,
+    Replaced,
+    MigrationRequired,
 }
 
 /// Metadata for session notifications (timing info).
@@ -196,6 +285,9 @@ mod tests {
             turn_start_ms: None,
             last_compaction_prompt_index: None,
             credentials: Credentials::default(),
+            history_revision: 0,
+            request_identity_generation: 0,
+            bound_request_identity: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -244,6 +336,9 @@ mod tests {
             turn_start_ms: Some(1234567800),
             last_compaction_prompt_index: Some(2),
             credentials: Credentials::default(),
+            history_revision: 3,
+            request_identity_generation: 4,
+            bound_request_identity: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

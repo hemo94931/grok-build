@@ -163,6 +163,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
@@ -289,6 +290,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -439,7 +441,9 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 )
                 .await
                 .expect("request should build");
-            assert!(matches!(request.items.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Persist this memory reminder.")));
+            // Memory is a dedicated marked item; the base head stays "sys".
+            assert!(matches!(request.items.first(), Some(ConversationItem::System(sys)) if sys.content.as_ref() == "sys"));
+            assert!(request.items.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Persist this memory reminder."))));
             let storage = crate::session::storage::JsonlStorageAdapter::with_explicit_session_dir(
                 session_dir.path().to_path_buf(),
             );
@@ -455,7 +459,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                 .load_session_without_updates(&session_info)
                 .await
                 .unwrap();
-            assert!(matches!(loaded.chat_history.first(), Some(ConversationItem::System(sys)) if sys.content.contains("Persist this memory reminder.")));
+            assert!(matches!(loaded.chat_history.first(), Some(ConversationItem::System(sys)) if sys.content.as_ref() == "sys"));
+            assert!(loaded.chat_history.iter().any(|item| matches!(item, ConversationItem::System(sys) if sys.source == xai_grok_sampling_types::SystemSource::MemoryContext && sys.content.contains("Persist this memory reminder."))));
         })
         .await;
 }
@@ -630,6 +635,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
@@ -759,6 +765,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -916,6 +923,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
@@ -1061,6 +1069,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -1081,6 +1090,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         })
                         .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state
                     .pending_inputs
@@ -1170,6 +1180,7 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert_eq!(actor.events.take_prior_interrupt_category(), None);
@@ -1212,6 +1223,7 @@ async fn cancel_without_active_tool_arms_interrupt_reminder() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert!(!actor.events.has_active_tool());
@@ -1253,6 +1265,7 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             let zombie_guard = crate::tools::tool_context::BlockingWaitGuard::enter(
@@ -1317,6 +1330,7 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             assert!(!actor.events.has_active_tool());
@@ -1565,6 +1579,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(running_item);
                 state.pending_inputs.push_back(q1_item);
@@ -2173,6 +2188,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    quota_pressure_notified_at: std::sync::atomic::AtomicI64::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
@@ -2318,6 +2334,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                post_compact_usage_state: std::sync::atomic::AtomicU8::new(0),
                 sampler_handle: sampler_handle.clone(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -2360,6 +2377,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 state.running_task = Some(AgentTask {
                     prompt_id: "running".into(),
                     handle: task.abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
             }
             actor.cancel_running_task(true, false, false, None).await;
@@ -2506,6 +2524,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state
                     .pending_inputs

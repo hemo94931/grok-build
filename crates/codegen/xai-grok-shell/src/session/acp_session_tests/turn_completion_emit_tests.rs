@@ -256,6 +256,7 @@ async fn cancellation_persists_turn_completed_cancelled() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(item);
             }
@@ -325,6 +326,7 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(item);
             }
@@ -371,6 +373,7 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(item);
             }
@@ -452,6 +455,7 @@ async fn pristine_rewind_cancel_emits_no_turn_completed() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     })
                     .abort_handle(),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                 });
                 state.pending_inputs.push_back(item);
             }

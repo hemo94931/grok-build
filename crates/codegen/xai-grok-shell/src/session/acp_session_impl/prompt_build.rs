@@ -224,12 +224,32 @@ pub(super) fn install_system_prompt(
     preserve_inherited_system: bool,
     system_prompt: &str,
 ) {
-    if let Some(ConversationItem::System(sys)) = conversation.first_mut() {
+    if conversation
+        .first()
+        .is_some_and(|item| item.is_responses_checkpoint())
+    {
+        return;
+    }
+    // Only a non-memory leading System is the base head; a leading
+    // MemoryContext item (base already stripped) gets a fresh base inserted
+    // before it.
+    let head_is_base = matches!(
+        conversation.first(),
+        Some(ConversationItem::System(sys)) if sys.source != xai_grok_sampling_types::SystemSource::MemoryContext
+    );
+    if head_is_base {
         if is_subagent_spawn && !preserve_inherited_system {
+            let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+                unreachable!("head_is_base implies a leading system item");
+            };
             sys.content = std::sync::Arc::<str>::from(system_prompt);
+            sys.source = xai_grok_sampling_types::SystemSource::BaseInstructions;
         }
     } else {
-        conversation.insert(0, ConversationItem::system(system_prompt.to_string()));
+        conversation.insert(
+            0,
+            ConversationItem::base_instructions(system_prompt.to_string()),
+        );
         if let Some(len) = inherited_prefix_len {
             *len += 1;
         }
@@ -285,6 +305,60 @@ mod install_system_prompt_tests {
             "summarized fork (preserve=false) must overwrite [0] with the child system"
         );
     }
+    #[test]
+    fn checkpoint_resume_never_inserts_before_wrapper() {
+        use chrono::Utc;
+        use xai_grok_sampling_types::{
+            CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ResponsesCompactionMode,
+            ServerResponsesCheckpoint, TokenSeedSource,
+        };
+        let mut conv = vec![ConversationItem::ResponsesCompactionCheckpoint(Box::new(
+            ServerResponsesCheckpoint {
+                checkpoint_id: "checkpoint".into(),
+                operation_id: "operation".into(),
+                prompt_index: 1,
+                created_at: Utc::now(),
+                auto_continue: false,
+                mode: ResponsesCompactionMode {
+                    name: "summary".into(),
+                    detail: None,
+                },
+                branch_id: "branch".into(),
+                identity: CheckpointIdentity {
+                    provider_id: "provider".into(),
+                    api: "responses".into(),
+                    endpoint_fingerprint: "endpoint".into(),
+                    model: "model".into(),
+                    auth_principal_fingerprint: "principal".into(),
+                    contract_version: RESPONSES_COMPACTION_CONTRACT.into(),
+                    prompt_envelope_fingerprint: "prompt".into(),
+                    base_instructions_sha256: "base".into(),
+                    prior_checkpoint_id: None,
+                    cache_route_fingerprint: None,
+                },
+                output: vec![serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "opaque"
+                })],
+                portable_history_path: "compaction_checkpoints/checkpoint.json".into(),
+                portable_history_sha256: "digest".into(),
+                portable_history_bytes: 1,
+                checkpoint_token_seed: 1,
+                token_seed_source: TokenSeedSource::UsageOutputTokens,
+                server_output_item_count: 1,
+                prior_checkpoint_id: None,
+                memory_revision: None,
+            },
+        ))];
+        let mut prefix = None;
+        install_system_prompt(&mut conv, &mut prefix, false, false, "fresh");
+        assert!(matches!(
+            conv.first(),
+            Some(ConversationItem::ResponsesCompactionCheckpoint(_))
+        ));
+        assert_eq!(conv.len(), 1);
+    }
+
     #[test]
     fn top_level_resume_keeps_stored_system() {
         let mut conv = vec![

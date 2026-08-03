@@ -11,6 +11,30 @@ use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::ConversationItem;
 
 use crate::commands::{StrictAppendAck, StrictAppendError};
+use crate::types::TailAppend;
+
+#[derive(Debug)]
+pub enum HistoryReplaceError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+    Indeterminate(io::Error),
+}
+
+impl std::fmt::Display for HistoryReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(f, "history was not committed: {error}"),
+            Self::Committed(error) => {
+                write!(f, "history committed but acknowledgement failed: {error}")
+            }
+            Self::Indeterminate(error) => {
+                write!(f, "history commit status is indeterminate: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HistoryReplaceError {}
 
 /// Abstraction over chat-specific persistence operations.
 ///
@@ -33,6 +57,19 @@ pub trait ChatPersistence: Send + 'static {
     /// Replace the entire chat history (compaction / rewind).
     fn replace_history(&mut self, items: &[ConversationItem]);
 
+    /// Durably replace history and resolve the operation to committed or not committed.
+    fn replace_history_and_ack(
+        &mut self,
+        operation_id: &str,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>>;
+
+    /// Persist a two-phase typed tail append after an active checkpoint.
+    fn append_tail_and_ack(
+        &mut self,
+        append: &TailAppend,
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>>;
+
     /// Flush pending writes to disk.
     fn flush(&mut self);
 }
@@ -50,6 +87,13 @@ pub enum PersistenceRecord {
     AcknowledgedMessage(ConversationItem),
     /// The full history was replaced.
     ReplaceHistory(Vec<ConversationItem>),
+    /// A durable history replacement was requested.
+    AcknowledgedReplaceHistory {
+        operation_id: String,
+        items: Vec<ConversationItem>,
+    },
+    /// A two-phase typed checkpoint-tail append was requested.
+    AcknowledgedTail(TailAppend),
     /// A flush was requested.
     Flush,
 }
@@ -61,6 +105,10 @@ pub struct MockChatPersistence {
     tx: mpsc::UnboundedSender<PersistenceRecord>,
     persistence_ack_tx:
         Option<mpsc::UnboundedSender<oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>>>,
+    history_replace_ack_tx:
+        Option<mpsc::UnboundedSender<oneshot::Sender<Result<(), HistoryReplaceError>>>>,
+    tail_append_ack_tx:
+        Option<mpsc::UnboundedSender<oneshot::Sender<Result<(), HistoryReplaceError>>>>,
     persisted_working_directory_switches: Vec<ConversationItem>,
 }
 
@@ -70,6 +118,10 @@ pub struct MockPersistenceReceiver {
     persistence_ack_rx: Option<
         mpsc::UnboundedReceiver<oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>>,
     >,
+    history_replace_ack_rx:
+        Option<mpsc::UnboundedReceiver<oneshot::Sender<Result<(), HistoryReplaceError>>>>,
+    tail_append_ack_rx:
+        Option<mpsc::UnboundedReceiver<oneshot::Sender<Result<(), HistoryReplaceError>>>>,
 }
 
 impl MockChatPersistence {
@@ -81,11 +133,15 @@ impl MockChatPersistence {
             Self {
                 tx,
                 persistence_ack_tx: None,
+                history_replace_ack_tx: None,
+                tail_append_ack_tx: None,
                 persisted_working_directory_switches: Vec::new(),
             },
             MockPersistenceReceiver {
                 rx,
                 persistence_ack_rx: None,
+                history_replace_ack_rx: None,
+                tail_append_ack_rx: None,
             },
         )
     }
@@ -98,11 +154,57 @@ impl MockChatPersistence {
             Self {
                 tx,
                 persistence_ack_tx: Some(persistence_ack_tx),
+                history_replace_ack_tx: None,
+                tail_append_ack_tx: None,
                 persisted_working_directory_switches: Vec::new(),
             },
             MockPersistenceReceiver {
                 rx,
                 persistence_ack_rx: Some(persistence_ack_rx),
+                history_replace_ack_rx: None,
+                tail_append_ack_rx: None,
+            },
+        )
+    }
+
+    /// Create a mock whose durable history-replace acknowledgement is test-controlled.
+    pub fn new_with_manual_history_replace_ack() -> (Self, MockPersistenceReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (history_replace_ack_tx, history_replace_ack_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                persistence_ack_tx: None,
+                history_replace_ack_tx: Some(history_replace_ack_tx),
+                tail_append_ack_tx: None,
+                persisted_working_directory_switches: Vec::new(),
+            },
+            MockPersistenceReceiver {
+                rx,
+                persistence_ack_rx: None,
+                history_replace_ack_rx: Some(history_replace_ack_rx),
+                tail_append_ack_rx: None,
+            },
+        )
+    }
+
+    /// Create a mock whose typed-tail acknowledgement is test-controlled.
+    pub fn new_with_manual_tail_append_ack() -> (Self, MockPersistenceReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (tail_append_ack_tx, tail_append_ack_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                persistence_ack_tx: None,
+                history_replace_ack_tx: None,
+                tail_append_ack_tx: Some(tail_append_ack_tx),
+                persisted_working_directory_switches: Vec::new(),
+            },
+            MockPersistenceReceiver {
+                rx,
+                persistence_ack_rx: None,
+                history_replace_ack_rx: None,
+                tail_append_ack_rx: Some(tail_append_ack_rx),
             },
         )
     }
@@ -123,6 +225,24 @@ impl MockPersistenceReceiver {
         &mut self,
     ) -> Option<oneshot::Sender<Result<StrictAppendAck, StrictAppendError>>> {
         match &mut self.persistence_ack_rx {
+            Some(rx) => rx.recv().await,
+            None => None,
+        }
+    }
+
+    pub async fn next_history_replace_ack(
+        &mut self,
+    ) -> Option<oneshot::Sender<Result<(), HistoryReplaceError>>> {
+        match &mut self.history_replace_ack_rx {
+            Some(rx) => rx.recv().await,
+            None => None,
+        }
+    }
+
+    pub async fn next_tail_append_ack(
+        &mut self,
+    ) -> Option<oneshot::Sender<Result<(), HistoryReplaceError>>> {
+        match &mut self.tail_append_ack_rx {
             Some(rx) => rx.recv().await,
             None => None,
         }
@@ -185,6 +305,51 @@ impl ChatPersistence for MockChatPersistence {
             .send(PersistenceRecord::ReplaceHistory(items.to_vec()));
     }
 
+    fn replace_history_and_ack(
+        &mut self,
+        operation_id: &str,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        let sent = self.tx.send(PersistenceRecord::AcknowledgedReplaceHistory {
+            operation_id: operation_id.to_string(),
+            items: items.to_vec(),
+        });
+        if sent.is_err() {
+            let _ = reply.send(Err(HistoryReplaceError::NotCommitted(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mock persistence closed",
+            ))));
+        } else if let Some(ack_tx) = &self.history_replace_ack_tx {
+            let _ = ack_tx.send(reply);
+        } else {
+            let _ = reply.send(Ok(()));
+        }
+        receiver
+    }
+
+    fn append_tail_and_ack(
+        &mut self,
+        append: &TailAppend,
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(PersistenceRecord::AcknowledgedTail(append.clone()))
+            .is_err()
+        {
+            let _ = reply.send(Err(HistoryReplaceError::NotCommitted(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mock persistence closed",
+            ))));
+        } else if let Some(ack_tx) = &self.tail_append_ack_tx {
+            let _ = ack_tx.send(reply);
+        } else {
+            let _ = reply.send(Ok(()));
+        }
+        receiver
+    }
+
     fn flush(&mut self) {
         let _ = self.tx.send(PersistenceRecord::Flush);
     }
@@ -208,6 +373,23 @@ impl ChatPersistence for NullChatPersistence {
         receiver
     }
     fn replace_history(&mut self, _items: &[ConversationItem]) {}
+    fn replace_history_and_ack(
+        &mut self,
+        _operation_id: &str,
+        _items: &[ConversationItem],
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        let _ = reply.send(Ok(()));
+        receiver
+    }
+    fn append_tail_and_ack(
+        &mut self,
+        _append: &TailAppend,
+    ) -> oneshot::Receiver<Result<(), HistoryReplaceError>> {
+        let (reply, receiver) = oneshot::channel();
+        let _ = reply.send(Ok(()));
+        receiver
+    }
     fn flush(&mut self) {}
 }
 
