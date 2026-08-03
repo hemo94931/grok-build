@@ -231,6 +231,7 @@ mod tests {
         assert_eq!(windows_style.as_str(), "plugins/foo");
     }
 
+    #[cfg(unix)]
     #[test]
     fn marketplace_relative_path_join_under_rejects_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();
@@ -246,6 +247,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn marketplace_relative_path_join_under_rejects_symlink_ancestor_escape() {
         let dir = tempfile::tempdir().unwrap();
