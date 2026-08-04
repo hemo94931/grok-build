@@ -19,6 +19,44 @@ fn test_manager() -> ModelsManager {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn multi_provider_regression_auth_change_keeps_provider_models() {
+    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    use xai_grok_test_support::EnvGuard;
+
+    let _xai = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+    let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
+    let cfg = config_from_toml(
+        r#"
+        [model."anthropic/claude-test"]
+        name = "Claude Test"
+        model = "anthropic/claude-test"
+        base_url = "https://api.anthropic.com"
+        context_window = 200000
+        "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        cfg,
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.on_auth_changed().await;
+
+    assert!(
+        mgr.available()
+            .contains_key(&acp::ModelId::new("anthropic/claude-test"))
+    );
+    assert_eq!(mgr.current_model_id().0.as_ref(), "anthropic/claude-test");
+}
+
+#[tokio::test]
 async fn catalog_retry_recovers_after_endpoint_returns() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -31,7 +31,8 @@ pub(crate) use flow::{AuthInteraction, AuthNotification, AuthPrompt, DeviceCode,
 pub(crate) use route::{
     ProviderCapabilities, ProviderDescriptor, ProviderRequestContext, ProviderSecret,
     ProviderSecretSource, ProviderWireDialect, namespaced_model_id, parse_namespaced_model_id,
-    provider_bearer_resolver, provider_descriptor, resolve_provider_secret,
+    provider_bearer_resolver, provider_descriptor, resolve_fresh_provider_secret,
+    resolve_provider_secret,
 };
 pub(crate) use store::{ProviderCredential, ProviderStore, RefreshReason};
 

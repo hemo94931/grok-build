@@ -17,7 +17,12 @@ const DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
 const DEVICE_TIMEOUT_SECONDS: u64 = 15 * 60;
 const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(40);
 const REFRESH_RETRIES: usize = 3;
+const _: () = assert!(
+    REFRESH_TIMEOUT.as_millis() < crate::auth::manager::REFRESH_LOCK_TIMEOUT.as_millis(),
+    "Kimi refresh must finish before another process stops waiting for the shared auth lock"
+);
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 pub(super) async fn login(
@@ -65,55 +70,60 @@ pub(super) async fn refresh(
         ("grant_type", "refresh_token"),
         ("refresh_token", credential.refresh.as_str()),
     ];
-    let mut last_error = None;
+    let refresh = async {
+        let mut last_error = None;
 
-    for attempt in 0..=REFRESH_RETRIES {
-        if attempt > 0 {
-            sleep_or_cancel(Duration::from_secs(1 << (attempt - 1)), &signal).await?;
-        }
-        let response = send_form(
-            format!("{host}/api/oauth/token"),
-            &form,
-            &signal,
-            "Kimi Coding token refresh",
-        )
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) if attempt < REFRESH_RETRIES && !signal.is_cancelled() => {
-                last_error = Some(error);
+        for attempt in 0..=REFRESH_RETRIES {
+            if attempt > 0 {
+                sleep_or_cancel(Duration::from_secs(1 << (attempt - 1)), &signal).await?;
+            }
+            let response = send_form(
+                format!("{host}/api/oauth/token"),
+                &form,
+                &signal,
+                "Kimi Coding token refresh",
+            )
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if attempt < REFRESH_RETRIES && !signal.is_cancelled() => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let status = response.status();
+            let body = response_text(response, &signal).await?;
+            let json = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+
+            if status.is_success() {
+                return Ok(ProviderRefreshOutcome::Save(token_credential(
+                    &json, "refresh",
+                )?));
+            }
+            if refresh_credential_is_dead(status, &json) {
+                return Ok(ProviderRefreshOutcome::Remove {
+                    message: format!(
+                        "Kimi Coding authorization expired; run `grok login --provider kimi-coding`"
+                    ),
+                });
+            }
+            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && attempt < REFRESH_RETRIES
+            {
+                last_error = Some(anyhow::anyhow!(
+                    "Kimi Coding token refresh failed ({status})"
+                ));
                 continue;
             }
-            Err(error) => return Err(error),
-        };
-        let status = response.status();
-        let body = response_text(response, &signal).await?;
-        let json = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            return response_error("Kimi Coding token refresh", status, &body);
+        }
 
-        if status.is_success() {
-            return Ok(ProviderRefreshOutcome::Save(token_credential(
-                &json, "refresh",
-            )?));
-        }
-        if refresh_credential_is_dead(status, &json) {
-            return Ok(ProviderRefreshOutcome::Remove {
-                message: format!(
-                    "Kimi Coding authorization expired; run `grok login --provider kimi-coding`"
-                ),
-            });
-        }
-        if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-            && attempt < REFRESH_RETRIES
-        {
-            last_error = Some(anyhow::anyhow!(
-                "Kimi Coding token refresh failed ({status})"
-            ));
-            continue;
-        }
-        return response_error("Kimi Coding token refresh", status, &body);
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Kimi Coding token refresh failed")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Kimi Coding token refresh failed")))
+    };
+    tokio::time::timeout(REFRESH_TIMEOUT, refresh)
+        .await
+        .context("Kimi Coding token refresh exceeded the shared auth-lock budget")?
 }
 
 async fn start_device_authorization(
@@ -327,6 +337,11 @@ mod tests {
         );
         assert!(normalize_oauth_host("javascript:alert(1)").is_err());
         assert!(normalize_oauth_host("https://user:pass@auth.kimi.com").is_err());
+    }
+
+    #[test]
+    fn multi_provider_regression_kimi_refresh_fits_shared_lock_budget() {
+        assert!(REFRESH_TIMEOUT < crate::auth::manager::REFRESH_LOCK_TIMEOUT);
     }
 
     #[test]

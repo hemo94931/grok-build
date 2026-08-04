@@ -719,16 +719,36 @@ impl SamplingClient {
     /// A wired bearer_resolver is the sole auth source: a missing live
     /// bearer strips default Authorization / x-api-key so a hard-expired
     /// seed key cannot ride on the wire.
+    #[cfg(test)]
     fn post(&self, url: impl reqwest::IntoUrl) -> SentRequest {
         self.post_with_headers(url, HeaderMap::new())
     }
 
-    fn post_json<T: Serialize>(&self, url: impl reqwest::IntoUrl, body: &T) -> SentRequest {
+    fn post_json<T: Serialize>(&self, url: impl reqwest::IntoUrl, body: &T) -> Result<SentRequest> {
+        match self.provider_body(body)? {
+            Some(body) => Ok(self.post_prepared_json(url, &body)),
+            None => Ok(self.post_prepared_json(url, body)),
+        }
+    }
+
+    /// POST a body that has already passed any provider wire transformation.
+    fn post_prepared_json<T: Serialize>(
+        &self,
+        url: impl reqwest::IntoUrl,
+        body: &T,
+    ) -> SentRequest {
         let mut request_headers = HeaderMap::new();
         if let Some(route) = &self.provider_wire {
             route.add_dynamic_headers(body, &mut request_headers);
         }
-        self.post_with_headers(url, request_headers)
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post_with_headers(url, request_headers);
+        SentRequest {
+            builder: builder.json(body),
+            sent_bearer,
+        }
     }
 
     fn post_with_headers(
@@ -831,7 +851,7 @@ impl SamplingClient {
     /// Best-effort *build-time* view of what the next request would carry
     /// (resolver-authoritative). For request-start diagnostics
     /// ([`Self::auth_info`]) only — 401 attribution must use the fragment
-    /// captured by [`Self::post`] instead, which cannot race a recovery.
+    /// captured by [`Self::post_with_headers`] instead, which cannot race a recovery.
     fn current_sent_bearer_prefix(&self) -> Option<String> {
         if self.bearer_resolver.is_some() {
             return self
@@ -850,7 +870,7 @@ impl SamplingClient {
     /// that saw the status, so higher layers that react to a 401 must
     /// not emit a duplicate event.
     ///
-    /// `sent_prefix` is the fragment [`Self::post`] captured for the
+    /// `sent_prefix` is the fragment [`Self::post_with_headers`] captured for the
     /// rejected request (already tail-truncated; the full bearer never
     /// crosses this boundary).
     fn record_401_attribution(
@@ -935,7 +955,7 @@ impl SamplingClient {
         Ok(request)
     }
 
-    /// `sent_bearer` is the fragment [`Self::post`] captured for the
+    /// `sent_bearer` is the fragment [`Self::post_with_headers`] captured for the
     /// request that produced `response` (401 attribution).
     async fn handle_response(
         &self,
@@ -1011,19 +1031,11 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let provider_body = self.provider_body(&payload)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = match provider_body.as_ref() {
-            Some(body) => self.post_json(self.endpoint("chat/completions"), body),
-            None => self.post(self.endpoint("chat/completions")),
-        };
-        let builder = self.apply_grok_headers(builder, &grok_headers);
-        let http_request = match provider_body.as_ref() {
-            Some(body) => builder.json(body),
-            None => builder.json(&payload),
-        };
+        } = self.post_json(self.endpoint("chat/completions"), &payload)?;
+        let http_request = self.apply_grok_headers(builder, &grok_headers);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -1079,21 +1091,13 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let provider_body = self.provider_body(&streaming_request)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = match provider_body.as_ref() {
-            Some(body) => self.post_json(self.endpoint("chat/completions"), body),
-            None => self.post(self.endpoint("chat/completions")),
-        };
-        let builder = self
+        } = self.post_json(self.endpoint("chat/completions"), &streaming_request)?;
+        let http_request = self
             .apply_grok_headers(builder, &grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        let http_request = match provider_body.as_ref() {
-            Some(body) => builder.json(body),
-            None => builder.json(&streaming_request),
-        };
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1348,14 +1352,8 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = if self.provider_wire.is_some() {
-            self.post_json(self.endpoint("responses"), &request_body)
-        } else {
-            self.post(self.endpoint("responses"))
-        };
-        let http_request = self
-            .apply_grok_headers(builder, &grok_headers)
-            .json(&request_body);
+        } = self.post_prepared_json(self.endpoint("responses"), &request_body);
+        let http_request = self.apply_grok_headers(builder, &grok_headers);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1498,11 +1496,7 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = if self.provider_wire.is_some() {
-            self.post_json(self.endpoint("responses"), &request_body)
-        } else {
-            self.post(self.endpoint("responses"))
-        };
+        } = self.post_prepared_json(self.endpoint("responses"), &request_body);
         let mut http_request = self
             .apply_grok_headers(builder, &grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -1510,8 +1504,6 @@ impl SamplingClient {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
         }
-        let http_request = http_request.json(&request_body);
-
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
             SamplingError::Http(e)
@@ -1710,19 +1702,11 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let provider_body = self.provider_body(&request.inner)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = match provider_body.as_ref() {
-            Some(body) => self.post_json(self.endpoint("messages"), body),
-            None => self.post(self.endpoint("messages")),
-        };
-        let builder = self.apply_grok_headers(builder, &grok_headers);
-        let http_request = match provider_body.as_ref() {
-            Some(body) => builder.json(body),
-            None => builder.json(&request.inner),
-        };
+        } = self.post_json(self.endpoint("messages"), &request.inner)?;
+        let http_request = self.apply_grok_headers(builder, &grok_headers);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1837,21 +1821,13 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let provider_body = self.provider_body(&request.inner)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = match provider_body.as_ref() {
-            Some(body) => self.post_json(self.endpoint("messages"), body),
-            None => self.post(self.endpoint("messages")),
-        };
-        let builder = self
+        } = self.post_json(self.endpoint("messages"), &request.inner)?;
+        let http_request = self
             .apply_grok_headers(builder, &grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        let http_request = match provider_body.as_ref() {
-            Some(body) => builder.json(body),
-            None => builder.json(&request.inner),
-        };
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -2020,10 +1996,9 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post_json(self.endpoint("messages"), &body);
+        } = self.post_prepared_json(self.endpoint("messages"), &body);
         let built_request = builder
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&body)
             .build()
             .map_err(SamplingError::Http)?;
         let response = self.http.execute(built_request).await.map_err(|error| {
@@ -2724,6 +2699,38 @@ mod tests {
             req.headers().contains_key("traceparent"),
             "HeaderInjector should inject traceparent into post() requests"
         );
+    }
+
+    #[test]
+    fn provider_json_post_uses_sanitized_body() {
+        let config = SamplerConfig {
+            api_key: Some("provider-token".to_owned()),
+            base_url: "https://chatgpt.com/backend-api".to_owned(),
+            model: "openai-codex/gpt-5".to_owned(),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(config).expect("build provider client");
+        let body = serde_json::json!({
+            "model": "openai-codex/gpt-5",
+            "previous_response_id": "response-1",
+        });
+        let request = client
+            .post_json("http://localhost/test", &body)
+            .expect("prepare provider body")
+            .builder
+            .build()
+            .expect("build request");
+        let body: serde_json::Value = serde_json::from_slice(
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("JSON request body"),
+        )
+        .expect("parse JSON request body");
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["includeSystemPrompt"], false);
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]

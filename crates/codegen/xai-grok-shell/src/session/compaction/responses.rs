@@ -111,7 +111,6 @@ pub(super) fn responses_route_capabilities(
     crate::auth::providers::ProviderCapabilities {
         supports_remote_compaction: true,
         accepts_responses_checkpoint: true,
-        supports_xai_hosted_tools: true,
     }
 }
 

@@ -19,9 +19,9 @@ pub(super) fn dispatch_login(app: &mut AppView, provider: String) -> Vec<Effect>
     let request_seq = app.next_auth_request_seq;
     app.next_auth_request_seq += 1;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
-        agent
-            .scrollback
-            .push_block(RenderBlock::system(format!("Signing in to {provider}…")));
+        agent.scrollback.push_block(RenderBlock::system(format!(
+            "Signing in to {provider}… Run /logout {provider} to cancel."
+        )));
     }
     vec![Effect::ProviderLogin {
         agent_id,
@@ -60,6 +60,13 @@ pub(super) fn handle_login_complete(
                 return vec![];
             }
         }
+        Err(error) if provider_login_was_cancelled(&error) => {
+            agent.reauth_stashed_prompt = None;
+            agent.scrollback.push_block(RenderBlock::system(format!(
+                "Sign-in to {provider} was cancelled."
+            )));
+            return vec![];
+        }
         Err(error) => {
             agent.scrollback.push_block(RenderBlock::system(format!(
                 "Could not sign in to {provider}: {error}"
@@ -68,6 +75,10 @@ pub(super) fn handle_login_complete(
         }
     }
     super::queue::maybe_drain_queue_and_note_peek(app, agent_id)
+}
+
+fn provider_login_was_cancelled(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("cancel")
 }
 
 pub(super) fn handle_logout_complete(
@@ -86,4 +97,18 @@ pub(super) fn handle_logout_complete(
     };
     agent.scrollback.push_block(RenderBlock::system(message));
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_provider_regression_cancelled_login_is_not_reported_as_failure() {
+        assert!(provider_login_was_cancelled("login cancelled"));
+        assert!(provider_login_was_cancelled(
+            "Authentication CANCELED by user"
+        ));
+        assert!(!provider_login_was_cancelled("connection timed out"));
+    }
 }

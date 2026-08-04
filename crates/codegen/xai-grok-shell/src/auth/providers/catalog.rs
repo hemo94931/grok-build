@@ -25,7 +25,7 @@ pub(crate) struct ProviderCatalogModel {
 impl ProviderCatalogModel {
     pub(crate) fn api_backend(&self) -> Option<ApiBackend> {
         match self.api.as_str() {
-            "anthropic-messages" => Some(ApiBackend::Messages),
+            "anthropic-messages" | "pi-messages" => Some(ApiBackend::Messages),
             "openai-completions" => Some(ApiBackend::ChatCompletions),
             "openai-codex-responses" | "openai-responses" => Some(ApiBackend::Responses),
             _ => None,
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn radius_catalog_comes_from_gateway_config() {
+    fn multi_provider_regression_radius_catalog_comes_from_gateway_config() {
         let mut credential = ProviderCredential::permanent("secret");
         credential.set_metadata(
             "gatewayConfig",
@@ -136,5 +136,6 @@ mod tests {
         let models = provider_models(ProviderId::Radius, Some(&credential));
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].base_url, "https://api.radius.example");
+        assert_eq!(models[0].api_backend(), Some(ApiBackend::Messages));
     }
 }

@@ -197,6 +197,11 @@ impl ProviderWireRoute {
         if *backend == ApiBackend::Responses {
             if self.kind == ProviderKind::OpenaiCodex {
                 object.insert("store".to_owned(), Value::Bool(false));
+                object.insert("includeSystemPrompt".to_owned(), Value::Bool(false));
+                object.insert(
+                    "include".to_owned(),
+                    serde_json::json!(["reasoning.encrypted_content"]),
+                );
                 object.remove("previous_response_id");
             }
             if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
@@ -411,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_body_is_normal_history_without_checkpoint_fields() {
+    fn multi_provider_regression_codex_body_matches_contract() {
         let route = ProviderWireRoute::from_config(
             "openai-codex/gpt-5.4",
             "https://chatgpt.com/backend-api",
@@ -428,6 +433,11 @@ mod tests {
         route.sanitize_body(&mut body, &ApiBackend::Responses);
         assert_eq!(body["model"], "gpt-5.4");
         assert_eq!(body["store"], false);
+        assert_eq!(body["includeSystemPrompt"], false);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
         assert!(body.get("previous_response_id").is_none());
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);

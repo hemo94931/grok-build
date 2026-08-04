@@ -59,7 +59,9 @@ async fn handle_login(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         .transpose()
         .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
 
-    let (signal, _guard) = agent.interactive_auth.begin(None, params.request_seq);
+    let (signal, _guard) = agent
+        .interactive_auth
+        .begin_provider(provider, params.request_seq);
     let interaction =
         AcpAuthInteraction::new(agent.gateway.clone(), params.session_id, provider, signal);
     crate::auth::providers::login_and_store(provider, &interaction, mode)
@@ -93,7 +95,7 @@ async fn handle_logout(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         .provider
         .parse::<ProviderId>()
         .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
-    agent.interactive_auth.cancel();
+    agent.interactive_auth.cancel_provider(provider, None);
     let was_logged_in = crate::auth::providers::logout(provider)
         .await
         .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
@@ -109,17 +111,20 @@ fn handle_cancel(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct CancelParams {
+        provider: String,
         #[serde(default)]
         request_seq: Option<u64>,
     }
 
-    let params: CancelParams =
-        serde_json::from_str(args.params.get()).unwrap_or(CancelParams { request_seq: None });
-    match params.request_seq {
-        Some(seq) => agent.interactive_auth.cancel_for_client_seq(seq),
-        None => agent.interactive_auth.cancel(),
-    }
-    to_raw_response(&serde_json::json!({ "cancelled": true }))
+    let params: CancelParams = parse_params(args)?;
+    let provider = params
+        .provider
+        .parse::<ProviderId>()
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    let cancelled = agent
+        .interactive_auth
+        .cancel_provider(provider, params.request_seq);
+    to_raw_response(&serde_json::json!({ "cancelled": cancelled }))
 }
 
 #[derive(Serialize)]

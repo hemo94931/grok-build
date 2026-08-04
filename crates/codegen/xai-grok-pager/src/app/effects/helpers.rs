@@ -880,6 +880,15 @@ pub(super) async fn send_provider_logout(
     agent_id: AgentId,
     provider: String,
 ) -> TaskResult {
+    let cancel = acp::ExtRequest::new(
+        "x.ai/providerAuth/cancel",
+        serde_json::value::to_raw_value(&serde_json::json!({ "provider": provider }))
+            .expect("serialize provider cancel params")
+            .into(),
+    );
+    if let Err(error) = acp_send(cancel, tx).await {
+        tracing::debug!(%error, %provider, "provider auth cancel failed before logout");
+    }
     let req = acp::ExtRequest::new(
         "x.ai/providerAuth/logout",
         serde_json::value::to_raw_value(&serde_json::json!({ "provider": provider }))

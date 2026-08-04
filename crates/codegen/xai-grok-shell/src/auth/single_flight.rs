@@ -31,6 +31,8 @@ pub(crate) struct AttemptChannels {
 struct Attempt {
     token: CancellationToken,
     channels: Option<AttemptChannels>,
+    /// `None` for xAI auth; provider logins are cancelled only by their own RPCs.
+    provider: Option<super::providers::ProviderId>,
     /// Pager `request_seq` for this attempt (scopes delayed cancel RPCs).
     client_seq: Option<u64>,
 }
@@ -91,12 +93,30 @@ impl AuthSingleFlight {
         channels: Option<AttemptChannels>,
         client_seq: Option<u64>,
     ) -> (CancellationToken, AuthAttemptGuard<'_>) {
+        self.begin_scoped(channels, client_seq, None)
+    }
+
+    pub(crate) fn begin_provider(
+        &self,
+        provider: super::providers::ProviderId,
+        client_seq: Option<u64>,
+    ) -> (CancellationToken, AuthAttemptGuard<'_>) {
+        self.begin_scoped(None, client_seq, Some(provider))
+    }
+
+    fn begin_scoped(
+        &self,
+        channels: Option<AttemptChannels>,
+        client_seq: Option<u64>,
+        provider: Option<super::providers::ProviderId>,
+    ) -> (CancellationToken, AuthAttemptGuard<'_>) {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         let token = CancellationToken::new();
         if let Some(prev) = self.active.borrow_mut().replace(Attempt {
             token: token.clone(),
             channels,
+            provider,
             client_seq,
         }) {
             tracing::info!("auth: cancelling prior interactive auth for single-flight");
@@ -125,10 +145,33 @@ impl AuthSingleFlight {
     /// [`Self::cancel_for_client_seq`] when the caller has a pager `request_seq`
     /// so a delayed cancel cannot tear down a newer login.
     pub(crate) fn cancel(&self) {
-        if let Some(prev) = self.active.borrow_mut().take() {
-            tracing::info!("auth: interactive auth cancelled");
+        let mut active = self.active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|attempt| attempt.provider.is_none())
+            && let Some(prev) = active.take()
+        {
+            tracing::info!("auth: interactive xAI auth cancelled");
             prev.token.cancel();
         }
+    }
+
+    pub(crate) fn cancel_provider(
+        &self,
+        provider: super::providers::ProviderId,
+        client_seq: Option<u64>,
+    ) -> bool {
+        let mut active = self.active.borrow_mut();
+        let matches = active.as_ref().is_some_and(|attempt| {
+            attempt.provider == Some(provider)
+                && client_seq.is_none_or(|seq| attempt.client_seq == Some(seq))
+        });
+        if matches && let Some(prev) = active.take() {
+            tracing::info!(%provider, ?client_seq, "auth: provider auth cancelled");
+            prev.token.cancel();
+            return true;
+        }
+        false
     }
 
     /// Cancel only if the active attempt was started for `client_seq`. A stale
@@ -136,7 +179,7 @@ impl AuthSingleFlight {
     pub(crate) fn cancel_for_client_seq(&self, client_seq: u64) {
         let mut active = self.active.borrow_mut();
         match active.as_ref() {
-            Some(a) if a.client_seq == Some(client_seq) => {
+            Some(a) if a.provider.is_none() && a.client_seq == Some(client_seq) => {
                 if let Some(prev) = active.take() {
                     tracing::info!(
                         client_seq,
@@ -307,6 +350,28 @@ mod tests {
         );
         sf.cancel_for_client_seq(2);
         assert!(second.is_cancelled());
+    }
+
+    #[test]
+    fn multi_provider_regression_cancellation_is_provider_scoped() {
+        let sf = AuthSingleFlight::default();
+        let (xai, _xai_guard) = sf.begin(None, Some(1));
+        assert!(!sf.cancel_provider(super::super::providers::ProviderId::Anthropic, None));
+        assert!(
+            !xai.is_cancelled(),
+            "provider cancel must not stop xAI login"
+        );
+
+        let (provider, _provider_guard) =
+            sf.begin_provider(super::super::providers::ProviderId::Anthropic, Some(2));
+        sf.cancel();
+        assert!(
+            !provider.is_cancelled(),
+            "xAI cancel must not stop provider login"
+        );
+        assert!(!sf.cancel_provider(super::super::providers::ProviderId::Openrouter, Some(2),));
+        assert!(sf.cancel_provider(super::super::providers::ProviderId::Anthropic, Some(2),));
+        assert!(provider.is_cancelled());
     }
 
     #[test]

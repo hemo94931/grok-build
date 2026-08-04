@@ -382,6 +382,11 @@ impl ModelsManager {
         self.inner.catalog.read().models.clone()
     }
 
+    pub(crate) fn model_entry(&self, model_id: &str) -> Option<ModelEntry> {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id).cloned()
+    }
+
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
     }
@@ -602,7 +607,14 @@ impl ModelsManager {
         if self.inner.auth_manager.current_or_expired().is_none()
             && fetch_auth == ModelFetchAuth::Session
         {
+            let mut models = resolve_model_catalog(&config, None);
+            models.retain(|id, _| crate::auth::providers::parse_namespaced_model_id(id).is_some());
             self.clear();
+            self.inner.catalog.write().models = models;
+            if !self.inner.catalog.read().models.is_empty() {
+                self.reselect_current_model_if_missing(&config);
+            }
+            self.notify_models_updated();
             return;
         }
 

@@ -350,8 +350,14 @@ impl SessionActor {
         model_id: &str,
         sent_credential: xai_grok_sampling_types::SentCredential,
     ) -> bool {
-        let context = match crate::agent::config::resolve_fresh_provider_request_context(model_id)
-            .await
+        let Some(model) = self.models_manager.model_entry(model_id) else {
+            tracing::warn!(%provider, %model_id, "provider 401 recovery model is unavailable");
+            return false;
+        };
+        let context = match crate::agent::config::resolve_fresh_provider_request_context(
+            model_id, &model,
+        )
+        .await
         {
             Ok(Some(context)) => context,
             Ok(None) => return false,
@@ -468,21 +474,66 @@ impl SessionActor {
                 stream_tool_calls: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
-        if let Some((provider, _)) = crate::auth::providers::parse_namespaced_model_id(&cfg.model) {
-            let context =
-                crate::agent::config::resolve_fresh_provider_request_context(&cfg.model).await;
+        let mut full_config = SamplingConfig {
+            api_key: None,
+            base_url: cfg.base_url,
+            model: cfg.model,
+            max_completion_tokens: cfg.max_completion_tokens,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            api_backend: cfg.api_backend,
+            auth_scheme: xai_grok_sampler::AuthScheme::Bearer,
+            extra_headers: cfg.extra_headers,
+            query_params: cfg.query_params,
+            env_http_headers: cfg.env_http_headers,
+            context_window: cfg.context_window.get(),
+            client_version: None,
+            reasoning_effort: cfg.reasoning_effort,
+            force_http1: false,
+            max_retries: Some(self.max_retries),
+            stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+            idle_timeout_secs: None,
+            client_identifier: None,
+            deployment_id: None,
+            user_id: None,
+            origin_client: self.origin_client.clone(),
+            attribution_callback: None,
+            bearer_resolver: None,
+            supports_backend_search: false,
+            compactions_remaining: None,
+            compaction_at_tokens: None,
+            doom_loop_recovery: None,
+            header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+        };
+        if let Some((provider, _)) =
+            crate::auth::providers::parse_namespaced_model_id(&full_config.model)
+        {
+            let context = match self.models_manager.model_entry(&full_config.model) {
+                Some(model) => {
+                    crate::agent::config::resolve_fresh_provider_request_context(
+                        &full_config.model,
+                        &model,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!(
+                    "provider model `{}` is not available",
+                    full_config.model
+                )),
+            };
             let context = match context {
                 Ok(Some(context)) => Some(context),
                 Ok(None) => unreachable!("namespaced provider model must resolve a provider route"),
                 Err(error) => {
-                    tracing::warn!(model = %cfg.model, %error, "provider route unavailable; request will fail closed locally");
+                    tracing::warn!(model = %full_config.model, %error, "provider route unavailable; request will fail closed locally");
                     None
                 }
             };
-            let mut extra_headers = cfg.extra_headers;
             if let Some(context) = context.as_ref() {
                 for (name, value) in &context.headers {
-                    extra_headers.insert(name.clone(), value.clone());
+                    full_config
+                        .extra_headers
+                        .insert(name.clone(), value.clone());
                 }
             }
             let descriptor = crate::auth::providers::provider_descriptor(provider);
@@ -496,92 +547,65 @@ impl SessionActor {
             {
                 self.set_chat_api_key(context.token.clone()).await;
             }
-            return SamplingConfig {
-                api_key: context.as_ref().map(|context| context.token.clone()),
-                base_url: context
-                    .as_ref()
-                    .map(|context| context.base_url.clone())
-                    .unwrap_or_else(|| {
-                        if cfg.base_url.trim().is_empty() {
-                            descriptor.base_url.to_owned()
-                        } else {
-                            cfg.base_url.clone()
-                        }
-                    }),
-                model: cfg.model,
-                max_completion_tokens: cfg.max_completion_tokens,
-                temperature: cfg.temperature,
-                top_p: cfg.top_p,
-                api_backend: context
-                    .as_ref()
-                    .map(|context| context.api_backend.clone())
-                    .unwrap_or(cfg.api_backend),
-                auth_scheme: context
-                    .as_ref()
-                    .map_or(xai_grok_sampler::AuthScheme::Bearer, |context| {
-                        context.auth_scheme
-                    }),
-                extra_headers,
-                query_params: cfg.query_params,
-                env_http_headers: cfg.env_http_headers,
-                context_window: cfg.context_window.get(),
-                client_version: None,
-                reasoning_effort: cfg.reasoning_effort,
-                force_http1: false,
-                max_retries: Some(self.max_retries),
-                stream_tool_calls: false,
-                idle_timeout_secs: None,
-                client_identifier: None,
-                deployment_id: None,
-                user_id: None,
-                origin_client: self.origin_client.clone(),
-                attribution_callback: None,
-                bearer_resolver: stored_oauth
-                    .then(|| crate::auth::providers::provider_bearer_resolver(provider)),
-                supports_backend_search: false,
-                compactions_remaining: None,
-                compaction_at_tokens: None,
-                doom_loop_recovery: None,
-                header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
-            };
+            full_config.api_key = context.as_ref().map(|context| context.token.clone());
+            full_config.base_url = context
+                .as_ref()
+                .map(|context| context.base_url.clone())
+                .unwrap_or_else(|| {
+                    if full_config.base_url.trim().is_empty() {
+                        descriptor.base_url.to_owned()
+                    } else {
+                        full_config.base_url.clone()
+                    }
+                });
+            if let Some(context) = context.as_ref() {
+                full_config.api_backend.clone_from(&context.api_backend);
+                full_config.auth_scheme = context.auth_scheme;
+            }
+            full_config.stream_tool_calls = false;
+            full_config.bearer_resolver =
+                stored_oauth.then(|| crate::auth::providers::provider_bearer_resolver(provider));
+            return full_config;
         }
-        let model_facts = self.model_auth_facts(cfg.model.as_str());
+
+        let model_facts = self.model_auth_facts(full_config.model.as_str());
         let auth_method = self.auth_method_id.load();
-        let gate =
-            SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
+        let gate = SessionTokenAuthGate::new(
+            auth_method.as_deref(),
+            model_facts.byok,
+            &full_config.base_url,
+        );
         let use_bearer_resolver = gate.active();
-        self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
+        self.log_auth_gate_unknown("reconstruct_full_config", gate, &full_config.base_url);
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
-        let api_key = if use_bearer_resolver {
+        full_config.api_key = if use_bearer_resolver {
             self.auth_manager
                 .as_ref()
                 .and_then(|am| am.current_wire_valid().map(|a| a.key))
         } else {
             creds.api_key
         };
-        let auth_scheme = model_facts.auth_scheme;
-        let mut extra_headers = cfg.extra_headers;
+        full_config.auth_scheme = model_facts.auth_scheme;
         crate::agent::config::inject_url_derived_headers(
-            &mut extra_headers,
+            &mut full_config.extra_headers,
             creds.alpha_test_key.as_deref(),
-            &cfg.base_url,
+            &full_config.base_url,
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
         let send_inline_compaction_headers =
             crate::session::responses_server_compaction::should_send_inline_compaction_headers(
-                &cfg.api_backend,
+                &full_config.api_backend,
             );
-        let mut env_http_headers = cfg.env_http_headers.clone();
         if !send_inline_compaction_headers {
             // Responses uses exactly one explicit compaction mechanism. Strip
             // even user/model/env-injected inline controls so disabling the
             // endpoint cannot silently re-enable provider compaction.
             for name in ["x-compaction-at", "x-compactions-remaining"] {
-                extra_headers.shift_remove(name);
-                env_http_headers.shift_remove(name);
+                full_config.extra_headers.shift_remove(name);
+                full_config.env_http_headers.shift_remove(name);
             }
         }
         if send_inline_compaction_headers
@@ -595,63 +619,51 @@ impl SessionActor {
             if let Some(value) =
                 compactions_remaining.and_then(|c| c.resolve(has_compaction_summary))
             {
-                extra_headers.insert("x-compactions-remaining".to_string(), value.to_string());
+                full_config
+                    .extra_headers
+                    .insert("x-compactions-remaining".to_string(), value.to_string());
             }
             if !has_compaction_summary
                 && let Some(value) = compaction_at_tokens.and_then(|c| {
                     c.resolve(
-                        cfg.context_window.get(),
+                        full_config.context_window,
                         self.compaction.threshold_percent.get(),
                     )
                 })
             {
-                extra_headers.insert("x-compaction-at".to_string(), value.to_string());
+                full_config
+                    .extra_headers
+                    .insert("x-compaction-at".to_string(), value.to_string());
             }
         }
-        SamplingConfig {
-            api_key,
-            base_url: cfg.base_url,
-            model: cfg.model,
-            max_completion_tokens: cfg.max_completion_tokens,
-            temperature: cfg.temperature,
-            top_p: cfg.top_p,
-            api_backend: cfg.api_backend,
-            auth_scheme,
-            extra_headers,
-            query_params: cfg.query_params.clone(),
-            env_http_headers,
-            context_window: cfg.context_window.get(),
-            client_version: creds.client_version,
-            reasoning_effort: cfg.reasoning_effort,
-            force_http1: false,
-            max_retries: Some(self.max_retries),
-            stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
-            idle_timeout_secs: None,
-            client_identifier: self.client_identifier.clone(),
-            deployment_id: crate::managed_config::resolve_deployment_id(
-                crate::managed_config::resolve_deployment_key().as_deref(),
-            ),
-            user_id: self
-                .auth_manager
-                .as_ref()
-                .and_then(|am| am.current_or_expired())
-                .filter(|a| a.is_xai_auth())
-                .map(|a| a.user_id),
-            origin_client: self.origin_client.clone(),
-            attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
-                self.auth_manager.as_ref().map(|am| {
-                    crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
-                })
-            } else {
-                None
-            },
-            supports_backend_search: self.supports_backend_search.get(),
-            compactions_remaining: self.compactions_remaining.get(),
-            compaction_at_tokens: self.compaction_at_tokens.get(),
-            doom_loop_recovery: self.doom_loop_recovery,
-            header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
-        }
+        full_config.client_version = creds.client_version;
+        full_config
+            .client_identifier
+            .clone_from(&self.client_identifier);
+        full_config.deployment_id = crate::managed_config::resolve_deployment_id(
+            crate::managed_config::resolve_deployment_key().as_deref(),
+        );
+        full_config.user_id = self
+            .auth_manager
+            .as_ref()
+            .and_then(|am| am.current_or_expired())
+            .filter(|auth| auth.is_xai_auth())
+            .map(|auth| auth.user_id);
+        full_config
+            .attribution_callback
+            .clone_from(&self.attribution_callback);
+        full_config.bearer_resolver = if use_bearer_resolver {
+            self.auth_manager.as_ref().map(|am| {
+                crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
+            })
+        } else {
+            None
+        };
+        full_config.supports_backend_search = self.supports_backend_search.get();
+        full_config.compactions_remaining = compactions_remaining;
+        full_config.compaction_at_tokens = compaction_at_tokens;
+        full_config.doom_loop_recovery = self.doom_loop_recovery;
+        full_config
     }
     /// Install auto-mode permission classifier with a live LLM side-query
     /// (laziness-classifier pattern: `prepare_chat_completion` +
@@ -983,7 +995,8 @@ impl SessionActor {
             };
             (error_type.to_owned(), message)
         };
-        self.log_terminal_failure(&error_type, STATUS, &message);
+        self.log_terminal_failure(&error_type, STATUS, &message)
+            .await;
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type,
@@ -995,26 +1008,44 @@ impl SessionActor {
             message, STATUS,
         ))
     }
-    fn log_terminal_failure(&self, error_type: &str, status_code: Option<u16>, message: &str) {
-        let auth = self
-            .auth_manager
-            .as_ref()
-            .and_then(|am| am.current_or_expired());
-        let reauthable = is_reauthable_failure(Some(error_type), message);
+    async fn log_terminal_failure(
+        &self,
+        error_type: &str,
+        status_code: Option<u16>,
+        message: &str,
+    ) {
+        let provider_id = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .and_then(|config| {
+                crate::auth::providers::parse_namespaced_model_id(&config.model)
+                    .map(|(provider, _)| provider.to_string())
+                    .or_else(|| {
+                        (!crate::util::is_xai_api_url(&config.base_url))
+                            .then(|| "custom".to_owned())
+                    })
+            })
+            .or_else(|| error_type.strip_prefix("provider_auth:").map(str::to_owned));
+        let auth = if provider_id.is_none() {
+            self.auth_manager
+                .as_ref()
+                .and_then(|manager| manager.current_or_expired())
+        } else {
+            None
+        };
+        let attributes = terminal_failure_attributes(
+            error_type,
+            status_code,
+            is_reauthable_failure(Some(error_type), message),
+            message,
+            provider_id.as_deref(),
+            auth.as_ref(),
+        );
         xai_grok_telemetry::unified_log::warn(
             "turn.terminal_failure",
             Some(self.session_info.id.0.as_ref()),
-            Some(serde_json::json!({
-                "error_type": error_type,
-                "status_code": status_code,
-                "reauthable": reauthable,
-                "auth_mode": auth.as_ref().map(|a| format!("{:?}", a.auth_mode)),
-                "key_prefix": auth.as_ref().map(|a| crate::auth::token_suffix(&a.key).to_owned()),
-                "expires_at": auth
-                    .as_ref()
-                    .and_then(|a| a.expires_at.map(|e| e.to_rfc3339())),
-                "message": crate::util::truncate(message, 300),
-            })),
+            Some(attributes),
         );
     }
     pub(crate) async fn handle_sampling_failure(
@@ -1036,7 +1067,8 @@ impl SessionActor {
                 "budgeted workflow child model request failed; output grant exhausted: {}",
                 error.message
             );
-            self.log_terminal_failure("output_budget_usage_unknown", error.status_code, &message);
+            self.log_terminal_failure("output_budget_usage_unknown", error.status_code, &message)
+                .await;
             return Err(acp::Error::internal_error().data(message));
         }
         if self.tool_context.sampler_retry_only_before_output {
@@ -1052,7 +1084,8 @@ impl SessionActor {
                 "workflow_child_sampling_failed",
                 error.status_code,
                 &message,
-            );
+            )
+            .await;
             return Err(acp::Error::internal_error().data(message));
         }
         if self.should_compact_on_error(&error).await {
@@ -1098,7 +1131,8 @@ impl SessionActor {
             let friendly = "This session's conversation history is incompatible \
                             with the current model. Please start a new session."
                 .to_string();
-            self.log_terminal_failure("encrypted_content_mismatch", error.status_code, &friendly);
+            self.log_terminal_failure("encrypted_content_mismatch", error.status_code, &friendly)
+                .await;
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "encrypted_content_mismatch".to_string(),
@@ -1109,7 +1143,8 @@ impl SessionActor {
             return Err(acp::Error::invalid_params().data(friendly));
         }
         if matches!(error.kind, SamplingErrorKind::RateLimited) {
-            self.log_terminal_failure("rate_limited", error.status_code, &detailed_message);
+            self.log_terminal_failure("rate_limited", error.status_code, &detailed_message)
+                .await;
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Exhausted {
                     attempts: 0,
@@ -1273,7 +1308,8 @@ impl SessionActor {
                  To fix: run `grok logout` then `grok login` to re-authenticate with OAuth2.\n\n\
                  Version: {client_version}"
             );
-            self.log_terminal_failure("legacy_auth", error.status_code, &msg);
+            self.log_terminal_failure("legacy_auth", error.status_code, &msg)
+                .await;
             self.send_xai_notification(XaiSessionUpdate::RetryState(
                 crate::extensions::notification::RetryState::Failed {
                     error_type: "legacy_auth".to_string(),
@@ -1349,7 +1385,8 @@ impl SessionActor {
             }
             _ => (error_type, detailed_message),
         };
-        self.log_terminal_failure(&error_type, error.status_code, &detailed_message);
+        self.log_terminal_failure(&error_type, error.status_code, &detailed_message)
+            .await;
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
                 error_type,
@@ -1785,6 +1822,70 @@ impl SessionActor {
             .push_assistant_response(assistant_item);
     }
 }
+
+fn terminal_failure_attributes(
+    error_type: &str,
+    status_code: Option<u16>,
+    reauthable: bool,
+    message: &str,
+    provider_id: Option<&str>,
+    auth: Option<&crate::auth::GrokAuth>,
+) -> serde_json::Value {
+    let mut attributes = serde_json::json!({
+        "error_type": error_type,
+        "status_code": status_code,
+        "reauthable": reauthable,
+        "message": crate::util::truncate(message, 300),
+    });
+    let object = attributes
+        .as_object_mut()
+        .expect("terminal failure attributes are an object");
+    if let Some(provider_id) = provider_id {
+        object.insert("provider_id".to_owned(), provider_id.into());
+    } else {
+        object.insert(
+            "auth_mode".to_owned(),
+            auth.map(|value| format!("{:?}", value.auth_mode)).into(),
+        );
+        object.insert(
+            "key_prefix".to_owned(),
+            auth.map(|value| crate::auth::token_suffix(&value.key).to_owned())
+                .into(),
+        );
+        object.insert(
+            "expires_at".to_owned(),
+            auth.and_then(|value| value.expires_at.map(|expires_at| expires_at.to_rfc3339()))
+                .into(),
+        );
+    }
+    attributes
+}
+
+#[cfg(test)]
+mod terminal_failure_tests {
+    #[test]
+    fn multi_provider_regression_provider_telemetry_omits_xai_auth_fields() {
+        let provider = super::terminal_failure_attributes(
+            "provider_auth:anthropic",
+            Some(401),
+            true,
+            "unauthorized",
+            Some("anthropic"),
+            None,
+        );
+        assert_eq!(provider["provider_id"], "anthropic");
+        for key in ["auth_mode", "key_prefix", "expires_at"] {
+            assert!(provider.get(key).is_none(), "provider event leaked {key}");
+        }
+
+        let xai =
+            super::terminal_failure_attributes("auth", Some(401), true, "unauthorized", None, None);
+        for key in ["auth_mode", "key_prefix", "expires_at"] {
+            assert!(xai.get(key).is_some(), "xAI event omitted {key}");
+        }
+    }
+}
+
 /// Per-tool precedence: a non-empty `over` wins, else the non-empty `seed`.
 fn prefer_non_empty<T>(
     over: Option<T>,

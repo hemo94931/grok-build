@@ -29,7 +29,6 @@ pub(crate) enum ProviderWireDialect {
 pub(crate) struct ProviderCapabilities {
     pub(crate) supports_remote_compaction: bool,
     pub(crate) accepts_responses_checkpoint: bool,
-    pub(crate) supports_xai_hosted_tools: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,14 +193,21 @@ pub(crate) fn provider_bearer_resolver(
     std::sync::Arc::new(ProviderBearerResolver { provider })
 }
 
-pub(crate) fn resolve_provider_secret(
+fn model_provider_secret(
     provider: ProviderId,
     model_secret: Option<String>,
+) -> anyhow::Result<Option<(ProviderSecret, Option<ProviderCredential>)>> {
+    model_secret
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| ProviderSecret::from_model(provider, token).map(|secret| (secret, None)))
+        .transpose()
+}
+
+fn stored_or_environment_secret(
+    provider: ProviderId,
+    credential: Option<ProviderCredential>,
 ) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
-    if let Some(token) = model_secret.filter(|token| !token.trim().is_empty()) {
-        return Ok((ProviderSecret::from_model(provider, token)?, None));
-    }
-    if let Some(credential) = ProviderStore::default().get(provider)? {
+    if let Some(credential) = credential {
         let secret = ProviderSecret::from_oauth(provider, &credential);
         return Ok((secret, Some(credential)));
     }
@@ -211,6 +217,29 @@ pub(crate) fn resolve_provider_secret(
     bail!(
         "{provider} credentials are missing; run `grok login --provider {provider}` or set one of: {}",
         provider_descriptor(provider).env_keys.join(", ")
+    )
+}
+
+pub(crate) fn resolve_provider_secret(
+    provider: ProviderId,
+    model_secret: Option<String>,
+) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
+    if let Some(secret) = model_provider_secret(provider, model_secret)? {
+        return Ok(secret);
+    }
+    stored_or_environment_secret(provider, ProviderStore::default().get(provider)?)
+}
+
+pub(crate) async fn resolve_fresh_provider_secret(
+    provider: ProviderId,
+    model_secret: Option<String>,
+) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
+    if let Some(secret) = model_provider_secret(provider, model_secret)? {
+        return Ok(secret);
+    }
+    stored_or_environment_secret(
+        provider,
+        super::fresh_stored_credential(provider, None).await?,
     )
 }
 
@@ -236,7 +265,7 @@ fn secret(
         && !token.starts_with("sk-ant-oat")
         && !matches!(
             source,
-            ProviderSecretSource::Environment("ANTHROPIC_AUTH_TOKEN")
+            ProviderSecretSource::Environment("ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_OAUTH_TOKEN")
         ) {
         AuthScheme::XApiKey
     } else {
@@ -452,8 +481,25 @@ mod tests {
             let capabilities = provider_descriptor(provider).capabilities;
             assert!(!capabilities.supports_remote_compaction);
             assert!(!capabilities.accepts_responses_checkpoint);
-            assert!(!capabilities.supports_xai_hosted_tools);
         }
+    }
+
+    #[test]
+    fn multi_provider_regression_anthropic_oauth_env_is_bearer() {
+        let oauth = secret(
+            ProviderId::Anthropic,
+            "opaque-oauth-token".to_owned(),
+            ProviderSecretSource::Environment("ANTHROPIC_OAUTH_TOKEN"),
+        )
+        .unwrap();
+        let api_key = secret(
+            ProviderId::Anthropic,
+            "sk-ant-api".to_owned(),
+            ProviderSecretSource::Environment("ANTHROPIC_API_KEY"),
+        )
+        .unwrap();
+        assert_eq!(oauth.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(api_key.auth_scheme, AuthScheme::XApiKey);
     }
 
     #[test]

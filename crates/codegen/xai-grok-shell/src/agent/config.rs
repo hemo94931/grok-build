@@ -3549,20 +3549,7 @@ pub(crate) fn resolve_model_list(
             }
         });
         let effective = with_provider.as_ref().unwrap_or(model_override);
-        let mut entry = effective.apply(key, base, &cfg.endpoints);
-        let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
-            || entry
-                .api_base_url
-                .as_deref()
-                .is_some_and(|url| !crate::util::is_xai_api_bearer_url(url));
-        if let Some(pid) = model_override.model_provider.as_deref()
-            && entry.auth_provider.is_none()
-            && session_bearer_unsafe
-        {
-            entry.auth_provider = Some(crate::auth::AuthProviderRef::fail_closed(format!(
-                "model_provider:{pid} (fail-closed)"
-            )));
-        }
+        let entry = effective.apply(key, base, &cfg.endpoints);
         tracing::debug!(
             model_key = %key,
             base_url = %entry.info.base_url,
@@ -3576,6 +3563,19 @@ pub(crate) fn resolve_model_list(
         resolved.insert(key.clone(), entry);
     }
     for (key, entry) in resolved.iter_mut() {
+        let custom_endpoint = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
+            || entry
+                .api_base_url
+                .as_deref()
+                .is_some_and(|url| !crate::util::is_xai_api_bearer_url(url));
+        if crate::auth::providers::parse_namespaced_model_id(&entry.info.model).is_none()
+            && entry.auth_provider.is_none()
+            && custom_endpoint
+        {
+            entry.auth_provider = Some(crate::auth::AuthProviderRef::fail_closed(format!(
+                "custom endpoint:{key} (fail-closed)"
+            )));
+        }
         if let Some(ref mut provider) = entry.auth_provider {
             if provider.is_fail_closed() {
                 continue;
@@ -4808,45 +4808,22 @@ pub(crate) fn resolve_provider_request_context(
     .map(Some)
 }
 
-/// Re-read provider state for every turn. Stored OAuth credentials are refreshed
-/// under the shared auth lock; model BYOK remains the highest-priority source.
+/// Refresh provider state for every turn. The model comes from the live
+/// in-memory catalog; only the provider credential store is re-read.
 pub(crate) async fn resolve_fresh_provider_request_context(
     model_id: &str,
+    model: &ModelEntry,
 ) -> anyhow::Result<Option<crate::auth::providers::ProviderRequestContext>> {
     let Some((provider, upstream_model_id)) =
         crate::auth::providers::parse_namespaced_model_id(model_id)
     else {
         return Ok(None);
     };
-    let raw =
-        crate::config::load_effective_config().context("config load failed for provider route")?;
-    let cfg = Config::new_from_toml_cfg(&raw)
-        .map_err(anyhow::Error::msg)
-        .context("config parse failed for provider route")?;
-    let models = resolve_model_list(&cfg, None);
-    let model = find_model_by_id(&models, model_id)
-        .cloned()
-        .with_context(|| format!("provider model `{model_id}` is not available"))?;
-
-    let (secret, credential) = if let Some(token) = model.own_credential() {
-        (
-            crate::auth::providers::ProviderSecret::from_model(provider, token)?,
-            None,
-        )
-    } else if let Some(credential) =
-        crate::auth::providers::fresh_stored_credential(provider, None).await?
-    {
-        (
-            crate::auth::providers::ProviderSecret::from_oauth(provider, &credential),
-            Some(credential),
-        )
-    } else {
-        let secret = crate::auth::providers::ProviderSecret::from_environment(provider)?
-            .with_context(|| format!("{provider} credentials are missing"))?;
-        (secret, None)
-    };
+    let (secret, credential) =
+        crate::auth::providers::resolve_fresh_provider_secret(provider, model.own_credential())
+            .await?;
     build_provider_request_context(
-        &model,
+        model,
         provider,
         upstream_model_id,
         secret,
@@ -6437,6 +6414,31 @@ reasoning_effort = "low"
         assert!(model.has_own_credentials());
         let creds = resolve_credentials(model, Some("session-jwt"));
         assert_eq!(creds.api_key, None);
+    }
+    #[test]
+    fn multi_provider_regression_custom_endpoint_never_uses_xai_credentials() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.custom]
+            model = "custom"
+            base_url = "https://third-party.example/v1"
+            context_window = 200000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("custom").expect("model should exist");
+        assert!(
+            model
+                .auth_provider
+                .as_ref()
+                .is_some_and(|p| p.is_fail_closed())
+        );
+        assert_eq!(
+            resolve_credentials(model, Some("session-jwt")).api_key,
+            None
+        );
     }
     #[tokio::test]
     async fn resolve_credentials_serves_cached_provider_token() {
