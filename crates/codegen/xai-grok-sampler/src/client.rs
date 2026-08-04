@@ -32,6 +32,7 @@ use xai_grok_sampling_types::{
 use crate::attribution::bearer_tail_fragment;
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
+use crate::provider_wire::{PiMessagesEventDecoder, ProviderWireRoute, radius_payload};
 
 pub mod responses_compact;
 
@@ -326,6 +327,9 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
     endpoint: EndpointTemplate,
+    /// Shell-independent route derived from a namespaced model ID (or a
+    /// conservative third-party classification for custom endpoints).
+    provider_wire: Option<ProviderWireRoute>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -341,6 +345,7 @@ impl std::fmt::Debug for SamplingClient {
                 &self.attribution_callback.is_some(),
             )
             .field("has_bearer_resolver", &self.bearer_resolver.is_some())
+            .field("provider_wire", &self.provider_wire)
             .finish()
     }
 }
@@ -523,6 +528,17 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let provider_wire = ProviderWireRoute::from_config(&config.model, &config.base_url);
+        if provider_wire
+            .as_ref()
+            .is_some_and(ProviderWireRoute::is_known_provider)
+            && config.api_key.is_none()
+            && config.bearer_resolver.is_none()
+        {
+            return Err(SamplingError::auth_unknown(
+                "Provider credentials are missing; login or configure a provider key",
+            ));
+        }
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -619,7 +635,9 @@ impl SamplingClient {
                     version: Some(agent_version()),
                 }),
             };
-            if let Ok(v) = HeaderValue::from_str(&ua_string) {
+            if let Ok(v) = HeaderValue::from_str(&ua_string)
+                && !headers.contains_key(USER_AGENT)
+            {
                 headers.insert(USER_AGENT, v);
             }
         }
@@ -653,7 +671,11 @@ impl SamplingClient {
         );
 
         let defaults = ClientDefaults {
-            model: config.model,
+            model: provider_wire
+                .as_ref()
+                .map_or(config.model.clone(), |route| {
+                    route.upstream_model().to_owned()
+                }),
             max_completion_tokens: config.max_completion_tokens,
             temperature: config.temperature,
             top_p: config.top_p,
@@ -675,6 +697,7 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            provider_wire,
         })
     }
 
@@ -697,7 +720,24 @@ impl SamplingClient {
     /// bearer strips default Authorization / x-api-key so a hard-expired
     /// seed key cannot ride on the wire.
     fn post(&self, url: impl reqwest::IntoUrl) -> SentRequest {
+        self.post_with_headers(url, HeaderMap::new())
+    }
+
+    fn post_json<T: Serialize>(&self, url: impl reqwest::IntoUrl, body: &T) -> SentRequest {
+        let mut request_headers = HeaderMap::new();
+        if let Some(route) = &self.provider_wire {
+            route.add_dynamic_headers(body, &mut request_headers);
+        }
+        self.post_with_headers(url, request_headers)
+    }
+
+    fn post_with_headers(
+        &self,
+        url: impl reqwest::IntoUrl,
+        request_headers: HeaderMap,
+    ) -> SentRequest {
         let mut headers = self.default_headers.clone();
+        headers.extend(request_headers);
         if let Some(resolver) = &self.bearer_resolver {
             headers.remove(AUTHORIZATION);
             headers.remove(HeaderName::from_static("x-api-key"));
@@ -716,6 +756,13 @@ impl SamplingClient {
                 }
             }
         }
+        if let Some(injector) = &self.header_injector {
+            injector.inject(&mut headers);
+        }
+        if let Some(route) = &self.provider_wire {
+            route.sanitize_headers(&mut headers);
+        }
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         {
             let auth_prefix = headers
                 .get(AUTHORIZATION)
@@ -738,13 +785,30 @@ impl SamplingClient {
                 x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
             );
         }
-        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
-        if let Some(injector) = &self.header_injector {
-            injector.inject(&mut headers);
-        }
         SentRequest {
             builder: self.http.post(url).headers(headers),
             sent_bearer,
+        }
+    }
+
+    fn provider_body<T: Serialize>(&self, body: &T) -> Result<Option<serde_json::Value>> {
+        let Some(route) = &self.provider_wire else {
+            return Ok(None);
+        };
+        let mut value = serde_json::to_value(body).map_err(SamplingError::Serialization)?;
+        route.sanitize_body(&mut value, &self.defaults.api_backend);
+        Ok(Some(value))
+    }
+
+    fn apply_grok_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+        headers: &GrokRequestHeaders<'_>,
+    ) -> reqwest::RequestBuilder {
+        if self.provider_wire.is_some() {
+            builder
+        } else {
+            headers.apply(builder)
         }
     }
 
@@ -845,6 +909,9 @@ impl SamplingClient {
     }
 
     fn endpoint(&self, path: &str) -> String {
+        let path = self.provider_wire.as_ref().map_or(path, |route| {
+            route.endpoint_path(path, &self.defaults.api_backend)
+        });
         self.endpoint.url_for_path(path)
     }
 
@@ -944,11 +1011,19 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
+        let provider_body = self.provider_body(&payload)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers.apply(builder).json(&payload);
+        } = match provider_body.as_ref() {
+            Some(body) => self.post_json(self.endpoint("chat/completions"), body),
+            None => self.post(self.endpoint("chat/completions")),
+        };
+        let builder = self.apply_grok_headers(builder, &grok_headers);
+        let http_request = match provider_body.as_ref() {
+            Some(body) => builder.json(body),
+            None => builder.json(&payload),
+        };
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -1004,14 +1079,21 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
+        let provider_body = self.provider_body(&streaming_request)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers
-            .apply(builder)
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&streaming_request);
+        } = match provider_body.as_ref() {
+            Some(body) => self.post_json(self.endpoint("chat/completions"), body),
+            None => self.post(self.endpoint("chat/completions")),
+        };
+        let builder = self
+            .apply_grok_headers(builder, &grok_headers)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let http_request = match provider_body.as_ref() {
+            Some(body) => builder.json(body),
+            None => builder.json(&streaming_request),
+        };
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1246,7 +1328,10 @@ impl SamplingClient {
         // forwarded by the sampler. Drop it before we send.
         request.trace.take();
         let checkpoint_request = Self::response_request_has_compaction(&request);
-        let request_body = self.serialize_response_body(&mut request)?;
+        let mut request_body = self.serialize_response_body(&mut request)?;
+        if let Some(route) = &self.provider_wire {
+            route.sanitize_body(&mut request_body, &self.defaults.api_backend);
+        }
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
 
@@ -1263,8 +1348,14 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder).json(&request_body);
+        } = if self.provider_wire.is_some() {
+            self.post_json(self.endpoint("responses"), &request_body)
+        } else {
+            self.post(self.endpoint("responses"))
+        };
+        let http_request = self
+            .apply_grok_headers(builder, &grok_headers)
+            .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1381,6 +1472,9 @@ impl SamplingClient {
                 request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
+        if let Some(route) = &self.provider_wire {
+            route.sanitize_body(&mut request_body, &self.defaults.api_backend);
+        }
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
         let grok_headers = GrokRequestHeaders {
@@ -1396,15 +1490,21 @@ impl SamplingClient {
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
-            .defaults
-            .doom_loop_recovery
+            .provider_wire
+            .is_none()
+            .then_some(self.defaults.doom_loop_recovery)
+            .flatten()
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("responses"));
-        let mut http_request = grok_headers
-            .apply(builder)
+        } = if self.provider_wire.is_some() {
+            self.post_json(self.endpoint("responses"), &request_body)
+        } else {
+            self.post(self.endpoint("responses"))
+        };
+        let mut http_request = self
+            .apply_grok_headers(builder, &grok_headers)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
@@ -1586,6 +1686,9 @@ impl SamplingClient {
         mut request: MessagesRequestWrapper,
     ) -> Result<messages::MessagesResponse> {
         self.apply_message_defaults(&mut request)?;
+        let tool_names = self.provider_wire.as_ref().map_or_else(Vec::new, |route| {
+            route.prepare_messages(&mut request.inner, self.defaults.auth_scheme)
+        });
 
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
@@ -1607,11 +1710,19 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let provider_body = self.provider_body(&request.inner)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("messages"));
-        let http_request = grok_headers.apply(builder).json(&request.inner);
+        } = match provider_body.as_ref() {
+            Some(body) => self.post_json(self.endpoint("messages"), body),
+            None => self.post(self.endpoint("messages")),
+        };
+        let builder = self.apply_grok_headers(builder, &grok_headers);
+        let http_request = match provider_body.as_ref() {
+            Some(body) => builder.json(body),
+            None => builder.json(&request.inner),
+        };
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1655,8 +1766,8 @@ impl SamplingClient {
             });
         }
 
-        let response_obj =
-            serde_json::from_slice::<messages::MessagesResponse>(&bytes).map_err(|e| {
+        let mut response_obj = serde_json::from_slice::<messages::MessagesResponse>(&bytes)
+            .map_err(|e| {
                 let raw_body = String::from_utf8_lossy(&bytes);
                 tracing::error!(
                     error = %e,
@@ -1665,6 +1776,9 @@ impl SamplingClient {
                 );
                 SamplingError::Serialization(e)
             })?;
+        if let Some(route) = &self.provider_wire {
+            route.restore_message_response(&mut response_obj, &tool_names);
+        }
         Ok(response_obj)
     }
 
@@ -1696,6 +1810,9 @@ impl SamplingClient {
 
         // Enable streaming
         request.inner.stream = Some(true);
+        let tool_names = self.provider_wire.as_ref().map_or_else(Vec::new, |route| {
+            route.prepare_messages(&mut request.inner, self.defaults.auth_scheme)
+        });
 
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
@@ -1720,14 +1837,21 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let provider_body = self.provider_body(&request.inner)?;
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("messages"));
-        let http_request = grok_headers
-            .apply(builder)
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&request.inner);
+        } = match provider_body.as_ref() {
+            Some(body) => self.post_json(self.endpoint("messages"), body),
+            None => self.post(self.endpoint("messages")),
+        };
+        let builder = self
+            .apply_grok_headers(builder, &grok_headers)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let http_request = match provider_body.as_ref() {
+            Some(body) => builder.json(body),
+            None => builder.json(&request.inner),
+        };
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1811,8 +1935,9 @@ impl SamplingClient {
         // Map SSE events into MessageStreamEvent.
         // Uses `scan` so transport errors terminate the stream after the first
         // error (same pattern as `chat_completion_stream`).
+        let provider_wire = self.provider_wire.clone();
         let events = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
@@ -1834,16 +1959,21 @@ impl SamplingClient {
                             Some(Err(stream_error))
                         } else {
                             Some(
-                                serde_json::from_str::<messages::MessageStreamEvent>(data).map_err(
-                                    |e| {
+                                serde_json::from_str::<messages::MessageStreamEvent>(data)
+                                    .map(|mut event| {
+                                        if let Some(route) = &provider_wire {
+                                            route.restore_message_event(&mut event, &tool_names);
+                                        }
+                                        event
+                                    })
+                                    .map_err(|e| {
                                         tracing::error!(
                                             error = %e,
                                             raw_data = %data,
                                             "Failed to deserialize MessageStreamEvent from stream"
                                         );
                                         SamplingError::Serialization(e)
-                                    },
-                                ),
+                                    }),
                             )
                         }
                     }
@@ -1856,6 +1986,120 @@ impl SamplingClient {
             })
             .boxed();
 
+        Ok((events, model_metadata))
+    }
+
+    async fn conversation_stream_radius(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<messages::MessageStreamEvent>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        let model_id = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.defaults.model.clone());
+        let request_id = request
+            .x_grok_req_id
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = request.x_grok_session_id.clone();
+        let reasoning = request.reasoning_effort.map(|value| value.as_str());
+        let messages_request = build_messages_request(&request);
+        let mut body = radius_payload(
+            &model_id,
+            &messages_request,
+            session_id.as_deref(),
+            reasoning,
+        );
+        if let Some(route) = &self.provider_wire {
+            route.sanitize_body(&mut body, &self.defaults.api_backend);
+        }
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post_json(self.endpoint("messages"), &body);
+        let built_request = builder
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+            .json(&body)
+            .build()
+            .map_err(SamplingError::Http)?;
+        let response = self.http.execute(built_request).await.map_err(|error| {
+            record_stream_request_failure(&error);
+            SamplingError::Http(error)
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::MessagesStream,
+                    sent_bearer.as_deref(),
+                );
+                let endpoint = self.endpoint("messages");
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
+            }
+            let model_metadata = extract_model_metadata(response.headers());
+            let retry_after_secs = extract_retry_after(response.headers());
+            let should_retry = extract_should_retry(response.headers());
+            let bytes = response.bytes().await?;
+            return Err(SamplingError::Api {
+                status,
+                message: user_facing_api_error_message(status, bytes.as_ref()),
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+            });
+        }
+        let model_metadata = extract_model_metadata(response.headers());
+        let mut source = response.bytes_stream().eventsource();
+        let mut decoder = PiMessagesEventDecoder::new(model_id, request_id);
+        let events = async_stream::stream! {
+            let mut terminal = false;
+            while let Some(event) = source.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        yield Err(SamplingError::EventStreamError(error.to_string()));
+                        return;
+                    }
+                };
+                if event.data == "[DONE]" {
+                    break;
+                }
+                match decoder.decode(&event.data) {
+                    Ok(decoded) => {
+                        for event in decoded {
+                            terminal |= matches!(
+                                event,
+                                messages::MessageStreamEvent::MessageStop
+                                    | messages::MessageStreamEvent::Error { .. }
+                            );
+                            yield Ok(event);
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+            if !terminal {
+                yield Err(SamplingError::EventStreamError(
+                    "Radius stream ended without a terminal event".to_owned(),
+                ));
+            }
+        }
+        .boxed();
         Ok((events, model_metadata))
     }
 
@@ -2019,6 +2263,13 @@ impl SamplingClient {
             .map_err(|_| {
                 SamplingError::InvalidConfiguration("checkpoint requires Responses API")
             })?;
+        if self
+            .provider_wire
+            .as_ref()
+            .is_some_and(ProviderWireRoute::is_radius)
+        {
+            return self.conversation_stream_radius(request).await;
+        }
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();

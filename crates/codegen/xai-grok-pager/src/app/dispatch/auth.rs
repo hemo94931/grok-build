@@ -127,7 +127,10 @@ pub(super) fn scrollback_has_recent_reauth_prompt(
     for idx in (0..scrollback.len()).rev() {
         match scrollback.entry(idx).map(|e| &e.block) {
             Some(RenderBlock::SessionEvent(ev)) => {
-                if matches!(ev.event, SessionEvent::ReAuthRequired) {
+                if matches!(
+                    ev.event,
+                    SessionEvent::ReAuthRequired | SessionEvent::ProviderReAuthRequired { .. }
+                ) {
                     return true;
                 }
             }
@@ -182,6 +185,7 @@ pub(super) fn strip_trailing_auth_error_blocks(agent: &mut AgentView) {
                 if matches!(
                     &ev.event,
                     SessionEvent::ReAuthRequired
+                        | SessionEvent::ProviderReAuthRequired { .. }
                         | SessionEvent::RetryFailed { .. }
                         | SessionEvent::TurnFailed { .. }
                 ) =>

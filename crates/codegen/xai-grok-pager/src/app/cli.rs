@@ -20,7 +20,14 @@ pub enum Command {
     /// Manage running leader processes
     Leader(LeaderMgmtArgs),
     /// Sign out and clear cached credentials
-    Logout,
+    Logout {
+        /// Provider to sign out from (`xai`, `anthropic`, etc.).
+        #[arg(long, conflicts_with = "all")]
+        provider: Option<String>,
+        /// Sign out from xAI and every configured provider.
+        #[arg(long, conflicts_with = "provider")]
+        all: bool,
+    },
     /// Sign in to Grok
     Login {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
@@ -36,6 +43,12 @@ pub enum Command {
             conflicts_with_all = ["oauth"]
         )]
         device_auth: bool,
+        /// Provider to sign in to (`xai`, `anthropic`, etc.).
+        #[arg(long, conflicts_with = "all")]
+        provider: Option<String>,
+        /// Sign in to xAI and every provider, in order.
+        #[arg(long, conflicts_with = "provider")]
+        all: bool,
         /// Authenticate for remote development environments (hidden).
         ///
         /// Field is always present so match arms stay feature-unification-safe
@@ -1382,8 +1395,41 @@ mod tests {
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                provider: None,
+                all: false
+            })
+        ));
         assert!(args.prompt.is_none());
+    }
+    #[test]
+    fn login_and_logout_accept_provider_or_all() {
+        let login = PagerArgs::try_parse_from(["grok", "login", "--provider", "anthropic"])
+            .expect("provider login parses");
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                provider: Some(ref provider),
+                all: false,
+                ..
+            }) if provider == "anthropic"
+        ));
+
+        let logout = PagerArgs::try_parse_from(["grok", "logout", "--all"])
+            .expect("all-provider logout parses");
+        assert!(matches!(
+            logout.command,
+            Some(Command::Logout {
+                provider: None,
+                all: true
+            })
+        ));
+        assert!(
+            PagerArgs::try_parse_from(["grok", "login", "--provider", "anthropic", "--all"])
+                .is_err()
+        );
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

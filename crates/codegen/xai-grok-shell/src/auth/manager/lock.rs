@@ -286,6 +286,19 @@ fn holder_state(file: &mut File) -> HolderState {
 
 // ── Single-iteration acquire logic ───────────────────────────────────
 
+fn lock_is_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // LockFileEx reports contention as a raw Win32 error instead of
+    // ErrorKind::WouldBlock on some Rust/fs2 combinations.
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return true;
+    }
+    false
+}
+
 /// Outcome of one lock attempt.
 enum LockAttempt {
     /// Lock acquired; inner file holds the flock.
@@ -382,7 +395,7 @@ fn try_acquire_once(lock_path: &Path, stuck_live: StuckLivePolicy) -> LockAttemp
         }
 
         // Step 4: EWOULDBLOCK — lock is held by someone else.
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+        Err(e) if lock_is_contended(&e) => {
             let breakable = match holder_state(&mut file) {
                 HolderState::Dead => true,
                 HolderState::StuckLive => match stuck_live {
@@ -718,6 +731,14 @@ mod tests {
 
     // ── Pure-function unit tests (no runtime needed) ─────────────────
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_violation_is_classified_as_contention() {
+        assert!(lock_is_contended(&io::Error::from_raw_os_error(32)));
+        assert!(lock_is_contended(&io::Error::from_raw_os_error(33)));
+        assert!(!lock_is_contended(&io::Error::from_raw_os_error(5)));
+    }
+
     #[test]
     fn test_write_and_parse_holder_info() {
         let dir = TempDir::new().unwrap();
@@ -807,13 +828,14 @@ mod tests {
         let lock_path = path.with_file_name("auth.json.lock");
 
         let lock = try_lock_auth_file_nonblocking(&path).expect("uncontended non-blocking acquire");
+        // Windows denies a second handle access to the exclusively locked
+        // byte range, so release before inspecting the persisted holder info.
+        drop(lock);
 
         let content = std::fs::read_to_string(&lock_path).unwrap();
         let (pid, _ts) =
             parse_holder_info(&content).expect("non-blocking acquire must write parseable info");
         assert_eq!(pid, std::process::id());
-
-        drop(lock);
     }
 
     #[test]
@@ -1182,17 +1204,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = auth_json_path(&dir);
 
-        let lock = try_lock_auth_file_async(&path, StdDuration::from_secs(1)).await;
-        assert!(lock.is_some(), "should acquire lock");
+        let lock = try_lock_auth_file_async(&path, StdDuration::from_secs(1))
+            .await
+            .expect("should acquire lock");
+        // Windows denies a second handle access while the range is locked.
+        drop(lock);
 
         // Verify lock file has holder info.
         let lock_path = path.with_file_name("auth.json.lock");
         let content = std::fs::read_to_string(&lock_path).unwrap();
         let (pid, _ts) = parse_holder_info(&content).unwrap();
         assert_eq!(pid, std::process::id());
-
-        // Release.
-        drop(lock);
 
         // Re-acquire should succeed.
         let lock2 = try_lock_auth_file_async(&path, StdDuration::from_secs(1)).await;

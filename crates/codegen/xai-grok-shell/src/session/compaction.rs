@@ -1536,11 +1536,17 @@ impl SessionActor {
         }
 
         // Remote compaction has one eligibility rule: server-first strategy,
-        // the agent policy enabled, the Responses backend, no continuity
+        // the agent policy enabled, a supported Responses route, no continuity
         // migration, and no checkpoint quota pressure.
+        let server_route_supported = responses::responses_route_capabilities(
+            &actor_snapshot.sampling_config.model,
+            &actor_snapshot.sampling_config.base_url,
+        )
+        .supports_remote_compaction;
         let server_candidate = matches!(strategy, CompactionStrategy::ServerFirst)
             && self.agent.borrow().compaction_policy().server_compaction
             && actor_snapshot.sampling_config.api_backend == ApiBackend::Responses
+            && server_route_supported
             && migration_reason.is_none();
         let session_dir = crate::session::persistence::session_dir(&self.session_info);
         let quota_bytes = crate::session::compaction_gc::session_checkpoint_quota_bytes();
@@ -2194,6 +2200,8 @@ impl SessionActor {
                 "feature_off"
             } else if actor_snapshot.sampling_config.api_backend != ApiBackend::Responses {
                 "non_responses"
+            } else if !server_route_supported {
+                "unsupported_route"
             } else if quota_pressure {
                 "quota_exceeded"
             } else {

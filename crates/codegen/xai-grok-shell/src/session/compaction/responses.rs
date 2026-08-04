@@ -98,6 +98,23 @@ fn keyed_principal_fingerprint(class: &str, key: &str) -> String {
     format!("{:x}", hash.finalize())
 }
 
+pub(super) fn responses_route_capabilities(
+    model: &str,
+    base_url: &str,
+) -> crate::auth::providers::ProviderCapabilities {
+    if let Some((provider, _)) = crate::auth::providers::parse_namespaced_model_id(model) {
+        return crate::auth::providers::provider_descriptor(provider).capabilities;
+    }
+    if model.contains('/') || !crate::util::is_xai_api_url(base_url) {
+        return crate::auth::providers::ProviderCapabilities::default();
+    }
+    crate::auth::providers::ProviderCapabilities {
+        supports_remote_compaction: true,
+        accepts_responses_checkpoint: true,
+        supports_xai_hosted_tools: true,
+    }
+}
+
 impl SessionActor {
     pub(crate) fn compact_credential(
         &self,
@@ -108,8 +125,11 @@ impl SessionActor {
             .auth_manager
             .as_ref()
             .and_then(|manager| manager.current_wire_valid());
-        let uses_session_auth = auth.as_ref().is_some_and(|auth| auth.key == key)
-            || (config.bearer_resolver.is_some() && auth.is_some());
+        let provider_route =
+            crate::auth::providers::parse_namespaced_model_id(&config.model).is_some();
+        let uses_session_auth = !provider_route
+            && (auth.as_ref().is_some_and(|auth| auth.key == key)
+                || (config.bearer_resolver.is_some() && auth.is_some()));
         let principal = if uses_session_auth {
             stable_auth_principal_fingerprint(auth.as_ref()?)?
         } else if let Some(deployment_id) = config.deployment_id.as_deref() {
@@ -199,7 +219,17 @@ impl SessionActor {
             .get_sampling_config()
             .await
             .ok_or_else(|| acp::Error::internal_error().data("missing sampling config"))?;
-        if sampling.api_backend != ApiBackend::Responses {
+        if sampling.api_backend != ApiBackend::Responses
+            || !responses_route_capabilities(&sampling.model, &sampling.base_url)
+                .supports_remote_compaction
+        {
+            return Ok(None);
+        }
+        let full_config = self.reconstruct_full_config().await;
+        if full_config.api_backend != ApiBackend::Responses
+            || !responses_route_capabilities(&full_config.model, &full_config.base_url)
+                .supports_remote_compaction
+        {
             return Ok(None);
         }
 
@@ -239,7 +269,6 @@ impl SessionActor {
             acp::Error::internal_error().data("responses_compaction_missing_request_revision")
         })?;
 
-        let full_config = self.reconstruct_full_config().await;
         full_config.apply_conversation_defaults_to(&mut request);
         request.parallel_tool_calls = Some(true);
         let routing_model = request
@@ -259,11 +288,7 @@ impl SessionActor {
             return Ok(None);
         };
         let endpoint_fingerprint = client.responses_compact_endpoint_fingerprint();
-        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
-            "xai".to_string()
-        } else {
-            "openai_compatible".to_string()
-        };
+        let provider_id = "xai".to_string();
         let trusted_envelope = self.current_trusted_envelope(&request).await?;
         let live_wrapper = request.items.first().and_then(|item| match item {
             ConversationItem::ResponsesCompactionCheckpoint(wrapper) => Some(wrapper.clone()),
@@ -519,6 +544,13 @@ impl SessionActor {
                 acp::Error::internal_error().data("responses_compaction_invalid_checkpoint_layout")
             );
         }
+        let model = request.model.as_deref().unwrap_or(&full_config.model);
+        if !responses_route_capabilities(model, &full_config.base_url).accepts_responses_checkpoint
+        {
+            return self
+                .run_checkpoint_builtin_migration(request, full_config, "unsupported_route")
+                .await;
+        }
         if full_config.api_backend != ApiBackend::Responses {
             return self
                 .run_checkpoint_builtin_migration(request, full_config, "non_responses")
@@ -540,11 +572,7 @@ impl SessionActor {
             .model
             .clone()
             .unwrap_or_else(|| full_config.model.clone());
-        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
-            "xai".to_string()
-        } else {
-            "openai_compatible".to_string()
-        };
+        let provider_id = "xai".to_string();
         let identity = xai_grok_sampling_types::CheckpointIdentity {
             provider_id: provider_id.clone(),
             api: "responses".into(),
@@ -929,5 +957,33 @@ impl SessionActor {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_compaction_route_capabilities_fail_closed() {
+        let xai = responses_route_capabilities("grok-4", "https://api.x.ai/v1");
+        assert!(xai.supports_remote_compaction);
+        assert!(xai.accepts_responses_checkpoint);
+
+        for provider in crate::auth::providers::ProviderId::ALL {
+            let route =
+                responses_route_capabilities(&format!("{provider}/model"), "https://api.x.ai/v1");
+            assert!(!route.supports_remote_compaction, "{provider}");
+            assert!(!route.accepts_responses_checkpoint, "{provider}");
+        }
+
+        for (model, base_url) in [
+            ("unknown/model", "https://api.x.ai/v1"),
+            ("custom", "https://example.com/v1"),
+        ] {
+            let route = responses_route_capabilities(model, base_url);
+            assert!(!route.supports_remote_compaction, "{model} {base_url}");
+            assert!(!route.accepts_responses_checkpoint, "{model} {base_url}");
+        }
     }
 }

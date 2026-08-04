@@ -6,6 +6,7 @@ use crate::auth::{AuthManager, GrokComConfig, OidcAuthConfig};
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::{config::StorageMode, sampling::ApiBackend, tools::config::ShellToolsetConfig};
 use agent_client_protocol as acp;
+use anyhow::Context;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
@@ -3526,6 +3527,7 @@ pub(crate) fn resolve_model_list(
         }
         resolved = prefetched;
     }
+    crate::agent::provider_models::append_available_provider_models(&mut resolved);
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
@@ -4763,13 +4765,124 @@ pub(crate) fn first_own_credential(
         .map(str::to_owned)
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
-/// Priority: model api_key/env_key > cached auth-provider token > session
-/// token > XAI_API_KEY.
+fn build_provider_request_context(
+    model: &ModelEntry,
+    provider: crate::auth::ProviderId,
+    upstream_model_id: &str,
+    secret: crate::auth::providers::ProviderSecret,
+    credential: Option<&crate::auth::providers::ProviderCredential>,
+) -> anyhow::Result<crate::auth::providers::ProviderRequestContext> {
+    let descriptor = crate::auth::providers::provider_descriptor(provider);
+    let configured_base = model.info.base_url.trim_end_matches('/');
+    let base_url_override = (!configured_base.is_empty()
+        && configured_base != descriptor.base_url.trim_end_matches('/'))
+    .then_some(configured_base);
+    crate::auth::providers::ProviderRequestContext::build(
+        provider,
+        upstream_model_id,
+        secret,
+        credential,
+        base_url_override,
+        Some(model.info.api_backend.clone()),
+        None,
+    )
+}
+
+pub(crate) fn resolve_provider_request_context(
+    model: &ModelEntry,
+) -> anyhow::Result<Option<crate::auth::providers::ProviderRequestContext>> {
+    let Some((provider, upstream_model_id)) =
+        crate::auth::providers::parse_namespaced_model_id(&model.info.model)
+    else {
+        return Ok(None);
+    };
+    let (secret, credential) =
+        crate::auth::providers::resolve_provider_secret(provider, model.own_credential())?;
+    build_provider_request_context(
+        model,
+        provider,
+        upstream_model_id,
+        secret,
+        credential.as_ref(),
+    )
+    .map(Some)
+}
+
+/// Re-read provider state for every turn. Stored OAuth credentials are refreshed
+/// under the shared auth lock; model BYOK remains the highest-priority source.
+pub(crate) async fn resolve_fresh_provider_request_context(
+    model_id: &str,
+) -> anyhow::Result<Option<crate::auth::providers::ProviderRequestContext>> {
+    let Some((provider, upstream_model_id)) =
+        crate::auth::providers::parse_namespaced_model_id(model_id)
+    else {
+        return Ok(None);
+    };
+    let raw =
+        crate::config::load_effective_config().context("config load failed for provider route")?;
+    let cfg = Config::new_from_toml_cfg(&raw)
+        .map_err(anyhow::Error::msg)
+        .context("config parse failed for provider route")?;
+    let models = resolve_model_list(&cfg, None);
+    let model = find_model_by_id(&models, model_id)
+        .cloned()
+        .with_context(|| format!("provider model `{model_id}` is not available"))?;
+
+    let (secret, credential) = if let Some(token) = model.own_credential() {
+        (
+            crate::auth::providers::ProviderSecret::from_model(provider, token)?,
+            None,
+        )
+    } else if let Some(credential) =
+        crate::auth::providers::fresh_stored_credential(provider, None).await?
+    {
+        (
+            crate::auth::providers::ProviderSecret::from_oauth(provider, &credential),
+            Some(credential),
+        )
+    } else {
+        let secret = crate::auth::providers::ProviderSecret::from_environment(provider)?
+            .with_context(|| format!("{provider} credentials are missing"))?;
+        (secret, None)
+    };
+    build_provider_request_context(
+        &model,
+        provider,
+        upstream_model_id,
+        secret,
+        credential.as_ref(),
+    )
+    .map(Some)
+}
+
+/// Priority for provider models: model api_key/env_key > provider store >
+/// provider environment > fail closed. Other models retain the existing
+/// model/provider/session/XAI_API_KEY chain.
 pub(crate) fn resolve_credentials(
     model: &ModelEntry,
     session_key: Option<&str>,
 ) -> ResolvedCredentials {
     let info = model.info();
+    if crate::auth::providers::parse_namespaced_model_id(&info.model).is_some() {
+        return match resolve_provider_request_context(model) {
+            Ok(Some(context)) => ResolvedCredentials {
+                api_key: Some(context.token),
+                base_url: context.base_url,
+                auth_type: xai_chat_state::AuthType::ApiKey,
+                auth_scheme: context.auth_scheme,
+            },
+            Ok(None) => unreachable!("namespaced provider model must resolve a provider route"),
+            Err(error) => {
+                tracing::warn!(model = %info.model, %error, "provider credentials unavailable; failing closed");
+                ResolvedCredentials {
+                    api_key: None,
+                    base_url: info.base_url.clone(),
+                    auth_type: xai_chat_state::AuthType::ApiKey,
+                    auth_scheme: info.auth_scheme,
+                }
+            }
+        };
+    }
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
@@ -5071,7 +5184,9 @@ pub(crate) fn stamp_session_local_sampler_fields(
     max_retries: Option<u32>,
 ) {
     cfg.client_identifier = client_identifier;
-    cfg.attribution_callback = active_session_config.attribution_callback.clone();
+    if crate::auth::providers::parse_namespaced_model_id(&cfg.model).is_none() {
+        cfg.attribution_callback = active_session_config.attribution_callback.clone();
+    }
     if crate::util::is_xai_api_bearer_url(&cfg.base_url) {
         cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
     }
@@ -5129,45 +5244,62 @@ pub(crate) fn sampling_config_for_model(
     user_id: Option<String>,
 ) -> SamplerConfig {
     let info = model.info();
-    let model_name = info.model.clone();
-    let max_completion_tokens = info.max_completion_tokens;
-    let temperature = info.temperature;
-    let top_p = info.top_p;
+    let provider = crate::auth::providers::parse_namespaced_model_id(&info.model)
+        .map(|(provider, _)| provider);
+    let provider_context =
+        provider.and_then(|_| resolve_provider_request_context(model).ok().flatten());
     let mut extra_headers = info.extra_headers.clone();
-    inject_url_derived_headers(
-        &mut extra_headers,
-        alpha_test_key.as_deref(),
-        &credentials.base_url,
-    );
-    let api_backend = info.api_backend.clone();
+    if let Some(context) = provider_context.as_ref() {
+        for (name, value) in &context.headers {
+            extra_headers.insert(name.clone(), value.clone());
+        }
+    } else {
+        inject_url_derived_headers(
+            &mut extra_headers,
+            alpha_test_key.as_deref(),
+            &credentials.base_url,
+        );
+    }
+    let stored_oauth = provider_context.as_ref().is_some_and(|context| {
+        context.credential_source == crate::auth::providers::ProviderSecretSource::StoredOAuth
+    });
+    let is_provider = provider.is_some();
     SamplerConfig {
         api_key: credentials.api_key,
-        model: model_name,
+        model: info.model.clone(),
         base_url: credentials.base_url,
-        max_completion_tokens,
-        temperature,
-        top_p,
-        api_backend,
+        max_completion_tokens: info.max_completion_tokens,
+        temperature: info.temperature,
+        top_p: info.top_p,
+        api_backend: info.api_backend.clone(),
         auth_scheme: credentials.auth_scheme,
         extra_headers,
         query_params: info.query_params.clone(),
         env_http_headers: info.env_http_headers.clone(),
         context_window: info.context_window.get(),
-        client_version,
+        client_version: if is_provider { None } else { client_version },
         reasoning_effort: info.reasoning_effort,
         force_http1: false,
         max_retries: info.max_retries,
-        stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
+        stream_tool_calls: !is_provider && info.stream_tool_calls.unwrap_or(false),
         idle_timeout_secs: None,
         client_identifier: None,
-        deployment_id,
-        user_id,
+        deployment_id: if is_provider { None } else { deployment_id },
+        user_id: if is_provider { None } else { user_id },
         origin_client: None,
         attribution_callback: None,
-        bearer_resolver: None,
-        supports_backend_search: info.supports_backend_search,
-        compactions_remaining: info.compactions_remaining,
-        compaction_at_tokens: info.compaction_at_tokens,
+        bearer_resolver: stored_oauth.then(|| {
+            crate::auth::providers::provider_bearer_resolver(
+                provider.expect("stored provider context has a provider"),
+            )
+        }),
+        supports_backend_search: !is_provider && info.supports_backend_search,
+        compactions_remaining: (!is_provider)
+            .then_some(info.compactions_remaining)
+            .flatten(),
+        compaction_at_tokens: (!is_provider)
+            .then_some(info.compaction_at_tokens)
+            .flatten(),
         doom_loop_recovery: None,
         header_injector: None,
     }
@@ -8029,6 +8161,27 @@ reasoning_effort = "low"
                 .any(|m| m.name == "oauth-only-model")
         );
         assert!(oauth_available.values().any(|m| m.name == "public-model"));
+    }
+    #[test]
+    fn provider_models_bypass_xai_auth_visibility_in_picker_projection() {
+        use crate::agent::models::{available_models, resolve_model_catalog};
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [model."anthropic/claude-test"]
+            name = "Claude Test"
+            model = "anthropic/claude-test"
+            base_url = "https://api.anthropic.com"
+            context_window = 200000
+            supported_in_api = false
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        let available = available_models(&resolve_model_catalog(&cfg, None), false);
+        let model = available
+            .get(&acp::ModelId::new("anthropic/claude-test"))
+            .expect("provider model remains visible without xAI session auth");
+        assert_eq!(model.name, "Anthropic · Claude Test");
     }
     #[test]
     fn inference_idle_timeout_secs_round_trip() {

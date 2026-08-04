@@ -1188,7 +1188,8 @@ pub fn is_reauthable_failure(error_type: Option<&str>, message: &str) -> bool {
     if matches!(error_type, Some("legacy_auth") | Some("auth_transient")) {
         return false;
     }
-    error_type == Some("auth") || message.contains("Unauthorized (401)")
+    error_type.is_some_and(|kind| kind == "auth" || kind.starts_with("provider_auth:"))
+        || message.contains("Unauthorized (401)")
 }
 
 /// Status updates for relay sync (session sharing) feature.

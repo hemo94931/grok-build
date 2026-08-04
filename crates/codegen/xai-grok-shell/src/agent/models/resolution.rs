@@ -154,10 +154,22 @@ pub fn available_models(
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth))
+        .filter(|(id, entry)| {
+            !entry.info.hidden
+                && (crate::auth::providers::parse_namespaced_model_id(id).is_some()
+                    || entry.info.visible_for_auth(is_session_auth))
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    config::to_acp_model_info(&visible)
+    let mut available = config::to_acp_model_info(&visible);
+    for (id, info) in &mut available {
+        if let Some((provider, _)) =
+            crate::auth::providers::parse_namespaced_model_id(id.0.as_ref())
+        {
+            info.name = format!("{} · {}", provider.display_name(), info.name);
+        }
+    }
+    available
 }
 
 /// Compiled glob matcher shared by `allowed_models`, `disabled_models`, and `hidden_models` (matched against catalog key or model id).

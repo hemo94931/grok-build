@@ -963,15 +963,71 @@ pub async fn run_cli_login(
     oauth: bool,
     device_auth: bool,
     devbox: bool,
+    provider: Option<&str>,
+    all: bool,
 ) -> anyhow::Result<()> {
-    // Devbox never reaches the login funnel, so it reports nothing and needs
-    // no telemetry client — and `AuthManager::new` is not free (it logs, and
-    // may rewrite auth.json to drop a stale scope).
     if devbox {
+        if provider.is_some() || all {
+            anyhow::bail!("--devbox cannot be combined with --provider or --all");
+        }
         let auth = super::devbox_login::run_devbox_login(config).await?;
         return apply_post_login_config(auth).await;
     }
 
+    let targets = cli_provider_targets(provider, all, "sign in").await?;
+    let mode = if oauth {
+        Some(super::providers::LoginMode::Browser)
+    } else if device_auth {
+        Some(super::providers::LoginMode::DeviceCode)
+    } else {
+        None
+    };
+    for target in targets {
+        match target {
+            super::providers::ProviderTarget::Xai => {
+                run_cli_xai_login(config, oauth, device_auth).await?
+            }
+            super::providers::ProviderTarget::Provider(provider) => {
+                let interaction = super::providers::CliAuthInteraction::new();
+                super::providers::login_and_store(provider, &interaction, mode).await?;
+                super::providers::report_provider_login(provider);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cli_provider_targets(
+    provider: Option<&str>,
+    all: bool,
+    action: &str,
+) -> anyhow::Result<Vec<super::providers::ProviderTarget>> {
+    if provider.is_some() && all {
+        anyhow::bail!("--provider and --all cannot be combined");
+    }
+    if all {
+        return Ok(std::iter::once(super::providers::ProviderTarget::Xai)
+            .chain(
+                super::providers::ProviderId::ALL
+                    .into_iter()
+                    .map(super::providers::ProviderTarget::Provider),
+            )
+            .collect());
+    }
+    if let Some(provider) = provider {
+        return Ok(vec![super::providers::ProviderTarget::parse(provider)?]);
+    }
+    if super::providers::terminal_is_interactive() {
+        return Ok(vec![super::providers::select_target(action).await?]);
+    }
+    Ok(vec![super::providers::ProviderTarget::Xai])
+}
+
+async fn run_cli_xai_login(
+    config: &crate::agent::config::Config,
+    oauth: bool,
+    device_auth: bool,
+) -> anyhow::Result<()> {
     // Agent bootstrap is what normally initializes the product telemetry
     // client, and `grok login` never boots an agent, so without this every
     // event this process emits is dropped before reaching a sink. One manager
@@ -1145,9 +1201,31 @@ pub fn perform_logout(
     })
 }
 
-/// `grok logout` CLI handler. Calls [`perform_logout`] and formats
-/// the result to stderr.
-pub fn run_cli_logout(config: &crate::agent::config::Config) -> anyhow::Result<()> {
+/// `grok logout` CLI handler. Clears the selected provider credentials.
+pub async fn run_cli_logout(
+    config: &crate::agent::config::Config,
+    provider: Option<&str>,
+    all: bool,
+) -> anyhow::Result<()> {
+    for target in cli_provider_targets(provider, all, "sign out").await? {
+        match target {
+            super::providers::ProviderTarget::Xai => run_cli_xai_logout(config)?,
+            super::providers::ProviderTarget::Provider(provider) => {
+                if super::providers::logout(provider).await? {
+                    eprintln!("Logged out of {}.", provider.display_name());
+                } else {
+                    eprintln!(
+                        "No cached {} session to log out of.",
+                        provider.display_name()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_cli_xai_logout(config: &crate::agent::config::Config) -> anyhow::Result<()> {
     let grok_home = grok_home::grok_home();
     let auth_manager = AuthManager::new(&grok_home, config.grok_com_config.clone());
     let result = perform_logout(&auth_manager, None)

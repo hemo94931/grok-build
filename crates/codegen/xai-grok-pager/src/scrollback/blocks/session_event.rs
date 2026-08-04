@@ -91,6 +91,9 @@ pub enum SessionEvent {
     /// points the user at `/login` to re-authenticate, replacing the raw
     /// "Retry failed: Unauthorized (401) …" dump.
     ReAuthRequired,
+    /// A non-xAI provider rejected its credential. The provider name keeps the
+    /// recovery command scoped so xAI login and billing state remain untouched.
+    ProviderReAuthRequired { provider: String },
     /// Terminal context overflow — ideally unreachable, since auto-compaction should
     /// shrink the conversation first; a safeguard for when it didn't (estimate drift
     /// vs the server's max_prompt_length, or compaction suppressed/failed). One actionable
@@ -220,6 +223,10 @@ impl SessionEvent {
                  your message."
                     .to_string()
             }
+            SessionEvent::ProviderReAuthRequired { provider } => format!(
+                "{provider} rejected its credentials. Run /login {provider} to \
+                 re-authenticate, then resend your message."
+            ),
             SessionEvent::ContextTooLarge => {
                 "This conversation is too large for the model's context window. \
                  Use /new to start a new session."
@@ -522,6 +529,7 @@ impl BlockContent for SessionEventBlock {
         let style = if matches!(
             self.event,
             SessionEvent::ReAuthRequired
+                | SessionEvent::ProviderReAuthRequired { .. }
                 | SessionEvent::ContextTooLarge
                 | SessionEvent::CompactionFailed { .. }
         ) {
@@ -570,6 +578,7 @@ impl BlockContent for SessionEventBlock {
         if matches!(
             self.event,
             SessionEvent::ReAuthRequired
+                | SessionEvent::ProviderReAuthRequired { .. }
                 | SessionEvent::ContextTooLarge
                 | SessionEvent::CompactionFailed { .. }
         ) {

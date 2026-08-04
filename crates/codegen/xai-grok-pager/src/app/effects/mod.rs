@@ -88,6 +88,24 @@ pub(crate) fn execute(
                     TaskResult::LogoutComplete
                 });
         }
+        Effect::ProviderLogin {
+            agent_id,
+            session_id,
+            provider,
+            request_seq,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                send_provider_login(&tx, agent_id, session_id, provider, request_seq).await
+            });
+        }
+        Effect::ProviderLogout {
+            agent_id,
+            provider,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { send_provider_logout(&tx, agent_id, provider).await });
+        }
         Effect::CancelAuth { request_seq } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move { send_auth_cancel(&tx, request_seq).await });

@@ -26,6 +26,7 @@ mod modes;
 mod notes;
 mod permissions;
 mod prompt;
+mod provider_auth;
 mod queue;
 mod rewind;
 mod router;

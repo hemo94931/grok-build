@@ -847,6 +847,63 @@ pub(super) fn session_picker_entry_to_roster(
         },
     }
 }
+pub(super) async fn send_provider_login(
+    tx: &AcpAgentTx,
+    agent_id: AgentId,
+    session_id: acp::SessionId,
+    provider: String,
+    request_seq: u64,
+) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/providerAuth/login",
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "provider": provider,
+            "sessionId": session_id.0,
+            "requestSeq": request_seq,
+        }))
+        .expect("serialize provider login params")
+        .into(),
+    );
+    let result = acp_send(req, tx)
+        .await
+        .map(|_| ())
+        .map_err(|error| sanitize_user_error(&error.to_string()));
+    TaskResult::ProviderLoginComplete {
+        agent_id,
+        provider,
+        result,
+    }
+}
+
+pub(super) async fn send_provider_logout(
+    tx: &AcpAgentTx,
+    agent_id: AgentId,
+    provider: String,
+) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/providerAuth/logout",
+        serde_json::value::to_raw_value(&serde_json::json!({ "provider": provider }))
+            .expect("serialize provider logout params")
+            .into(),
+    );
+    let result = match acp_send(req, tx).await {
+        Ok(response) => serde_json::from_str::<serde_json::Value>(response.0.get())
+            .map_err(|error| error.to_string())
+            .map(|value| {
+                value
+                    .get("wasLoggedIn")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
+        Err(error) => Err(sanitize_user_error(&error.to_string())),
+    };
+    TaskResult::ProviderLogoutComplete {
+        agent_id,
+        provider,
+        result,
+    }
+}
+
 pub(super) async fn send_logout(tx: &AcpAgentTx) {
     let req = acp::ExtRequest::new(
         "x.ai/auth/logout",

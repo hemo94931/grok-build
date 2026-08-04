@@ -12,14 +12,16 @@ On first launch, Grok opens your browser to authenticate with grok.com:
 grok
 ```
 
-Grok stores credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
+Grok stores xAI credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
 ### Credential storage
 
-Tokens in `~/.grok/auth.json` (and MCP OAuth tokens in `~/.grok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
+xAI credentials stay in `~/.grok/auth.json`. OAuth credentials for additional model providers stay in a separate `~/.grok/providers.json`; the files have different schemas and are never merged. Writes to both files share `auth.json.lock` so concurrent login and token refresh operations cannot overwrite each other.
+
+Tokens in both files (and MCP OAuth tokens in `~/.grok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
 
 - Prefer full-disk encryption (FileVault, BitLocker, LUKS, or equivalent).
-- Do not copy `auth.json` or `mcp_credentials.json` into shared directories, tickets, or chat.
+- Do not copy `auth.json`, `providers.json`, or `mcp_credentials.json` into shared directories, tickets, or chat.
 - On multi-user hosts, keep `$HOME` / `$GROK_HOME` private to your account.
 
 ### Re-authenticate
@@ -30,14 +32,48 @@ To switch accounts or resolve an authentication problem, run:
 grok login
 ```
 
-Running `grok login` starts the sign-in flow again, replacing your cached session. By default, it opens your browser and signs in through SpaceXAI OAuth at `auth.x.ai`. Pass a flag to select a different flow:
+Running `grok login` starts the sign-in flow again, replacing your cached session. In an interactive terminal it first asks which provider to use; in a non-interactive terminal it defaults to xAI. Pass a flag to select the transport:
 
 | Flag | Description |
 |------|-------------|
-| `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
-| `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
+| `--oauth` | Force browser OAuth. For xAI this uses `auth.x.ai`. |
+| `--device-auth` (alias `--device-code`) | Force device-code authentication for providers that support it. |
 
-To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
+Use `grok logout` to select and clear one cached provider session.
+
+---
+
+## Additional Model Providers
+
+Grok can authenticate with Anthropic, OpenAI Codex, GitHub Copilot, OpenRouter, Kimi Coding, and Radius. Select a provider explicitly or process every provider in sequence:
+
+```bash
+grok login --provider anthropic
+grok login --provider openai-codex --device-auth
+grok login --all
+
+grok logout --provider radius
+grok logout --all
+```
+
+Valid provider IDs are `xai`, `anthropic`, `openai-codex`, `github-copilot`, `openrouter`, `kimi-coding`, and `radius`. `--provider` and `--all` are mutually exclusive. A forced browser or device flow fails clearly when that provider does not support it.
+
+In the TUI, use `/login <provider>` and `/logout <provider>`; argument completion shows the same provider list. Provider models appear in the model picker as `Provider · Model`. A provider-specific 401 prompts you to re-authenticate only that provider.
+
+### Provider environment keys
+
+API keys are read from the environment; there is no interactive API-key prompt. OpenAI Codex supports OAuth only.
+
+| Provider | Login flow | Environment keys |
+|----------|------------|------------------|
+| Anthropic | Browser | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+| OpenAI Codex | Browser or device code | None |
+| GitHub Copilot | Device code | `COPILOT_GITHUB_TOKEN` |
+| OpenRouter | Browser | `OPENROUTER_API_KEY` |
+| Kimi Coding | Device code | `KIMI_API_KEY` |
+| Radius | Browser or device code | `RADIUS_API_KEY` |
+
+For a provider model, credential precedence is: per-model key, that provider's stored OAuth credential, then that provider's environment keys. The route fails locally if none is available. It never falls back to the xAI session token or `XAI_API_KEY`, and a provider login or refresh does not change the active xAI authentication method.
 
 ---
 
@@ -50,7 +86,7 @@ export XAI_API_KEY="xai-..."
 grok
 ```
 
-Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.grok/auth.json`.
+Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout --provider xai` or delete `~/.grok/auth.json`.
 
 ---
 
@@ -205,7 +241,7 @@ your SSO session lapsed and it needs you to sign in again — Grok stops treatin
 the stored credential as usable and starts the interactive flow instead, the
 same one you get on a machine that has never signed in. That run has a long
 timeout and shows your binary's stderr, so a device-code URL or a browser prompt
-reaches you. Mid-session, the turn fails with a re-auth prompt and `/login`
+reaches you. Mid-session, the turn fails with a re-auth prompt and `/login xai`
 re-runs the binary interactively.
 
 ### Environment Variables
@@ -260,13 +296,15 @@ Grok picks up changes to `~/.grok/auth.json` automatically. If you update creden
 
 ---
 
-## Auth Precedence
+## xAI Auth Precedence
 
-Grok resolves credentials for each request in this order, highest to lowest:
+For xAI requests, Grok resolves credentials in this order, highest to lowest:
 
 1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
-2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.grok/auth.json`.
-3. **`XAI_API_KEY`** -- fallback when no session token is active.
+2. **Active xAI session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.grok/auth.json`.
+3. **`XAI_API_KEY`** -- fallback when no xAI session token is active.
+
+Additional providers use the separate precedence documented in [Provider environment keys](#provider-environment-keys); the two credential chains never cross.
 
 When more than one login flow is configured, Grok populates the session token from the first available source, highest to lowest:
 
@@ -332,7 +370,7 @@ RUST_LOG=debug grok -p "hello" 2> /tmp/grok.log
 
 ### Common fixes
 
-- **"Authentication failed"** -- Run `grok logout` to clear cached credentials, then `grok login` to sign in again.
+- **"Authentication failed"** -- Run `grok logout --provider <provider>` to clear that provider's cached credentials, then `grok login --provider <provider>` to sign in again.
 - **Token expires too quickly** -- Set `auth_token_ttl` or return `expires_in` in your auth provider's JSON output.
 - **OIDC redirect fails** -- Ensure your IdP allows loopback redirect URIs (`http://127.0.0.1/callback`).
 - **External auth provider not found** -- Check that the `auth_provider_command` path is correct and the binary is executable.

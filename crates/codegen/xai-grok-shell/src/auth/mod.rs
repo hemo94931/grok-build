@@ -12,6 +12,7 @@ mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub(crate) mod providers;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 pub(crate) mod single_flight;
@@ -49,6 +50,7 @@ pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{
     TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired, token_suffix,
 };
+pub(crate) use providers::{ProviderId, ProviderStore};
 pub(crate) use refresh::DiagnosticUploader;
 pub use storage::{
     clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,

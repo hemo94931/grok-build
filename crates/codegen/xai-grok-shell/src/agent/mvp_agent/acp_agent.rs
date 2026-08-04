@@ -3700,6 +3700,9 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/suggest" => crate::extensions::suggest::handle(self, &args).await,
             "x.ai/suggestPrompt" => crate::extensions::suggest::handle(self, &args).await,
+            s if s.starts_with("x.ai/providerAuth/") => {
+                crate::extensions::provider_auth::handle(self, &args).await
+            }
             s if s.starts_with("x.ai/auth/") => {
                 crate::extensions::auth::handle(self, &args).await
             }

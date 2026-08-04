@@ -647,6 +647,10 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// Sign in to one non-xAI model provider without changing xAI auth state.
+    ProviderLogin(String),
+    /// Sign out from one non-xAI model provider without changing xAI auth state.
+    ProviderLogout(String),
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1976,6 +1980,15 @@ pub enum Effect {
     },
     /// Log out via `x.ai/auth/logout` (shell clears auth.json + in-memory state).
     Logout,
+    /// Sign in through the provider-scoped auth RPC.
+    ProviderLogin {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        provider: String,
+        request_seq: u64,
+    },
+    /// Sign out through the provider-scoped auth RPC.
+    ProviderLogout { agent_id: AgentId, provider: String },
     /// Cancel an in-flight interactive auth on the shell (`x.ai/auth/cancel`).
     /// Used when the user abandons mid-session `/login` so the device-code
     /// poll stops instead of running until the code expires. `request_seq`
@@ -2731,6 +2744,18 @@ pub enum TaskResult {
     },
     /// Shell acknowledged logout (auth cleared).
     LogoutComplete,
+    /// A provider-scoped login finished.
+    ProviderLoginComplete {
+        agent_id: AgentId,
+        provider: String,
+        result: Result<(), String>,
+    },
+    /// A provider-scoped logout finished.
+    ProviderLogoutComplete {
+        agent_id: AgentId,
+        provider: String,
+        result: Result<bool, String>,
+    },
     /// Best-effort `x.ai/auth/cancel` finished (no UI update; state already left Authenticating).
     AuthCancelComplete,
     /// Shell responded to `x.ai/auth/check_subscription`. `verify` echoes

@@ -19,6 +19,7 @@ use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
     handle_suggestion_debounce_expired,
 };
+use super::provider_auth::{handle_login_complete, handle_logout_complete};
 use super::rewind::{
     dispatch_rewind_success, handle_rewind_execute_failed, handle_rewind_points_loaded,
     handle_rewind_preview_complete, handle_rewind_preview_failed,
@@ -1204,6 +1205,16 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.welcome_prompt_focused = false;
             effects
         }
+        TaskResult::ProviderLoginComplete {
+            agent_id,
+            provider,
+            result,
+        } => handle_login_complete(app, agent_id, provider, result),
+        TaskResult::ProviderLogoutComplete {
+            agent_id,
+            provider,
+            result,
+        } => handle_logout_complete(app, agent_id, provider, result),
         TaskResult::DeepSearchResults { results, seq } => {
             handle_deep_search_results(app, results, seq)
         }

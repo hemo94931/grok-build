@@ -344,6 +344,47 @@ impl SessionActor {
         self.set_chat_api_key(new_key).await;
         true
     }
+    async fn try_oauth_provider_401_recovery(
+        &self,
+        provider: crate::auth::ProviderId,
+        model_id: &str,
+        sent_credential: xai_grok_sampling_types::SentCredential,
+    ) -> bool {
+        let context = match crate::agent::config::resolve_fresh_provider_request_context(model_id)
+            .await
+        {
+            Ok(Some(context)) => context,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(%provider, %error, "provider 401 recovery could not rebuild route");
+                return false;
+            }
+        };
+        if context.credential_source != crate::auth::providers::ProviderSecretSource::StoredOAuth {
+            return false;
+        }
+        if sent_credential.is_missing() {
+            self.set_chat_api_key(context.token).await;
+            return true;
+        }
+        let rejected = self
+            .chat_state_handle
+            .get_credentials()
+            .await
+            .api_key
+            .unwrap_or(context.token);
+        match crate::auth::providers::fresh_stored_credential(provider, Some(&rejected)).await {
+            Ok(Some(credential)) => {
+                self.set_chat_api_key(credential.access).await;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(%provider, %error, "provider 401 token refresh failed");
+                false
+            }
+        }
+    }
     /// Gate inputs for `model_id` routed to `base_url`. See
     /// [`crate::agent::auth_method::session_token_auth_gate`] for the rationale
     /// (`base_url` keeps an `Unknown` BYOK status refreshable only
@@ -427,6 +468,83 @@ impl SessionActor {
                 stream_tool_calls: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
+        if let Some((provider, _)) = crate::auth::providers::parse_namespaced_model_id(&cfg.model) {
+            let context =
+                crate::agent::config::resolve_fresh_provider_request_context(&cfg.model).await;
+            let context = match context {
+                Ok(Some(context)) => Some(context),
+                Ok(None) => unreachable!("namespaced provider model must resolve a provider route"),
+                Err(error) => {
+                    tracing::warn!(model = %cfg.model, %error, "provider route unavailable; request will fail closed locally");
+                    None
+                }
+            };
+            let mut extra_headers = cfg.extra_headers;
+            if let Some(context) = context.as_ref() {
+                for (name, value) in &context.headers {
+                    extra_headers.insert(name.clone(), value.clone());
+                }
+            }
+            let descriptor = crate::auth::providers::provider_descriptor(provider);
+            let stored_oauth = context.as_ref().is_some_and(|context| {
+                context.credential_source
+                    == crate::auth::providers::ProviderSecretSource::StoredOAuth
+            });
+            if stored_oauth
+                && let Some(context) = context.as_ref()
+                && creds.api_key.as_deref() != Some(context.token.as_str())
+            {
+                self.set_chat_api_key(context.token.clone()).await;
+            }
+            return SamplingConfig {
+                api_key: context.as_ref().map(|context| context.token.clone()),
+                base_url: context
+                    .as_ref()
+                    .map(|context| context.base_url.clone())
+                    .unwrap_or_else(|| {
+                        if cfg.base_url.trim().is_empty() {
+                            descriptor.base_url.to_owned()
+                        } else {
+                            cfg.base_url.clone()
+                        }
+                    }),
+                model: cfg.model,
+                max_completion_tokens: cfg.max_completion_tokens,
+                temperature: cfg.temperature,
+                top_p: cfg.top_p,
+                api_backend: context
+                    .as_ref()
+                    .map(|context| context.api_backend.clone())
+                    .unwrap_or(cfg.api_backend),
+                auth_scheme: context
+                    .as_ref()
+                    .map_or(xai_grok_sampler::AuthScheme::Bearer, |context| {
+                        context.auth_scheme
+                    }),
+                extra_headers,
+                query_params: cfg.query_params,
+                env_http_headers: cfg.env_http_headers,
+                context_window: cfg.context_window.get(),
+                client_version: None,
+                reasoning_effort: cfg.reasoning_effort,
+                force_http1: false,
+                max_retries: Some(self.max_retries),
+                stream_tool_calls: false,
+                idle_timeout_secs: None,
+                client_identifier: None,
+                deployment_id: None,
+                user_id: None,
+                origin_client: self.origin_client.clone(),
+                attribution_callback: None,
+                bearer_resolver: stored_oauth
+                    .then(|| crate::auth::providers::provider_bearer_resolver(provider)),
+                supports_backend_search: false,
+                compactions_remaining: None,
+                compaction_at_tokens: None,
+                doom_loop_recovery: None,
+                header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            };
+        }
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         let auth_method = self.auth_method_id.load();
         let gate =
@@ -769,11 +887,17 @@ impl SessionActor {
         model: &str,
     ) -> Option<crate::session::cache_routing::SessionCacheRouting> {
         let (_, principal) = self.compact_credential(full_config)?;
-        let provider_id = if crate::util::is_xai_api_url(&full_config.base_url) {
-            "xai"
-        } else {
-            "openai_compatible"
-        };
+        let provider_id = crate::auth::providers::parse_namespaced_model_id(&full_config.model)
+            .map_or_else(
+                || {
+                    if crate::util::is_xai_api_url(&full_config.base_url) {
+                        "xai"
+                    } else {
+                        "openai_compatible"
+                    }
+                },
+                |(provider, _)| provider.as_str(),
+            );
         let session_dir = crate::session::persistence::session_dir(&self.session_info);
         match crate::session::cache_routing::load_or_create(
             &session_dir,
@@ -835,18 +959,34 @@ impl SessionActor {
     /// repeated 401s ended in silence.
     pub(crate) async fn fail_turn_auth_budget_exhausted(&self, message: String) -> acp::Error {
         const STATUS: Option<u16> = Some(401);
-        let (error_type, message) = match self.auth_manager.as_ref() {
-            Some(auth_manager) => self.apply_auth_remedy(
-                &auth_manager.auth_remedy().after_retries_exhausted(),
-                message,
-                STATUS,
-            ),
-            None => ("auth", message),
+        let provider = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .and_then(|config| {
+                crate::auth::providers::parse_namespaced_model_id(&config.model)
+                    .map(|(provider, _)| provider)
+            });
+        let (error_type, message) = if let Some(provider) = provider {
+            (
+                format!("provider_auth:{provider}"),
+                format!("{message}\n\nRun /login {provider} to re-authenticate."),
+            )
+        } else {
+            let (error_type, message) = match self.auth_manager.as_ref() {
+                Some(auth_manager) => self.apply_auth_remedy(
+                    &auth_manager.auth_remedy().after_retries_exhausted(),
+                    message,
+                    STATUS,
+                ),
+                None => ("auth", message),
+            };
+            (error_type.to_owned(), message)
         };
-        self.log_terminal_failure(error_type, STATUS, &message);
+        self.log_terminal_failure(&error_type, STATUS, &message);
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
-                error_type: error_type.to_owned(),
+                error_type,
                 message: message.clone(),
             },
         ))
@@ -991,17 +1131,20 @@ impl SessionActor {
             .await
             .map(|c| (c.model, c.base_url))
             .unwrap_or_default();
-        let auth_provider =
-            if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
-                self.model_auth_provider(&failed_model_id)
-            } else {
-                None
-            };
+        let auth_failure =
+            matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401);
+        let auth_provider = auth_failure
+            .then(|| self.model_auth_provider(&failed_model_id))
+            .flatten();
+        let oauth_provider = auth_failure
+            .then(|| crate::auth::providers::parse_namespaced_model_id(&failed_model_id))
+            .flatten()
+            .map(|(provider, _)| provider);
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
             let gate = self.auth_gate(&failed_model_id, &failed_base_url);
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
-            if !eligible && auth_provider.is_none() {
+            if !eligible && auth_provider.is_none() && oauth_provider.is_none() {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
                     is_session_based = gate.is_session_based,
@@ -1024,12 +1167,13 @@ impl SessionActor {
             eligible
         };
         debug_assert!(
-            !(auth_recovery_eligible && auth_provider.is_some()),
+            !(auth_recovery_eligible && (auth_provider.is_some() || oauth_provider.is_some())),
             "a provider-backed model must not be session-recovery-eligible"
         );
         if !matches!(error.kind, SamplingErrorKind::Auth)
             && error.status_code == Some(401)
             && auth_provider.is_none()
+            && oauth_provider.is_none()
         {
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401 not eligible (non-auth error kind)",
@@ -1066,6 +1210,17 @@ impl SessionActor {
         }
         if let Some(ref provider) = auth_provider
             && self.try_provider_401_recovery(provider).await
+        {
+            self.prepare_sampler_for_turn().await;
+            return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                credential: error.credential,
+                store: RecoveredStore::AuthProvider,
+            });
+        }
+        if let Some(provider) = oauth_provider
+            && self
+                .try_oauth_provider_401_recovery(provider, &failed_model_id, error.credential)
+                .await
         {
             self.prepare_sampler_for_turn().await;
             return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
@@ -1155,6 +1310,9 @@ impl SessionActor {
                     provider.name
                 ),
                 );
+            } else if let Some(provider) = oauth_provider {
+                msg.push_str(&format!("\n  Provider:  {provider}"));
+                msg.push_str(&format!("\n  Re-auth:   /login {provider}"));
             }
             msg.push_str(&format!("\n  Version:   {client_version}"));
             if available.is_empty() {
@@ -1173,23 +1331,28 @@ impl SessionActor {
         } else {
             detailed_message
         };
-        let error_type = if xai_grok_sampling_types::is_context_length_error(&error.message) {
-            "context_length"
+        let error_type = if is_auth_401 && let Some(provider) = oauth_provider {
+            format!("provider_auth:{provider}")
+        } else if xai_grok_sampling_types::is_context_length_error(&error.message) {
+            "context_length".to_owned()
         } else {
-            error.kind.as_str()
+            error.kind.as_str().to_owned()
         };
         let (error_type, detailed_message) = match self.auth_manager.as_ref() {
-            Some(auth_manager) if error_type == "auth" => self.apply_auth_remedy(
-                &auth_manager.auth_remedy(),
-                detailed_message,
-                error.status_code,
-            ),
+            Some(auth_manager) if error_type == "auth" => {
+                let (error_type, message) = self.apply_auth_remedy(
+                    &auth_manager.auth_remedy(),
+                    detailed_message,
+                    error.status_code,
+                );
+                (error_type.to_owned(), message)
+            }
             _ => (error_type, detailed_message),
         };
-        self.log_terminal_failure(error_type, error.status_code, &detailed_message);
+        self.log_terminal_failure(&error_type, error.status_code, &detailed_message);
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
-                error_type: error_type.to_string(),
+                error_type,
                 message: detailed_message.clone(),
             },
         ))
@@ -1431,6 +1594,12 @@ impl SessionActor {
             .await
             .map(|c| c.model)
             .unwrap_or_default();
+        if crate::auth::providers::parse_namespaced_model_id(&current_model_id).is_some() {
+            // Provider OAuth refresh and full route rebuild happen together in
+            // reconstruct_full_config; never feed these tokens into the legacy
+            // config.toml JWT refresh path below.
+            return;
+        }
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,

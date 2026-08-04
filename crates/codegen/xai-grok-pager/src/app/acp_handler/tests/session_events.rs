@@ -422,6 +422,10 @@
             "Unauthorized (401) from https://proxy/v1/responses"
         ));
         assert!(is_reauthable_failure(None, "Unauthorized (401)"));
+        assert!(is_reauthable_failure(
+            Some("provider_auth:anthropic"),
+            "credential rejected"
+        ));
         // legacy_auth carries its own migration guidance — excluded.
         assert!(!is_reauthable_failure(
             Some("legacy_auth"),
@@ -465,6 +469,27 @@
             "auth 401 must surface the actionable re-auth prompt"
         );
         assert!(!session.credit_limit_blocked);
+    }
+
+    #[test]
+    fn provider_auth_failure_names_the_provider_login_command() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "provider_auth:anthropic".into(),
+                message: "Unauthorized (401)".into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        let Some(SessionEvent::ProviderReAuthRequired { provider }) =
+            last_session_event(&scrollback)
+        else {
+            panic!("provider 401 must keep its provider identity");
+        };
+        assert_eq!(provider, "anthropic");
     }
 
     /// A recoverable auth failure preserves `in_flight_prompt` so the

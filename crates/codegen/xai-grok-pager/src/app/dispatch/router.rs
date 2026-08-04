@@ -46,6 +46,9 @@ use super::prompt::{
     dispatch_send_bash_command, dispatch_send_prompt, dispatch_send_prompt_inner,
     dispatch_show_plan_nudge, dispatch_show_undo_tip, dispatch_show_word_select_tip,
 };
+use super::provider_auth::{
+    dispatch_login as dispatch_provider_login, dispatch_logout as dispatch_provider_logout,
+};
 use super::queue;
 use super::queue::dispatch_drain_queue;
 use super::rewind::{
@@ -1079,6 +1082,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PermissionFollowup(text) => dispatch_permission_followup(app, text),
         Action::PermissionCancel => dispatch_permission_cancel(app),
         Action::Logout => dispatch_logout(app),
+        Action::ProviderLogout(provider) => dispatch_provider_logout(app, provider),
         Action::SwitchAccount => dispatch_switch_account(app),
         Action::CheckSubscription => vec![Effect::CheckSubscription { verify: None }],
         Action::OpenSupergrokUrl => dispatch_open_supergrok_url(app),
@@ -1130,6 +1134,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::Login => dispatch_login(app),
+        Action::ProviderLogin(provider) => dispatch_provider_login(app, provider),
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
         Action::CopyAuthUrl => {

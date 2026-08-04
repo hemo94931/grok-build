@@ -1367,6 +1367,13 @@ pub(super) fn apply_retry_state(
             is_credit_limit = super::super::dispatch::is_credit_limit_error(None, message);
             if is_credit_limit {
                 session.credit_limit_blocked = true;
+            } else if let Some(provider) = error_type.strip_prefix("provider_auth:") {
+                is_reauth = true;
+                scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::ProviderReAuthRequired {
+                        provider: provider.to_owned(),
+                    },
+                ));
             } else if is_reauthable_failure(Some(error_type.as_str()), message) {
                 is_reauth = true;
                 scrollback.push_block(RenderBlock::session_event(SessionEvent::ReAuthRequired));

@@ -69,7 +69,7 @@ pub(crate) const AUTH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 /// Lock timeout for `refresh_chain`, held across the IdP call to prevent
 /// refresh-token reuse. Must exceed the external-auth refresh budget
 /// (a single 7s run) so followers wait rather than retry.
-const REFRESH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+pub(crate) const REFRESH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 
 /// Long poll interval used by the proactive refresh task when no
 /// productive refresh is possible (see [`compute_proactive_sleep`]).

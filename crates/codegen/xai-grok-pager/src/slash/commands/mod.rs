@@ -46,6 +46,7 @@ pub mod personas;
 pub mod plan;
 pub mod plugin;
 pub mod privacy;
+mod providers;
 pub mod queue;
 pub mod recap;
 pub mod release_notes;
@@ -222,6 +223,20 @@ mod tests {
             "/vim-mode should be registered"
         );
         assert!(reg.get("find").is_some(), "/find should be registered");
+    }
+    #[test]
+    fn login_and_logout_route_selected_provider() {
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        assert!(matches!(
+            login::LoginCommand.run(&mut ctx, "anthropic"),
+            CommandResult::Action(Action::ProviderLogin(provider)) if provider == "anthropic"
+        ));
+        assert!(matches!(
+            logout::LogoutCommand.run(&mut ctx, "xai"),
+            CommandResult::Action(Action::Logout)
+        ));
+        assert!(login::LoginCommand.args_required());
     }
     #[test]
     fn loop_command_declares_scheduler_tool_requirement() {
