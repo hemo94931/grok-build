@@ -1055,12 +1055,14 @@ impl acp::Agent for MvpAgent {
         let campaign_nudge = if is_chat_kind {
             None
         } else {
-            crate::util::config::campaign_driven_models_default()
-                    .filter(|c| {
-                        build_custom_model_id.is_none()
-                            || build_custom_model_id == c.pre_campaign.as_deref()
-                            || build_custom_model_id == Some(c.value.as_str())
-                    })
+            let cli_model_override = self.cfg.borrow().default_model_override.is_some();
+            crate::util::config::campaign_driven_models_default().filter(|c| {
+                crate::util::config::campaign_nudge_allowed(
+                    cli_model_override,
+                    build_custom_model_id,
+                    c,
+                )
+            })
         };
         let campaign_nudged = campaign_nudge.is_some();
         if let Some(c) = &campaign_nudge {

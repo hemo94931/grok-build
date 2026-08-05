@@ -246,6 +246,26 @@ pub struct CampaignModelsDefault {
     pub pre_campaign: Option<String>,
 }
 
+/// Whether a campaign default may retarget a session's model choice.
+/// Explicit per-invocation requests win: the agent `-m` flag
+/// (`default_model_override`) always suppresses the nudge, and an ACP
+/// `meta.modelId` other than the pre-campaign default or the campaign value
+/// does too (the TUI picks a model via `/model`, which dismisses the
+/// campaign separately; connected clients get `meta.modelId` injected by
+/// the leader, but standalone `grok agent -m X stdio` has no such
+/// injection — without the `-m` guard a campaign would silently retarget
+/// the CLI-selected model).
+pub fn campaign_nudge_allowed(
+    cli_model_override_present: bool,
+    requested: Option<&str>,
+    campaign: &CampaignModelsDefault,
+) -> bool {
+    !cli_model_override_present
+        && (requested.is_none()
+            || requested == campaign.pre_campaign.as_deref()
+            || requested == Some(campaign.value.as_str()))
+}
+
 /// Resolve [`CampaignModelsDefault`] fresh from the config layers, the remote
 /// campaign cache, and the on-disk dismiss state.
 ///
@@ -468,6 +488,46 @@ pub async fn persist_models_default(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn campaign() -> CampaignModelsDefault {
+        CampaignModelsDefault {
+            value: "grok-4.5".to_owned(),
+            pre_campaign: Some("glm-5.2".to_owned()),
+        }
+    }
+
+    #[test]
+    fn campaign_nudge_applies_when_nothing_requested() {
+        assert!(campaign_nudge_allowed(false, None, &campaign()));
+    }
+
+    #[test]
+    fn campaign_nudge_applies_to_pre_campaign_and_campaign_values() {
+        let c = campaign();
+        assert!(campaign_nudge_allowed(false, Some("glm-5.2"), &c));
+        assert!(campaign_nudge_allowed(false, Some("grok-4.5"), &c));
+    }
+
+    #[test]
+    fn campaign_nudge_skipped_for_explicit_meta_model() {
+        // e.g. an ACP client asking for a provider model must not be retargeted.
+        assert!(!campaign_nudge_allowed(
+            false,
+            Some("openai-codex/gpt-5.6-luna"),
+            &campaign()
+        ));
+    }
+
+    #[test]
+    fn campaign_nudge_skipped_when_cli_model_flag_present() {
+        // `grok agent -m X` is an explicit per-invocation choice: standalone
+        // stdio sessions carry no meta.modelId, so without the -m guard the
+        // campaign would silently replace the CLI-selected model (observed
+        // live: session ran the campaign model instead of the -m model).
+        assert!(!campaign_nudge_allowed(true, None, &campaign()));
+        assert!(!campaign_nudge_allowed(true, Some("glm-5.2"), &campaign()));
+    }
+
     use tempfile::tempdir;
     use xai_grok_config::ConfigLayers;
     use xai_grok_test_support::EnvGuard;
