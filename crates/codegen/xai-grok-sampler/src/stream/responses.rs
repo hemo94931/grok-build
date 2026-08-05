@@ -164,6 +164,13 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut next_tool_index: u32 = 0;
 
+        // Completed output items as they stream by. Some backends (ChatGPT
+        // Codex) send every item exclusively via `response.output_item.done`
+        // and leave `response.output` EMPTY in the terminal
+        // `response.completed` frame; without this backfill the final
+        // response looks content-less and the retry loop resamples forever.
+        let mut streamed_items: Vec<rs::OutputItem> = Vec::new();
+
         let mut stream = raw_stream;
         loop {
             let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
@@ -404,6 +411,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                    streamed_items.push(done_event.item.clone());
                     match &done_event.item {
                         rs::OutputItem::WebSearchCall(ws) => {
                             let result = serde_json::to_value(ws).ok();
@@ -498,6 +506,13 @@ pub(crate) fn stream_responses_tracked<'a>(
                 return;
             }
         };
+
+        // Codex-style backends report `output: []` in the terminal frame and
+        // deliver content solely through streamed item events; reconstruct
+        // `output` from those items so text and tool calls survive.
+        if response.output.is_empty() && !streamed_items.is_empty() {
+            response.output = std::mem::take(&mut streamed_items);
+        }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
         // `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative
@@ -726,6 +741,62 @@ mod tests {
 
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn message_item_done_event(text: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: 0,
+            output_index: 0,
+            item: rs_types::OutputItem::Message(rs_types::OutputMessage {
+                id: "msg-1".into(),
+                role: rs_types::AssistantRole::Assistant,
+                status: rs_types::OutputStatus::Completed,
+                content: vec![rs_types::OutputMessageContent::OutputText(
+                    rs_types::OutputTextContent {
+                        annotations: vec![],
+                        logprobs: None,
+                        text: text.into(),
+                    },
+                )],
+            }),
+        })
+    }
+
+    /// ChatGPT Codex backend contract: content arrives exclusively via
+    /// `response.output_item.done`; the terminal `response.completed` frame
+    /// carries `output: []`. Without the streamed-item backfill the response
+    /// looks empty and the actor resamples forever.
+    #[tokio::test]
+    async fn empty_completed_output_backfilled_from_streamed_items() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("AUTH_OK")),
+            Ok(message_item_done_event("AUTH_OK")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert!(
+                    response.empty_reason().is_none(),
+                    "backfilled response must not report an empty reason"
+                );
+                assert_eq!(
+                    response.assistant().map(|a| a.content.as_ref()),
+                    Some("AUTH_OK")
+                );
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
             }
             other => panic!("expected Completed, got {other:?}"),
