@@ -1,0 +1,23 @@
+{
+  "skill_name": "provider-backend-debug",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我在 grok-build 仓库接入了一个新的第三方 provider 路由（类似 openai-codex），单轮测试时模型请求一直返回 HTTP 400 Bad Request，错误信息只有 'Request failed (HTTP 400)' 没有细节。帮我定位到底是请求里哪个字段被后端拒绝。",
+      "expected_output": "使用 capture_proxy.py 抓取真实请求体，用 curl 重放并逐步修复，再用 probe_params.py 枚举完整的参数接受/拒绝表；修复落在 provider_wire.rs 对应 ProviderKind 分支内，并补契约测试。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "grok 用 codex 模型跑 agent 任务时挂住了：日志显示每隔约 30 秒重复一次完全相同的模型请求，模型明明已经回答了但就是不停。什么原因，怎么修？",
+      "expected_output": "识别出 response.completed 帧 output 为空、内容只走流式 output_item.done 的后端特性；指出空响应重采样循环；修复在 stream/responses.rs 做流式项回填，并区分这是 bug 而非设计行为。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "想验证 grok-build 的远程压缩（responses/compact）在某个支持该能力的后端上是否端到端可用，包括压缩后 checkpoint 回放。给我一个可操作的验证流程。",
+      "expected_output": "给出大会话构造方法（超过信封 ~9.5k tokens）、抓包确认 compact 端点与请求体合规、检查 responses_server checkpoint 落盘、下一轮 input 回放 compaction_summary 项且后端接受；并说明小会话 fallback 到本地摘要是设计行为。",
+      "files": []
+    }
+  ]
+}
