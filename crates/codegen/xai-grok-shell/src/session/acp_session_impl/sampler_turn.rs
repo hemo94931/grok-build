@@ -1849,7 +1849,7 @@ fn terminal_failure_attributes(
         );
         object.insert(
             "key_prefix".to_owned(),
-            auth.map(|value| crate::auth::token_suffix(&value.key).to_owned())
+            auth.map(|value| xai_grok_auth::bearer_suffix(&value.key).to_owned())
                 .into(),
         );
         object.insert(

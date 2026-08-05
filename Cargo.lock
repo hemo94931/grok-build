@@ -13844,6 +13844,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xai-grok-auth",
  "xai-grok-extra-ca",
  "xai-grok-sampling-types",
  "xai-grok-test-support",
