@@ -25,12 +25,6 @@ pub(crate) enum ProviderWireDialect {
     PiMessages,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ProviderCapabilities {
-    pub(crate) supports_remote_compaction: bool,
-    pub(crate) accepts_responses_checkpoint: bool,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderDescriptor {
     pub(crate) id: ProviderId,
@@ -40,11 +34,9 @@ pub(crate) struct ProviderDescriptor {
     pub(crate) api_backend: ApiBackend,
     pub(crate) wire_dialect: ProviderWireDialect,
     pub(crate) env_keys: &'static [&'static str],
-    pub(crate) capabilities: ProviderCapabilities,
 }
 
 pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
-    let capabilities = ProviderCapabilities::default();
     match id {
         ProviderId::Anthropic => ProviderDescriptor {
             id,
@@ -58,7 +50,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
                 "ANTHROPIC_OAUTH_TOKEN",
                 "ANTHROPIC_API_KEY",
             ],
-            capabilities,
         },
         ProviderId::OpenaiCodex => ProviderDescriptor {
             id,
@@ -68,14 +59,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::Responses,
             wire_dialect: ProviderWireDialect::OpenaiCodexResponses,
             env_keys: &[],
-            // The ChatGPT backend hosts a working standalone compaction
-            // endpoint (`codex/responses/compact`, verified live) whose
-            // `compaction_summary` output shape matches the first-party
-            // contract, and it accepts checkpoint items replayed in `input`.
-            capabilities: ProviderCapabilities {
-                supports_remote_compaction: true,
-                accepts_responses_checkpoint: true,
-            },
         },
         ProviderId::GithubCopilot => ProviderDescriptor {
             id,
@@ -85,7 +68,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::ChatCompletions,
             wire_dialect: ProviderWireDialect::GithubCopilot,
             env_keys: &["COPILOT_GITHUB_TOKEN"],
-            capabilities,
         },
         ProviderId::Openrouter => ProviderDescriptor {
             id,
@@ -95,7 +77,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::ChatCompletions,
             wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
             env_keys: &["OPENROUTER_API_KEY"],
-            capabilities,
         },
         ProviderId::KimiCoding => ProviderDescriptor {
             id,
@@ -105,7 +86,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::Messages,
             wire_dialect: ProviderWireDialect::KimiAnthropicMessages,
             env_keys: &["KIMI_API_KEY"],
-            capabilities,
         },
         ProviderId::Radius => ProviderDescriptor {
             id,
@@ -118,7 +98,6 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::Messages,
             wire_dialect: ProviderWireDialect::PiMessages,
             env_keys: &["RADIUS_API_KEY"],
-            capabilities,
         },
     }
 }
@@ -306,7 +285,6 @@ pub(crate) struct ProviderRequestContext {
     pub(crate) headers: IndexMap<String, String>,
     pub(crate) api_backend: ApiBackend,
     pub(crate) wire_dialect: ProviderWireDialect,
-    pub(crate) capabilities: ProviderCapabilities,
     pub(crate) catalog_model_id: String,
     pub(crate) upstream_model_id: String,
     pub(crate) credential_source: ProviderSecretSource,
@@ -352,7 +330,6 @@ impl ProviderRequestContext {
             headers,
             api_backend: api_backend_override.unwrap_or(descriptor.api_backend),
             wire_dialect: wire_dialect_override.unwrap_or(descriptor.wire_dialect),
-            capabilities: descriptor.capabilities,
             catalog_model_id: namespaced_model_id(provider_id, &upstream_model_id),
             upstream_model_id,
             credential_source: secret.source,
@@ -371,7 +348,6 @@ impl fmt::Debug for ProviderRequestContext {
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("api_backend", &self.api_backend)
             .field("wire_dialect", &self.wire_dialect)
-            .field("capabilities", &self.capabilities)
             .field("catalog_model_id", &self.catalog_model_id)
             .field("upstream_model_id", &self.upstream_model_id)
             .field("credential_source", &self.credential_source)
@@ -480,22 +456,6 @@ mod tests {
             Some((ProviderId::Openrouter, "anthropic/claude-sonnet"))
         );
         assert!(parse_namespaced_model_id("grok-4").is_none());
-    }
-
-    #[test]
-    fn non_xai_routes_except_codex_fail_closed_for_first_party_capabilities() {
-        for provider in ProviderId::ALL {
-            let capabilities = provider_descriptor(provider).capabilities;
-            if provider == ProviderId::OpenaiCodex {
-                // Live-verified: `chatgpt.com/backend-api/codex/responses/compact`
-                // returns first-party-shaped `compaction_summary` output.
-                assert!(capabilities.supports_remote_compaction);
-                assert!(capabilities.accepts_responses_checkpoint);
-            } else {
-                assert!(!capabilities.supports_remote_compaction);
-                assert!(!capabilities.accepts_responses_checkpoint);
-            }
-        }
     }
 
     #[test]

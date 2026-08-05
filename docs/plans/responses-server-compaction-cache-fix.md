@@ -7,7 +7,8 @@ Responses 远程压缩现在只有一套实现，不再包含旧 checkpoint writ
 默认行为：
 
 - Responses backend 默认优先调用 `POST /responses/compact`；
-- 服务端不支持、请求失败或返回无效结果时，自动回退到 builtin compaction；
+- 资格规则只看两条：`server_compaction` 开关开启 + 当前模型走 Responses backend，与 base_url 无关（自定义端点同样适用）；
+- 服务端不支持、请求失败或返回无效结果时，自动回退到 builtin compaction（不支持的端点会被 negative capability cache 记住，1 小时内直接走 builtin）；
 - 不需要额外的 writer 开关或会话百分比环境变量；
 - 旧会话中的历史远程 checkpoint 格式不再兼容。
 
