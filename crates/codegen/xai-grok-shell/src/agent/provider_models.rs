@@ -47,6 +47,8 @@ pub(crate) fn append_available_provider_models(resolved: &mut IndexMap<String, M
             info.extra_headers = model.headers;
             info.context_window = context_window;
             info.supports_reasoning_effort = model.reasoning;
+            info.reasoning_effort = model.reasoning_effort;
+            info.reasoning_efforts = model.reasoning_efforts;
             resolved.insert(
                 catalog_id,
                 ModelEntry {

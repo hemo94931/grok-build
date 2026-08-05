@@ -4,6 +4,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
 use xai_grok_sampler::ApiBackend;
+use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
 
 use super::{ProviderCredential, ProviderId};
 
@@ -18,6 +19,13 @@ pub(crate) struct ProviderCatalogModel {
     pub(crate) reasoning: bool,
     pub(crate) context_window: u64,
     pub(crate) max_tokens: u32,
+    /// Per-model default reasoning effort; `None` lets the backend decide.
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Advertised reasoning-effort menu. Empty = no catalog-level
+    /// validation (legacy fallback menu in the UI).
+    #[serde(default)]
+    pub(crate) reasoning_efforts: Vec<ReasoningEffortOption>,
     #[serde(default)]
     pub(crate) headers: IndexMap<String, String>,
 }
@@ -86,6 +94,8 @@ fn radius_models(credential: Option<&ProviderCredential>) -> Vec<ProviderCatalog
                 reasoning: model.get("reasoning")?.as_bool()?,
                 context_window: model.get("contextWindow")?.as_u64()?,
                 max_tokens: u32::try_from(model.get("maxTokens")?.as_u64()?).ok()?,
+                reasoning_effort: None,
+                reasoning_efforts: Vec::new(),
                 headers: IndexMap::new(),
             })
         })
@@ -115,6 +125,46 @@ mod tests {
         let models = provider_models(ProviderId::GithubCopilot, Some(&credential));
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-4.1");
+    }
+
+    /// Live-verified against `chatgpt.com/backend-api/codex/responses`:
+    /// all three GPT-5.6 codex models accept low/medium/high/xhigh/max and
+    /// reject `minimal` with HTTP 400 ("Supported values: low, medium,
+    /// high, xhigh, max"). The embedded menu must match that contract — the
+    /// legacy UI fallback offers `minimal` (would 400) and omits `max`.
+    #[test]
+    fn codex_gpt56_models_declare_live_verified_effort_menu() {
+        let expected = [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ];
+        for id in ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] {
+            let model = provider_models(ProviderId::OpenaiCodex, None)
+                .into_iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from codex catalog"));
+            let menu: Vec<ReasoningEffort> = model
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect();
+            assert_eq!(menu, expected, "{id} effort menu drifted from the live contract");
+            assert_eq!(
+                model.reasoning_effort,
+                Some(ReasoningEffort::High),
+                "{id} default effort",
+            );
+            assert!(
+                model
+                    .reasoning_efforts
+                    .iter()
+                    .any(|option| option.default && option.value == ReasoningEffort::High),
+                "{id} menu must mark high as the default entry",
+            );
+        }
     }
 
     #[test]
