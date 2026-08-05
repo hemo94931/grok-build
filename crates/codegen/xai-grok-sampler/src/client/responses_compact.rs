@@ -467,7 +467,7 @@ impl SamplingClient {
                 ResponsesCompactFailure::Cancelled,
             ));
         }
-        let body = request.to_bounded_bytes()?;
+        let body = self.compact_body_bytes(request)?;
         if cancellation.is_cancelled() {
             return Err(ResponsesCompactError::new(
                 ResponsesCompactFailure::Cancelled,
@@ -551,6 +551,28 @@ impl SamplingClient {
             parsed.attempts = attempts;
             return Ok(parsed);
         }
+    }
+
+    /// Serialize the compact body, applying the provider route's
+    /// unsupported-parameter stripping (sealed bodies bypass the normal
+    /// `sanitize_body` path).
+    fn compact_body_bytes(
+        &self,
+        request: &ResponsesCompactRequest,
+    ) -> Result<Vec<u8>, ResponsesCompactError> {
+        let mut value = serde_json::to_value(request)
+            .map_err(|_| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?;
+        if let Some(route) = &self.provider_wire {
+            route.sanitize_compact_body(&mut value);
+        }
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|_| ResponsesCompactError::new(ResponsesCompactFailure::InvalidResponse))?;
+        if bytes.len() > RESPONSES_COMPACT_MAX_BYTES {
+            return Err(ResponsesCompactError::new(
+                ResponsesCompactFailure::RequestTooLarge,
+            ));
+        }
+        Ok(bytes)
     }
 
     async fn can_retry(

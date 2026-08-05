@@ -68,7 +68,14 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             api_backend: ApiBackend::Responses,
             wire_dialect: ProviderWireDialect::OpenaiCodexResponses,
             env_keys: &[],
-            capabilities,
+            // The ChatGPT backend hosts a working standalone compaction
+            // endpoint (`codex/responses/compact`, verified live) whose
+            // `compaction_summary` output shape matches the first-party
+            // contract, and it accepts checkpoint items replayed in `input`.
+            capabilities: ProviderCapabilities {
+                supports_remote_compaction: true,
+                accepts_responses_checkpoint: true,
+            },
         },
         ProviderId::GithubCopilot => ProviderDescriptor {
             id,
@@ -476,11 +483,18 @@ mod tests {
     }
 
     #[test]
-    fn every_non_xai_route_fails_closed_for_first_party_capabilities() {
+    fn non_xai_routes_except_codex_fail_closed_for_first_party_capabilities() {
         for provider in ProviderId::ALL {
             let capabilities = provider_descriptor(provider).capabilities;
-            assert!(!capabilities.supports_remote_compaction);
-            assert!(!capabilities.accepts_responses_checkpoint);
+            if provider == ProviderId::OpenaiCodex {
+                // Live-verified: `chatgpt.com/backend-api/codex/responses/compact`
+                // returns first-party-shaped `compaction_summary` output.
+                assert!(capabilities.supports_remote_compaction);
+                assert!(capabilities.accepts_responses_checkpoint);
+            } else {
+                assert!(!capabilities.supports_remote_compaction);
+                assert!(!capabilities.accepts_responses_checkpoint);
+            }
         }
     }
 

@@ -73,6 +73,12 @@ impl ProviderWireRoute {
     pub(crate) fn endpoint_path<'a>(&self, default: &'a str, backend: &ApiBackend) -> &'a str {
         match (self.kind, backend, default) {
             (ProviderKind::OpenaiCodex, ApiBackend::Responses, "responses") => "codex/responses",
+            // The standalone compaction endpoint lives under the same
+            // `codex/` prefix on the ChatGPT backend; the unprefixed path
+            // answers 404 with the ChatGPT front-end error page.
+            (ProviderKind::OpenaiCodex, ApiBackend::Responses, "responses/compact") => {
+                "codex/responses/compact"
+            }
             (
                 ProviderKind::Anthropic | ProviderKind::GithubCopilot | ProviderKind::KimiCoding,
                 ApiBackend::Messages,
@@ -232,6 +238,34 @@ impl ProviderWireRoute {
         }
         if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
             tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("x_search"));
+        }
+    }
+
+    /// Standalone-compaction bodies bypass [`sanitize_body`](Self::sanitize_body)
+    /// (they are sealed upstream), so provider body fixes for
+    /// `responses/compact` live here. The `model` rewrite mirrors
+    /// `sanitize_body`: the sealed body carries the namespaced catalog id,
+    /// which the ChatGPT backend rejects
+    /// ("not supported when using Codex with a ChatGPT account").
+    /// Additionally, verified live: `service_tier`, `prompt_cache_retention`,
+    /// and `prompt_cache_options` each answer HTTP 400 there.
+    pub(crate) fn sanitize_compact_body(&self, body: &mut Value) {
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            "model".to_owned(),
+            Value::String(self.upstream_model.clone()),
+        );
+        if self.kind != ProviderKind::OpenaiCodex {
+            return;
+        }
+        for key in [
+            "service_tier",
+            "prompt_cache_retention",
+            "prompt_cache_options",
+        ] {
+            object.remove(key);
         }
     }
 
@@ -479,6 +513,23 @@ mod tests {
         assert!(headers.contains_key("traceparent"));
         assert!(!headers.contains_key("x-grok-conv-id"));
         assert!(!headers.contains_key("x-xai-token-auth"));
+    }
+
+    #[test]
+    fn codex_compact_endpoint_uses_codex_prefix() {
+        let route = ProviderWireRoute::from_config(
+            "openai-codex/gpt-5.6-luna",
+            "https://chatgpt.com/backend-api",
+        )
+        .unwrap();
+        assert_eq!(
+            route.endpoint_path("responses", &ApiBackend::Responses),
+            "codex/responses"
+        );
+        assert_eq!(
+            route.endpoint_path("responses/compact", &ApiBackend::Responses),
+            "codex/responses/compact"
+        );
     }
 
     #[test]
