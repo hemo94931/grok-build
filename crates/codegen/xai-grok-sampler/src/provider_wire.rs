@@ -197,12 +197,34 @@ impl ProviderWireRoute {
         if *backend == ApiBackend::Responses {
             if self.kind == ProviderKind::OpenaiCodex {
                 object.insert("store".to_owned(), Value::Bool(false));
-                object.insert("includeSystemPrompt".to_owned(), Value::Bool(false));
                 object.insert(
                     "include".to_owned(),
                     serde_json::json!(["reasoning.encrypted_content"]),
                 );
                 object.remove("previous_response_id");
+                // The ChatGPT Codex backend rejects each of these with HTTP
+                // 400 ("Unsupported parameter: <name>"; verified against the
+                // live endpoint). System-role items in `input` are likewise
+                // refused ("System messages are not allowed") and must travel
+                // in the top-level `instructions` field instead.
+                for key in [
+                    "includeSystemPrompt",
+                    "max_output_tokens",
+                    "max_tool_calls",
+                    "temperature",
+                    "top_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "stream_options",
+                    "truncation",
+                    "metadata",
+                    "safety_identifier",
+                    "service_tier",
+                    "background",
+                ] {
+                    object.remove(key);
+                }
+                lift_system_messages_into_instructions(object);
             }
             if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
                 input.retain(|item| item.get("type").and_then(Value::as_str) != Some("compaction"));
@@ -269,6 +291,50 @@ impl ProviderWireRoute {
             }
             _ => {}
         }
+    }
+}
+
+/// Move `input` items of `{"type": "message", "role": "system"}` into the
+/// top-level `instructions` string, which is the only channel for system
+/// prompts the ChatGPT Codex backend accepts. Pre-existing `instructions`
+/// keep first position; hoisted bodies join with "\n\n".
+fn lift_system_messages_into_instructions(object: &mut serde_json::Map<String, Value>) {
+    let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut hoisted: Vec<String> = Vec::new();
+    input.retain(|item| {
+        let is_system = item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("system");
+        if is_system {
+            hoisted.push(system_message_text(item));
+        }
+        !is_system
+    });
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(existing) = object.get("instructions").and_then(Value::as_str) {
+        if !existing.trim().is_empty() {
+            parts.push(existing.to_owned());
+        }
+    }
+    parts.extend(hoisted.into_iter().filter(|text| !text.trim().is_empty()));
+    if parts.is_empty() {
+        return;
+    }
+    object.insert("instructions".to_owned(), Value::String(parts.join("\n\n")));
+}
+
+/// System message content arrives either as a plain string or as an array of
+/// content parts; flatten both into text.
+fn system_message_text(item: &Value) -> String {
+    match item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
     }
 }
 
@@ -426,14 +492,53 @@ mod tests {
             "model": "openai-codex/gpt-5.4",
             "store": true,
             "previous_response_id": "response-1",
-            "input": [{"type": "compaction"}, {"role": "user", "content": "hello"}],
+            "max_output_tokens": 128000,
+            "includeSystemPrompt": true,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1,
+            "stream_options": {"include_usage": true},
+            "truncation": "disabled",
+            "max_tool_calls": 5,
+            "metadata": {"k": "v"},
+            "safety_identifier": "id",
+            "service_tier": "auto",
+            "background": false,
+            "input": [
+                {"type": "message", "role": "system", "content": "base prompt"},
+                {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "extra"}]},
+                {"type": "compaction"},
+                {"role": "user", "content": "hello"}
+            ],
             "tools": [{"type": "x_search"}, {"type": "function", "name": "bash"}],
             "x_grok_conv_id": "conv"
         });
         route.sanitize_body(&mut body, &ApiBackend::Responses);
         assert_eq!(body["model"], "gpt-5.4");
         assert_eq!(body["store"], false);
-        assert_eq!(body["includeSystemPrompt"], false);
+        // The Codex backend HTTP-400s on `includeSystemPrompt`, sampling
+        // knobs (`temperature`, `top_p`, penalties, ...), and system-role
+        // `input` items; system prompts must be lifted into top-level
+        // `instructions`. Verified against the live endpoint.
+        for key in [
+            "includeSystemPrompt",
+            "max_output_tokens",
+            "max_tool_calls",
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "stream_options",
+            "truncation",
+            "metadata",
+            "safety_identifier",
+            "service_tier",
+            "background",
+        ] {
+            assert!(body.get(key).is_none(), "{key} must be stripped");
+        }
+        assert_eq!(body["instructions"], "base prompt\n\nextra");
         assert_eq!(
             body["include"],
             serde_json::json!(["reasoning.encrypted_content"])

@@ -2729,7 +2729,7 @@ mod tests {
         )
         .expect("parse JSON request body");
         assert_eq!(body["model"], "gpt-5");
-        assert_eq!(body["includeSystemPrompt"], false);
+        assert!(body.get("includeSystemPrompt").is_none());
         assert!(body.get("previous_response_id").is_none());
     }
 
