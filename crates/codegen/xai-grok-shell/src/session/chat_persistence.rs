@@ -26,7 +26,7 @@ pub(crate) struct ChannelChatPersistence {
 
 impl ChannelChatPersistence {
     /// Create a new `ChannelChatPersistence` wrapping the given persistence channel.
-    pub fn new(tx: mpsc::UnboundedSender<PersistenceMsg>) -> Self {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<PersistenceMsg>) -> Self {
         Self { tx }
     }
 }

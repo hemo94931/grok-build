@@ -22,7 +22,7 @@ use crate::auth::providers::{
 };
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
-pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/providerAuth/info" => handle_info().await,
         "x.ai/providerAuth/login" => handle_login(agent, args).await,

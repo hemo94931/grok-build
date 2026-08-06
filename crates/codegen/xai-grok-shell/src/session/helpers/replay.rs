@@ -58,30 +58,53 @@ pub(crate) fn validate_compaction_marker_kinds(updates: &[SessionUpdate]) -> io:
 
 /// Stream the durable update log and reject every malformed, removed, or
 /// unknown compaction marker before rewind filtering can hide it. Non-marker
-/// lines retain the storage layer's existing torn-line tolerance.
+/// lines retain the storage layer's existing torn-line tolerance: lines are
+/// split on raw `\n` bytes, undecodable lines without a marker needle are
+/// skipped, and only lines that can carry a marker record must parse.
 pub(crate) fn validate_persisted_compaction_marker_kinds(updates_path: &Path) -> io::Result<()> {
+    use std::io::BufRead;
     let file = match std::fs::File::open(updates_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        if !line.contains("compaction_checkpoint") {
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut index = 0usize;
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        index += 1;
+        let line = if buf.last() == Some(&b'\n') {
+            &buf[..buf.len() - 1]
+        } else {
+            &buf[..]
+        };
+        if !line
+            .windows(b"compaction_checkpoint".len())
+            .any(|window| window == b"compaction_checkpoint")
+        {
             continue;
         }
-        let update = SessionUpdateEnvelope::from_str(&line).map_err(|error| {
+        let line = std::str::from_utf8(line).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "malformed compaction marker at updates.jsonl line {}: {error}",
-                    index + 1
+                    "undecodable compaction marker at updates.jsonl line {index}: {error}"
                 ),
+            )
+        })?;
+        let update = SessionUpdateEnvelope::from_str(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed compaction marker at updates.jsonl line {index}: {error}"),
             )
         })?;
         validate_compaction_marker_kinds(std::slice::from_ref(&update))?;
     }
-    Ok(())
 }
 
 /// Scan the filtered update stream for the latest compaction marker and
