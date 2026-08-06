@@ -151,7 +151,10 @@ mod tests {
                 .iter()
                 .map(|option| option.value)
                 .collect();
-            assert_eq!(menu, expected, "{id} effort menu drifted from the live contract");
+            assert_eq!(
+                menu, expected,
+                "{id} effort menu drifted from the live contract"
+            );
             assert_eq!(
                 model.reasoning_effort,
                 Some(ReasoningEffort::High),

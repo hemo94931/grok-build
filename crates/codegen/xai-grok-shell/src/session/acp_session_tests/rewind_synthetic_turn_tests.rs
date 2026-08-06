@@ -9,7 +9,23 @@
 use super::support::create_test_actor;
 
 use crate::sampling::ConversationItem;
+use crate::session::persistence::PersistenceMsg;
 use crate::session::{RewindMode, RewindRequest};
+
+/// Simulate the persistence actor's durable-update acknowledgement: rewind
+/// commits its branch marker durably and waits for this ack before exposing
+/// the new branch. Mirrors `rewind_cross_compaction_tests`.
+fn acknowledge_durable_updates(
+    mut persistence_rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(message) = persistence_rx.recv().await {
+            if let PersistenceMsg::AppendUpdateDurablyAndAck { respond_to, .. } = message {
+                let _ = respond_to.send(Ok(()));
+            }
+        }
+    });
+}
 
 /// Build the canonical bugged-session shape:
 ///
@@ -49,7 +65,8 @@ fn seed_conversation(mark_turn_starts: bool) -> Vec<ConversationItem> {
 
 async fn run_rewind_over_synthetic_turn(mark_turn_starts: bool) {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    acknowledge_durable_updates(persistence_rx);
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -127,7 +144,8 @@ async fn rewind_with_no_prompts_lists_no_points_and_rejects_execute() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            acknowledge_durable_updates(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let points = actor.get_rewind_points().await;
@@ -165,7 +183,8 @@ async fn rewind_to_start_keeps_only_preamble() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            acknowledge_durable_updates(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut conversation = seed_conversation(true);
@@ -230,7 +249,8 @@ async fn rewind_twice_narrows_history_each_time() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            acknowledge_durable_updates(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             // 5 turns: real, wake, real, wake, real.
@@ -343,7 +363,8 @@ async fn rewind_to_midpoint_with_synthetic_turns_on_both_sides() {
         .run_until(async {
             for mark_turn_starts in [false, true] {
                 let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                acknowledge_durable_updates(persistence_rx);
                 let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
                 let user = |text: &str, idx: usize| {
@@ -428,7 +449,8 @@ async fn rewind_to_synthetic_auto_wake_turn_cuts_at_the_wake() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            acknowledge_durable_updates(persistence_rx);
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut snap = actor

@@ -92,9 +92,7 @@ pub(crate) fn validate_persisted_compaction_marker_kinds(updates_path: &Path) ->
         let line = std::str::from_utf8(line).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "undecodable compaction marker at updates.jsonl line {index}: {error}"
-                ),
+                format!("undecodable compaction marker at updates.jsonl line {index}: {error}"),
             )
         })?;
         let update = SessionUpdateEnvelope::from_str(line).map_err(|error| {

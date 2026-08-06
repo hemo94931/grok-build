@@ -1415,7 +1415,10 @@ async fn recovery_does_not_upgrade_an_unknown_checkpoint_marker() {
         id: acp::SessionId::new("unknown-recovery"),
         cwd: "/workspace".to_string(),
     };
-    adapter.init_session(&info, default_model_id()).await.unwrap();
+    adapter
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
     let mut unknown = checkpoint_record("unknown-checkpoint");
     let SessionUpdate::Xai(notification) = &mut unknown else {
         unreachable!();
@@ -1492,8 +1495,7 @@ async fn fork_filter_cannot_hide_an_unknown_checkpoint_marker() {
 async fn copy_session_data_copies_current_responses_sidecar() {
     use xai_grok_sampling_types::{
         CheckpointIdentity, CheckpointReplayMaterial, RESPONSES_COMPACTION_CONTRACT,
-        ResponsesCompactionMode, ServerResponsesCheckpoint, TokenSeedSource,
-        TrustedPromptEnvelope,
+        ResponsesCompactionMode, ServerResponsesCheckpoint, TokenSeedSource, TrustedPromptEnvelope,
     };
 
     let portable = vec![
@@ -1502,7 +1504,8 @@ async fn copy_session_data_copies_current_responses_sidecar() {
         ConversationItem::assistant("first answer"),
     ];
     let digest = xai_grok_sampling_types::portable_history_digest(&portable).unwrap();
-    let bytes = crate::session::storage::responses_compaction::portable_history_bytes(&portable).unwrap();
+    let bytes =
+        crate::session::storage::responses_compaction::portable_history_bytes(&portable).unwrap();
     let wrapper = ServerResponsesCheckpoint {
         checkpoint_id: "checkpoint-current".into(),
         operation_id: "operation-current".into(),
@@ -1565,7 +1568,10 @@ async fn copy_session_data_copies_current_responses_sidecar() {
         id: acp::SessionId::new("checkpoint-current-src"),
         cwd: "/source/workspace".to_string(),
     };
-    adapter.init_session(&source_info, default_model_id()).await.unwrap();
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
     crate::session::storage::responses_compaction::write_checkpoint_durable(
         &adapter.session_dir(&source_info),
         &wrapper.portable_history_path,
@@ -1594,9 +1600,11 @@ async fn copy_session_data_copies_current_responses_sidecar() {
                 crate::extensions::notification::SessionNotification {
                     session_id: acp::SessionId::new("checkpoint-current-src"),
                     update: crate::extensions::notification::SessionUpdate::CompactionCheckpoint(
-                        Box::new(crate::session::storage::responses_compaction::marker_for_wrapper(
-                            &wrapper,
-                        )),
+                        Box::new(
+                            crate::session::storage::responses_compaction::marker_for_wrapper(
+                                &wrapper,
+                            ),
+                        ),
                     ),
                     meta: None,
                 },
@@ -1622,7 +1630,8 @@ async fn copy_session_data_copies_current_responses_sidecar() {
     let original = std::fs::read(adapter.session_dir(&source_info).join(rel)).unwrap();
     assert_eq!(copied, original, "sidecar must be copied verbatim on fork");
     let target_chat = std::fs::read_to_string(adapter.chat_file(&target_info)).unwrap();
-    let first: ConversationItem = serde_json::from_str(target_chat.lines().next().unwrap()).unwrap();
+    let first: ConversationItem =
+        serde_json::from_str(target_chat.lines().next().unwrap()).unwrap();
     assert!(
         matches!(first, ConversationItem::ResponsesCompactionCheckpoint(_)),
         "target chat history must keep the checkpoint wrapper at index 0"
@@ -1728,21 +1737,29 @@ async fn copy_session_data_copies_current_responses_sidecar() {
     let filtered_updates = adapter
         .read_updates_jsonl(adapter.updates_file(&filtered_target))
         .unwrap();
-    let marker = filtered_updates.iter().find_map(|update| {
-        let SessionUpdate::Xai(notification) = update else {
-            return None;
-        };
-        let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
-            &notification.update
-        else {
-            return None;
-        };
-        Some(marker.as_ref())
-    })
-    .unwrap();
-    assert_eq!(marker.branch_id.as_deref(), Some(filtered_wrapper.branch_id.as_str()));
-    crate::session::storage::responses_compaction::validate_marker_for_wrapper(marker, &sidecar.wrapper)
+    let marker = filtered_updates
+        .iter()
+        .find_map(|update| {
+            let SessionUpdate::Xai(notification) = update else {
+                return None;
+            };
+            let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(marker) =
+                &notification.update
+            else {
+                return None;
+            };
+            Some(marker.as_ref())
+        })
         .unwrap();
+    assert_eq!(
+        marker.branch_id.as_deref(),
+        Some(filtered_wrapper.branch_id.as_str())
+    );
+    crate::session::storage::responses_compaction::validate_marker_for_wrapper(
+        marker,
+        &sidecar.wrapper,
+    )
+    .unwrap();
 
     // Simulate CAS + tail journal succeeding while the marker append itself
     // failed. Resume must append the marker first, then repeat the complete

@@ -204,18 +204,19 @@ impl<'a> UpdateLineWriter<'a> {
             match info.kind {
                 crate::extensions::notification::CompactionCheckpointKind::Builtin => {}
                 crate::extensions::notification::CompactionCheckpointKind::ResponsesServer => {
-                    let checkpoint = crate::session::storage::responses_compaction::read_checkpoint(
-                        self.source_session_dir,
-                        &info.checkpoint_file,
-                        &info.checkpoint_id,
-                        info.prompt_index_at_compaction,
-                        info.portable_history_sha256.as_deref().ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Responses checkpoint marker has no portable digest",
-                            )
-                        })?,
-                    )?;
+                    let checkpoint =
+                        crate::session::storage::responses_compaction::read_checkpoint(
+                            self.source_session_dir,
+                            &info.checkpoint_file,
+                            &info.checkpoint_id,
+                            info.prompt_index_at_compaction,
+                            info.portable_history_sha256.as_deref().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Responses checkpoint marker has no portable digest",
+                                )
+                            })?,
+                        )?;
                     crate::session::storage::responses_compaction::validate_marker_for_wrapper(
                         info,
                         &checkpoint.wrapper,
@@ -280,7 +281,8 @@ fn copy_updates_streaming(
     target_session_id: &acp::SessionId,
     target_prompt_index: Option<usize>,
 ) -> io::Result<CopiedUpdates> {
-    let mut writer = UpdateLineWriter::try_new(target, source, source_session_dir, target_session_id)?;
+    let mut writer =
+        UpdateLineWriter::try_new(target, source, source_session_dir, target_session_id)?;
     let mut file = match std::fs::File::open(source) {
         Ok(file) => file,
         // A missing source is an empty transcript; still write the target.
@@ -427,10 +429,11 @@ impl JsonlStorageAdapter {
 
         // Checkpoint histories always use the typed persisted-entry path.
         if let Some((operation_id, _)) = &checkpoint_replacement {
-            let entries = crate::session::storage::responses_compaction::persisted_entries_for_replacement(
-                operation_id,
-                &chat_to_copy,
-            )?;
+            let entries =
+                crate::session::storage::responses_compaction::persisted_entries_for_replacement(
+                    operation_id,
+                    &chat_to_copy,
+                )?;
             crate::session::storage::responses_compaction::write_history_durable(
                 &self.chat_file(target_info),
                 &entries,
@@ -664,6 +667,19 @@ fn fork_summary(
         agent_name: source.agent_name,
         sandbox_profile: source.sandbox_profile,
         reasoning_effort: source.reasoning_effort,
+        // Full forks keep the parent's last turn. Partial forks
+        // (`target_prompt_index`) may drop that turn, so clear the summary
+        // rather than showing work that is not in the child conversation.
+        last_turn_summary: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_turn_summary
+        },
+        last_turn_summary_prompt_id: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_turn_summary_prompt_id
+        },
     }
 }
 
