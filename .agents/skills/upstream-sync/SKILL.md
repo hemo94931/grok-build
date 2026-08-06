@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Merge upstream changes (origin/main monorepo syncs) into a long-lived fork branch (dev) without losing fork features. Use whenever the user asks to sync/merge/rebase upstream into dev, pull new changes from the monorepo, resolve merge conflicts against upstream, or says things like "合并上游", "sync from monorepo", "merge origin/main". Covers dry-run conflict inventory via git merge-tree, pre-merge decoupling refactors that adopt upstream names/structure to shrink conflict surface, per-file resolution strategy (upstream wins where it subsumes fork features, fork deltas ported onto upstream's new structure otherwise), pre-existing-vs-regression failure attribution through git archaeology, targeted verification instead of full test suites, and audit-ready merge commits.
+description: Merge upstream changes (origin/main monorepo syncs) into a long-lived fork branch (dev) without losing fork features. Use whenever the user asks to sync/merge/rebase upstream into dev, pull new changes from the monorepo, resolve merge conflicts against upstream, or says things like "合并上游", "sync from monorepo", "merge origin/main". Covers dry-run conflict inventory via git merge-tree, pre-merge refactors on the fork branch that shrink conflict surface — adopting upstream names/structure for mechanical divergence, and extracting inline fork logic into fork-owned modules for durable decoupling from upstream — per-file resolution strategy (upstream wins where it subsumes fork features, fork deltas ported onto upstream's new structure otherwise), pre-existing-vs-regression failure attribution through git archaeology, targeted verification instead of full test suites, and audit-ready merge commits.
 ---
 
 # Upstream Sync
@@ -47,6 +47,23 @@ When a large share of the conflict surface comes from *mechanical* divergence �
 After this, the real merge's conflicts shrink to the genuinely semantic ones — often most conflicts simply vanish from the merge-tree output. A behavior-preserving refactor is also far easier to review and to bisect than hunks resolved inside a merge commit, where they become invisible. Concrete example from this repo: upstream extracted `token_suffix` into a shared `xai_grok_auth::bearer_suffix` module; applying the identical rename on dev first (commit "adopt shared bearer_suffix ahead of upstream sync") eliminated most of the conflict surface in four files before the merge even started.
 
 Skip this step when conflicts are few and deeply semantic — the refactor only pays off when it converts large mechanical conflicts into clean auto-merges.
+
+### Structural decoupling: give fork code its own modules
+
+The rename-adoption refactor above shrinks *this* merge's conflicts. A complementary move shrinks *every future* sync's conflicts: when the dry run shows the same files conflicting sync after sync because fork logic is interleaved with upstream code (long functions the fork extended inline, match arms the fork added variants to, structs the fork added fields to), refactor the fork side so its logic lives in fork-owned modules behind thin call-site glue.
+
+Coupling is what makes merges expensive: a conflict hunk that mixes both sides' changes forces a semantic resolution every time upstream touches that region. The same logic in a fork-owned file with one-line call sites in upstream files conflicts rarely, and when it does, the resolution is mechanical (keep upstream's file, re-add the one-liner).
+
+How to apply it on the fork branch before merging:
+
+1. Identify the high-coupling spots from the dry run: files that conflicted in previous syncs *and* conflict now, where fork edits are inline rather than isolated.
+2. Extract the fork's inline logic into fork-owned helpers/modules (e.g. `fork_feature.rs` with a clear API), leaving the smallest possible call in the upstream-owned file — one function call, one match delegation, one field with a fork-typed value.
+3. Keep the refactor behavior-preserving; verify build + relevant tests; commit separately from the merge.
+4. In the merge itself, upstream's version of the interleaved file is then safe to take as the base: re-applying the thin glue is trivial, and the fork's real logic never enters the conflict at all.
+
+This repo shows the payoff: dev's Responses-compaction code lives almost entirely in fork-owned files (`client/responses_compact.rs`, `storage/responses_compaction.rs`, `session/cache_routing.rs`) and those files never conflict — the conflicts concentrate exactly where dev logic is inline in upstream files (recap.rs, copy.rs, rewind.rs). Each sync is an opportunity to move one more inline block behind a fork-owned boundary, so conflict surface trends downward instead of staying constant.
+
+Judge the investment: decouple the spots with a history of repeated conflicts first; a file that conflicted once for an obvious one-off reason does not justify restructuring.
 
 ### Port, don't preserve
 
