@@ -3,6 +3,7 @@ use super::*;
 // ── Disk cache ──────────────────────────────────────────────────────────────
 
 pub(crate) const MODELS_CACHE_FILE: &str = "models_cache.json";
+pub(crate) const RADIUS_CATALOG_CACHE_FILE: &str = "radius_catalog_cache.json";
 pub(crate) const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -35,9 +36,117 @@ pub(crate) struct CacheResult {
     pub(crate) etag: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RadiusCatalogCache {
+    pub(crate) fetched_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grok_version: Option<String>,
+    /// Radius gateway origin (`GROK_RADIUS_GATEWAY` normalized), never credential material.
+    pub(crate) origin: String,
+    pub(crate) catalog: crate::auth::providers::RadiusGatewayConfig,
+}
+
+impl RadiusCatalogCache {
+    fn is_fresh(&self, ttl: std::time::Duration) -> bool {
+        let Ok(ttl) = ChronoDuration::from_std(ttl) else {
+            return false;
+        };
+        let age = Utc::now().signed_duration_since(self.fetched_at);
+        age >= ChronoDuration::zero() && age < ttl
+    }
+}
+
 pub(crate) struct ModelsCacheManager {
     pub(crate) path: std::path::PathBuf,
     pub(crate) ttl: std::time::Duration,
+}
+
+pub(crate) struct RadiusCatalogCacheManager {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) ttl: std::time::Duration,
+}
+
+impl RadiusCatalogCacheManager {
+    pub(crate) fn new() -> Self {
+        Self {
+            path: crate::util::grok_home::grok_home().join(RADIUS_CATALOG_CACHE_FILE),
+            ttl: CACHE_TTL,
+        }
+    }
+
+    pub(crate) fn load_fresh(
+        &self,
+        expected_origin: &str,
+    ) -> Option<crate::auth::providers::RadiusGatewayConfig> {
+        let data = std::fs::read(&self.path).ok()?;
+        let cache: RadiusCatalogCache = serde_json::from_slice(&data).ok()?;
+        if cache.grok_version.as_deref() != Some(xai_grok_version::VERSION) {
+            tracing::debug!("Radius catalog cache version mismatch");
+            return None;
+        }
+        if cache.origin != expected_origin {
+            tracing::debug!(cached = %cache.origin, expected = expected_origin, "Radius catalog cache origin mismatch");
+            return None;
+        }
+        if !cache.is_fresh(self.ttl) {
+            tracing::debug!("Radius catalog cache is stale");
+            return None;
+        }
+        Some(cache.catalog)
+    }
+
+    pub(crate) fn load_fresh_for_current_gateway(
+        &self,
+    ) -> Option<crate::auth::providers::RadiusGatewayConfig> {
+        let origin = crate::auth::providers::gateway_cache_origin().ok()?;
+        self.load_fresh(&origin)
+    }
+
+    pub(crate) async fn persist(
+        &self,
+        catalog: &crate::auth::providers::RadiusGatewayConfig,
+        origin: &str,
+    ) {
+        let cache = RadiusCatalogCache {
+            fetched_at: Utc::now(),
+            grok_version: Some(xai_grok_version::VERSION.to_string()),
+            origin: origin.to_owned(),
+            catalog: catalog.clone(),
+        };
+        self.atomic_write_async(&cache).await;
+    }
+
+    pub(crate) async fn invalidate(&self) {
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => tracing::info!("Radius catalog disk cache invalidated"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "failed to invalidate Radius catalog cache"),
+        }
+    }
+
+    fn unique_tmp_path(&self) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.path
+            .with_extension(format!("json.tmp.{}.{n}", std::process::id()))
+    }
+
+    pub(crate) async fn atomic_write_async(&self, cache: &RadiusCatalogCache) {
+        if let Some(parent) = self.path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let Ok(json) = serde_json::to_vec_pretty(cache) else {
+            return;
+        };
+        let tmp = self.unique_tmp_path();
+        if tokio::fs::write(&tmp, &json).await.is_ok() {
+            if tokio::fs::rename(&tmp, &self.path).await.is_err() {
+                let _ = tokio::fs::remove_file(&tmp).await;
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+    }
 }
 
 impl ModelsCacheManager {

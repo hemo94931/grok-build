@@ -7,7 +7,7 @@ use serde_json::Value;
 use xai_grok_sampler::ApiBackend;
 use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
 
-use super::{ProviderCredential, ProviderId};
+use super::{GATEWAY_CONFIG_METADATA_KEY, ProviderCredential, ProviderId, RadiusGatewayConfig};
 
 pub(crate) type ThinkingLevelMap = BTreeMap<String, Option<String>>;
 
@@ -107,33 +107,33 @@ fn static_models() -> &'static [ProviderCatalogModel] {
 }
 
 fn radius_models(credential: Option<&ProviderCredential>) -> Vec<ProviderCatalogModel> {
-    let Some(config) = credential.and_then(|value| value.metadata("gatewayConfig")) else {
+    let Some(config) = credential
+        .and_then(|value| value.metadata(GATEWAY_CONFIG_METADATA_KEY))
+        .and_then(RadiusGatewayConfig::from_metadata)
+    else {
         return Vec::new();
     };
-    let Some(base_url) = config.get("baseUrl").and_then(Value::as_str) else {
-        return Vec::new();
-    };
+    radius_models_from_config(&config)
+}
+
+pub(crate) fn radius_models_from_config(config: &RadiusGatewayConfig) -> Vec<ProviderCatalogModel> {
     config
-        .get("models")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|model| {
-            Some(ProviderCatalogModel {
-                provider: ProviderId::Radius,
-                id: model.get("id")?.as_str()?.to_owned(),
-                name: model.get("name")?.as_str()?.to_owned(),
-                api: "pi-messages".to_owned(),
-                base_url: base_url.to_owned(),
-                reasoning: model.get("reasoning")?.as_bool()?,
-                context_window: model.get("contextWindow")?.as_u64()?,
-                max_tokens: u32::try_from(model.get("maxTokens")?.as_u64()?).ok()?,
-                reasoning_effort: None,
-                reasoning_efforts: Vec::new(),
-                thinking_level_map: ThinkingLevelMap::new(),
-                compat: ProviderCatalogCompat::default(),
-                headers: IndexMap::new(),
-            })
+        .models
+        .iter()
+        .map(|model| ProviderCatalogModel {
+            provider: ProviderId::Radius,
+            id: model.id.clone(),
+            name: model.name.clone(),
+            api: "pi-messages".to_owned(),
+            base_url: config.base_url.clone(),
+            reasoning: model.reasoning,
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            reasoning_effort: None,
+            reasoning_efforts: Vec::new(),
+            thinking_level_map: ThinkingLevelMap::new(),
+            compat: ProviderCatalogCompat::default(),
+            headers: IndexMap::new(),
         })
         .collect()
 }

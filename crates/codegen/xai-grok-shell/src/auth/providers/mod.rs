@@ -22,12 +22,16 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use catalog::{ProviderCatalogModel, provider_models};
+pub(crate) use catalog::{ProviderCatalogModel, provider_models, radius_models_from_config};
 pub(crate) use cli::{
     CliAuthInteraction, ProviderTarget, report_provider_login, select_target,
     terminal_is_interactive,
 };
 pub(crate) use flow::{AuthInteraction, AuthNotification, AuthPrompt, DeviceCode, SelectOption};
+pub(crate) use radius::{
+    GATEWAY_CONFIG_METADATA_KEY, RadiusGatewayConfig, RadiusGatewayModel, gateway_cache_origin,
+    load_gateway_config_for_catalog,
+};
 pub(crate) use route::{
     ProviderAuthRemedy, ProviderCredentialMethod, ProviderDescriptor, ProviderRequestContext,
     ProviderSecret, ProviderSecretSource, ProviderWireDialect, namespaced_model_id,

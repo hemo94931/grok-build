@@ -211,7 +211,18 @@ pub(crate) fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_catalog_with_radius(cfg, prefetched, None)
+}
+
+pub(crate) fn resolve_model_catalog_with_radius(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    radius_catalog: Option<&crate::auth::providers::RadiusGatewayConfig>,
+) -> IndexMap<String, ModelEntry> {
     let mut catalog: IndexMap<String, ModelEntry> = config::resolve_model_list(cfg, prefetched);
+    if let Some(radius_catalog) = radius_catalog {
+        crate::agent::provider_models::append_radius_catalog_models(&mut catalog, radius_catalog);
+    }
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();

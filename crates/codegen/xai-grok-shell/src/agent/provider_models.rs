@@ -5,8 +5,9 @@ use xai_grok_sampler::AuthScheme;
 
 use super::config::{ModelEntry, ModelInfo};
 use crate::auth::providers::{
-    ProviderId, ProviderSecret, ProviderSlotState, ProviderStore, ProviderStoredCredential,
-    namespaced_model_id, provider_models,
+    ProviderCatalogModel, ProviderId, ProviderSecret, ProviderSlotState, ProviderStore,
+    ProviderStoredCredential, RadiusGatewayConfig, namespaced_model_id, provider_models,
+    radius_models_from_config,
 };
 
 pub(crate) fn append_available_provider_models(resolved: &mut IndexMap<String, ModelEntry>) {
@@ -45,38 +46,52 @@ pub(crate) fn append_available_provider_models(resolved: &mut IndexMap<String, M
             }
         };
 
-        for model in provider_models(provider, credential) {
-            let Some(api_backend) = model.api_backend() else {
-                continue;
-            };
-            let catalog_id = namespaced_model_id(provider, &model.id);
-            let Some(context_window) = NonZeroU64::new(model.context_window) else {
-                continue;
-            };
-            let mut info = ModelInfo::fallback(&catalog_id);
-            info.id = Some(catalog_id.clone());
-            info.model = catalog_id.clone();
-            info.base_url = model.base_url;
-            info.name = Some(model.name);
-            info.max_completion_tokens = Some(model.max_tokens);
-            info.api_backend = api_backend;
-            info.auth_scheme = AuthScheme::Bearer;
-            info.extra_headers = model.headers;
-            info.context_window = context_window;
-            info.supports_reasoning_effort = model.reasoning;
-            info.reasoning_effort = model.reasoning_effort;
-            info.reasoning_efforts = model.reasoning_efforts;
-            resolved.insert(
-                catalog_id,
-                ModelEntry {
-                    info,
-                    api_key: None,
-                    env_key: None,
-                    auth_provider: None,
-                    api_base_url: None,
-                },
-            );
-        }
+        append_provider_catalog_models(resolved, provider_models(provider, credential));
+    }
+}
+
+pub(crate) fn append_radius_catalog_models(
+    resolved: &mut IndexMap<String, ModelEntry>,
+    config: &RadiusGatewayConfig,
+) {
+    append_provider_catalog_models(resolved, radius_models_from_config(config));
+}
+
+fn append_provider_catalog_models(
+    resolved: &mut IndexMap<String, ModelEntry>,
+    models: Vec<ProviderCatalogModel>,
+) {
+    for model in models {
+        let Some(api_backend) = model.api_backend() else {
+            continue;
+        };
+        let catalog_id = namespaced_model_id(model.provider, &model.id);
+        let Some(context_window) = NonZeroU64::new(model.context_window) else {
+            continue;
+        };
+        let mut info = ModelInfo::fallback(&catalog_id);
+        info.id = Some(catalog_id.clone());
+        info.model = catalog_id.clone();
+        info.base_url = model.base_url;
+        info.name = Some(model.name);
+        info.max_completion_tokens = Some(model.max_tokens);
+        info.api_backend = api_backend;
+        info.auth_scheme = AuthScheme::Bearer;
+        info.extra_headers = model.headers;
+        info.context_window = context_window;
+        info.supports_reasoning_effort = model.reasoning;
+        info.reasoning_effort = model.reasoning_effort;
+        info.reasoning_efforts = model.reasoning_efforts;
+        resolved.insert(
+            catalog_id,
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+            },
+        );
     }
 }
 

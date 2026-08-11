@@ -81,6 +81,294 @@ impl ModelsEndpoint for SlowEndpoint {
     }
 }
 
+fn radius_gateway_config(id: &str) -> crate::auth::providers::RadiusGatewayConfig {
+    crate::auth::providers::RadiusGatewayConfig {
+        base_url: "https://api.radius.test".to_owned(),
+        models: vec![crate::auth::providers::RadiusGatewayModel {
+            id: id.to_owned(),
+            name: format!("Radius {id}"),
+            reasoning: true,
+            context_window: 123_000,
+            max_tokens: 4_096,
+        }],
+    }
+}
+
+fn radius_fetch_result(id: &str) -> RadiusCatalogFetchResult {
+    RadiusCatalogFetchResult {
+        origin: "https://radius.test".to_owned(),
+        catalog: radius_gateway_config(id),
+    }
+}
+
+struct QueueRadiusEndpoint {
+    responses: std::sync::Mutex<Vec<anyhow::Result<Option<RadiusCatalogFetchResult>>>>,
+}
+
+impl QueueRadiusEndpoint {
+    fn new(responses: Vec<anyhow::Result<Option<RadiusCatalogFetchResult>>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into_iter().rev().collect()),
+        }
+    }
+}
+
+impl RadiusCatalogEndpoint for QueueRadiusEndpoint {
+    fn fetch_radius_catalog(&self) -> RadiusCatalogFetchFuture {
+        let response = self.responses.lock().unwrap().pop().unwrap_or(Ok(None));
+        Box::pin(async move { response })
+    }
+}
+
+struct PendingRadiusEndpoint;
+impl RadiusCatalogEndpoint for PendingRadiusEndpoint {
+    fn fetch_radius_catalog(&self) -> RadiusCatalogFetchFuture {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn test_radius_cache_manager(dir: &std::path::Path) -> RadiusCatalogCacheManager {
+    RadiusCatalogCacheManager {
+        path: dir.join(RADIUS_CATALOG_CACHE_FILE),
+        ttl: CACHE_TTL,
+    }
+}
+
+async fn radius_manager_with_endpoint(
+    endpoint: Arc<dyn RadiusCatalogEndpoint>,
+    dir: &std::path::Path,
+) -> ModelsManager {
+    let auth_manager = Arc::new(AuthManager::new(dir, GrokComConfig::default()));
+    ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .endpoint(Arc::new(FailingEndpoint))
+    .cache(test_cache_manager(dir))
+    .radius_endpoint(endpoint)
+    .radius_cache(test_radius_cache_manager(dir))
+    .build()
+}
+
+#[tokio::test]
+async fn radius_catalog_refresh_makes_models_visible_when_signed_out() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mgr = radius_manager_with_endpoint(
+        Arc::new(QueueRadiusEndpoint::new(vec![Ok(Some(
+            radius_fetch_result("stored-model"),
+        ))])),
+        tmp.path(),
+    )
+    .await;
+
+    mgr.on_auth_changed().await;
+
+    assert!(
+        mgr.available()
+            .contains_key(&acp::ModelId::new("radius/stored-model")),
+        "Radius models should be visible without an xAI session"
+    );
+}
+
+#[tokio::test]
+async fn radius_catalog_uses_warm_cache_after_restart() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache = test_radius_cache_manager(tmp.path());
+    cache
+        .persist(&radius_gateway_config("warm-model"), "https://radius.test")
+        .await;
+
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", "https://radius.test");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .endpoint(Arc::new(FailingEndpoint))
+    .cache(test_cache_manager(tmp.path()))
+    .radius_endpoint(Arc::new(QueueRadiusEndpoint::new(vec![])))
+    .radius_cache(cache)
+    .build();
+
+    assert!(
+        mgr.available()
+            .contains_key(&acp::ModelId::new("radius/warm-model")),
+        "startup should recover Radius models from the keyless cache"
+    );
+}
+
+#[tokio::test]
+async fn radius_catalog_failure_preserves_cache_and_retry_can_replace_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mgr = radius_manager_with_endpoint(
+        Arc::new(QueueRadiusEndpoint::new(vec![
+            Err(anyhow::anyhow!("temporary outage with key secret-key")),
+            Ok(Some(radius_fetch_result("retry-model"))),
+        ])),
+        tmp.path(),
+    )
+    .await;
+    let generation = mgr.inner.catalog.read().generation;
+    assert!(
+        mgr.apply_radius_catalog_fenced(Some(radius_gateway_config("cached-model")), generation)
+    );
+
+    mgr.on_auth_changed().await;
+    assert!(mgr.models().contains_key("radius/cached-model"));
+    assert!(!mgr.models().contains_key("radius/retry-model"));
+
+    mgr.on_auth_changed().await;
+    assert!(mgr.models().contains_key("radius/retry-model"));
+}
+
+#[tokio::test]
+async fn radius_catalog_cache_contains_no_secret_material() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mgr = radius_manager_with_endpoint(
+        Arc::new(QueueRadiusEndpoint::new(vec![Ok(Some(
+            radius_fetch_result("no-secret-model"),
+        ))])),
+        tmp.path(),
+    )
+    .await;
+
+    mgr.on_auth_changed().await;
+
+    let data = std::fs::read_to_string(tmp.path().join(RADIUS_CATALOG_CACHE_FILE)).unwrap();
+    assert!(data.contains("no-secret-model"));
+    for forbidden in ["stored-key", "env-key", "sk-test", "secret-key"] {
+        assert!(
+            !data.contains(forbidden),
+            "Radius cache must not include credential material or derived key facts"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn radius_catalog_timeout_is_bounded_and_preserves_existing_catalog() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mgr = radius_manager_with_endpoint(Arc::new(PendingRadiusEndpoint), tmp.path()).await;
+    let generation = mgr.inner.catalog.read().generation;
+    assert!(
+        mgr.apply_radius_catalog_fenced(Some(radius_gateway_config("cached-model")), generation)
+    );
+
+    mgr.on_auth_changed().await;
+
+    assert!(mgr.models().contains_key("radius/cached-model"));
+}
+
+#[tokio::test]
+#[serial]
+async fn radius_http_catalog_uses_stored_api_key_bearer() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (gateway, seen) = start_radius_config_server("stored-key").await;
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", &gateway);
+    let _env_key = EnvGuard::unset("RADIUS_API_KEY");
+    let store = crate::auth::providers::ProviderStore::with_paths(
+        tmp.path().join("providers.json"),
+        tmp.path().join("auth.json"),
+    );
+    store
+        .put(
+            crate::auth::providers::ProviderId::Radius,
+            crate::auth::providers::ProviderApiKeyCredential::new("stored-key"),
+        )
+        .await
+        .unwrap();
+    let endpoint = HttpRadiusCatalogEndpoint::with_store(store);
+
+    let result = endpoint.fetch_radius_catalog().await.unwrap().unwrap();
+
+    assert_eq!(result.catalog.models[0].id, "server-model");
+    assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer stored-key"));
+}
+
+#[tokio::test]
+#[serial]
+async fn radius_http_catalog_uses_env_key_without_provider_slot() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (gateway, seen) = start_radius_config_server("env-key").await;
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", &gateway);
+    let _env_key = EnvGuard::set("RADIUS_API_KEY", "env-key");
+    let store = crate::auth::providers::ProviderStore::with_paths(
+        tmp.path().join("providers.json"),
+        tmp.path().join("auth.json"),
+    );
+    let endpoint = HttpRadiusCatalogEndpoint::with_store(store);
+
+    let result = endpoint.fetch_radius_catalog().await.unwrap().unwrap();
+
+    assert_eq!(result.catalog.models[0].id, "server-model");
+    assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer env-key"));
+}
+
+async fn start_radius_config_server(
+    expected_token: &'static str,
+) -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+
+    #[derive(Clone)]
+    struct ServerState {
+        expected_token: &'static str,
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    async fn config(State(state): State<ServerState>, headers: HeaderMap) -> impl IntoResponse {
+        let auth = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        *state.seen.lock().unwrap() = auth.clone();
+        let expected = format!("Bearer {}", state.expected_token);
+        if auth.as_deref() != Some(expected.as_str()) {
+            return (StatusCode::UNAUTHORIZED, "bad bearer").into_response();
+        }
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "baseUrl": "https://api.radius.test",
+                "models": [{
+                    "id": "server-model",
+                    "name": "Server Model",
+                    "reasoning": true,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0},
+                    "contextWindow": 123000,
+                    "maxTokens": 4096,
+                    "ignoredSecretEcho": "must be sanitized away"
+                }]
+            })),
+        )
+            .into_response()
+    }
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let state = ServerState {
+        expected_token,
+        seen: seen.clone(),
+    };
+    let app = Router::new()
+        .route("/v1/config", get(config))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn multi_provider_regression_auth_change_keeps_provider_models() {

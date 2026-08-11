@@ -116,6 +116,9 @@ struct CatalogState {
     has_fetched_real_catalog: bool,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
+    /// Keyless sanitized Radius catalog facts from `/v1/config`, loaded from a
+    /// separate cache or a bounded refresh. Never stores key material.
+    radius_catalog: Option<crate::auth::providers::RadiusGatewayConfig>,
     /// Bumped on identity change; a fetch captured before it must not apply.
     generation: u64,
 }
@@ -130,11 +133,15 @@ struct Inner {
     fetch_auth: RwLock<ModelFetchAuth>,
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
+    radius_cache: RadiusCatalogCacheManager,
     endpoint: Arc<dyn ModelsEndpoint>,
+    radius_endpoint: Arc<dyn RadiusCatalogEndpoint>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
     refresh_in_flight: AtomicBool,
+    /// Single-flight for the Radius provider catalog refresh.
+    radius_refresh_in_flight: AtomicBool,
     fetches_in_flight: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
@@ -156,6 +163,14 @@ struct RefreshInFlightGuard(Arc<Inner>);
 impl Drop for RefreshInFlightGuard {
     fn drop(&mut self) {
         self.0.refresh_in_flight.store(false, Ordering::Release);
+    }
+}
+struct RadiusRefreshInFlightGuard(Arc<Inner>);
+impl Drop for RadiusRefreshInFlightGuard {
+    fn drop(&mut self) {
+        self.0
+            .radius_refresh_in_flight
+            .store(false, Ordering::Release);
     }
 }
 
@@ -228,7 +243,10 @@ pub(crate) struct ModelsManagerBuilder {
     auth_manager: Arc<AuthManager>,
     cfg: config::Config,
     endpoint: Arc<dyn ModelsEndpoint>,
+    radius_endpoint: Arc<dyn RadiusCatalogEndpoint>,
     cache: ModelsCacheManager,
+    radius_cache: RadiusCatalogCacheManager,
+    initial_radius_catalog: Option<crate::auth::providers::RadiusGatewayConfig>,
 }
 
 impl ModelsManagerBuilder {
@@ -246,7 +264,10 @@ impl ModelsManagerBuilder {
             auth_manager,
             cfg,
             endpoint: Arc::new(HttpModelsEndpoint),
+            radius_endpoint: Arc::new(HttpRadiusCatalogEndpoint::new()),
             cache: ModelsCacheManager::new(),
+            radius_cache: RadiusCatalogCacheManager::new(),
+            initial_radius_catalog: None,
         }
     }
 
@@ -262,15 +283,48 @@ impl ModelsManagerBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn radius_endpoint(mut self, endpoint: Arc<dyn RadiusCatalogEndpoint>) -> Self {
+        self.radius_endpoint = endpoint;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn radius_cache(mut self, cache: RadiusCatalogCacheManager) -> Self {
+        self.radius_cache = cache;
+        self
+    }
+
+    fn initial_radius_catalog(
+        mut self,
+        catalog: Option<crate::auth::providers::RadiusGatewayConfig>,
+    ) -> Self {
+        self.initial_radius_catalog = catalog;
+        self
+    }
+
     pub(crate) fn build(self) -> ModelsManager {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
         let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
+        let radius_catalog = self
+            .initial_radius_catalog
+            .or_else(|| self.radius_cache.load_fresh_for_current_gateway());
+        let models = if radius_catalog.is_some() {
+            resolve_model_catalog_with_radius(
+                &self.cfg,
+                self.prefetched.clone(),
+                radius_catalog.as_ref(),
+            )
+        } else {
+            self.models
+        };
         ModelsManager {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {
                     prefetched: self.prefetched,
-                    models: self.models,
+                    models,
+                    radius_catalog,
                     ..Default::default()
                 }),
                 current_model_id: RwLock::new(self.current_model_id),
@@ -280,9 +334,12 @@ impl ModelsManagerBuilder {
                 fetch_auth: RwLock::new(fetch_auth),
                 gateway: RwLock::new(None),
                 cache: self.cache,
+                radius_cache: self.radius_cache,
                 endpoint: self.endpoint,
+                radius_endpoint: self.radius_endpoint,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
+                radius_refresh_in_flight: AtomicBool::new(false),
                 fetches_in_flight: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
@@ -337,8 +394,13 @@ impl ModelsManager {
                     c.models
                 })
         });
+        let radius_catalog = RadiusCatalogCacheManager::new().load_fresh_for_current_gateway();
         let has_prefetched = prefetched_models.is_some();
-        let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let catalog = resolve_model_catalog_with_radius(
+            cfg,
+            prefetched_models.clone(),
+            radius_catalog.as_ref(),
+        );
 
         if has_prefetched {
             validate_selectable(cfg, &catalog)?;
@@ -355,13 +417,15 @@ impl ModelsManager {
 
         let current_model_id = acp::ModelId::new(Arc::from(current_model_key));
 
-        let mgr = Self::new(
+        let mgr = ModelsManagerBuilder::new(
             prefetched_models,
             catalog,
             current_model_id,
             auth_manager,
             cfg.clone(),
-        );
+        )
+        .initial_radius_catalog(radius_catalog)
+        .build();
         if has_prefetched {
             let mut cat = mgr.inner.catalog.write();
             cat.has_fetched_real_catalog = true;
@@ -384,8 +448,12 @@ impl ModelsManager {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
         }
-        let prefetched = self.inner.catalog.read().prefetched.clone();
-        let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let (prefetched, radius_catalog) = {
+            let cat = self.inner.catalog.read();
+            (cat.prefetched.clone(), cat.radius_catalog.clone())
+        };
+        let new_catalog =
+            resolve_model_catalog_with_radius(&new_config, prefetched, radius_catalog.as_ref());
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
         if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
@@ -683,7 +751,9 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
+        let radius_catalog = self.inner.catalog.read().radius_catalog.clone();
+        self.inner.catalog.write().models =
+            resolve_model_catalog_with_radius(cfg, prefetched, radius_catalog.as_ref());
     }
 
     /// Reset to this identity's bundled catalog and reselect a valid default.
@@ -697,7 +767,9 @@ impl ModelsManager {
     /// Namespaced provider models remain valid without the xAI session. When no
     /// provider model is available, retain upstream's bundled fallback instead.
     fn rebuild_signed_out_catalog(&self, cfg: &config::Config) {
-        let mut provider_models = resolve_model_catalog(cfg, None);
+        let radius_catalog = self.inner.catalog.read().radius_catalog.clone();
+        let mut provider_models =
+            resolve_model_catalog_with_radius(cfg, None, radius_catalog.as_ref());
         provider_models
             .retain(|id, _| crate::auth::providers::parse_namespaced_model_id(id).is_some());
 
@@ -739,6 +811,12 @@ impl ModelsManager {
             cat.generation += 1;
             cat.etag = None;
         }
+        // Radius provider catalogs are independent from the xAI session. Refresh
+        // them before the signed-out early return so API-key/env-only Radius
+        // models become visible without an xAI login. Transient failures leave
+        // the existing keyless cache/in-memory catalog intact for retry.
+        let generation = self.inner.catalog.read().generation;
+        self.refresh_radius_catalog_fenced(generation).await;
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
@@ -946,7 +1024,91 @@ impl ModelsManager {
 
     /// One-shot background catalog refresh after readiness; no-op when a fresh disk cache already loaded a real catalog.
     pub fn spawn_background_refresh(&self) {
+        self.spawn_radius_catalog_refresh(crate::util::config::resolve_remote_fetch_enabled());
         self.spawn_background_refresh_inner(crate::util::config::resolve_remote_fetch_enabled());
+    }
+
+    fn spawn_radius_catalog_refresh(&self, remote_fetch_enabled: bool) {
+        if !remote_fetch_enabled {
+            return;
+        }
+        let mgr = self.clone();
+        let generation = self.inner.catalog.read().generation;
+        tokio::task::spawn(async move {
+            mgr.refresh_radius_catalog_fenced(generation).await;
+        });
+    }
+
+    async fn refresh_radius_catalog_fenced(&self, generation: u64) -> bool {
+        if self
+            .inner
+            .radius_refresh_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            tracing::debug!("Radius catalog refresh already in flight, skipping");
+            return false;
+        }
+        let _guard = RadiusRefreshInFlightGuard(self.inner.clone());
+        let endpoint = self.inner.radius_endpoint.clone();
+        let result = match tokio::time::timeout(
+            crate::http::STARTUP_FETCH_TIMEOUT,
+            endpoint.fetch_radius_catalog(),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "Radius catalog refresh failed; preserving cached catalog");
+                return false;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = crate::http::STARTUP_FETCH_TIMEOUT.as_secs(),
+                    "Radius catalog refresh timed out; preserving cached catalog"
+                );
+                return false;
+            }
+        };
+
+        match result {
+            Some(result) => {
+                self.inner
+                    .radius_cache
+                    .persist(&result.catalog, &result.origin)
+                    .await;
+                self.apply_radius_catalog_fenced(Some(result.catalog), generation)
+            }
+            None => {
+                self.inner.radius_cache.invalidate().await;
+                self.apply_radius_catalog_fenced(None, generation)
+            }
+        }
+    }
+
+    fn apply_radius_catalog_fenced(
+        &self,
+        radius_catalog: Option<crate::auth::providers::RadiusGatewayConfig>,
+        generation: u64,
+    ) -> bool {
+        let cfg = self.inner.cfg.read().clone();
+        {
+            let mut cat = self.inner.catalog.write();
+            if cat.generation != generation {
+                tracing::info!("Radius catalog result discarded: identity changed during fetch");
+                return false;
+            }
+            cat.radius_catalog = radius_catalog;
+            cat.models = resolve_model_catalog_with_radius(
+                &cfg,
+                cat.prefetched.clone(),
+                cat.radius_catalog.as_ref(),
+            );
+            cat.allowlist_excludes_all = allowlist_matches_nothing(&cfg, &cat.models);
+        }
+        self.reselect_current_model_if_missing(&cfg);
+        self.notify_models_updated();
+        true
     }
 
     fn spawn_background_refresh_inner(&self, remote_fetch_enabled: bool) {
@@ -1024,8 +1186,10 @@ impl ModelsManager {
         {
             let mut cat = self.inner.catalog.write();
             let generation = cat.generation + 1;
+            let radius_catalog = cat.radius_catalog.clone();
             *cat = CatalogState::default();
             cat.generation = generation;
+            cat.radius_catalog = radius_catalog;
             self.inner
                 .catalog_progress
                 .send_replace(CatalogProgress::Pending);
@@ -1268,7 +1432,11 @@ impl ModelsManager {
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
             cat.prefetched = Some(models);
-            cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
+            cat.models = resolve_model_catalog_with_radius(
+                cfg,
+                cat.prefetched.clone(),
+                cat.radius_catalog.as_ref(),
+            );
             cat.etag = new_etag;
             cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
             // In the lock: the flag and its mirror can't desync vs `clear()`.

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -27,6 +28,30 @@ const CALLBACK_PORT: u16 = 1456;
 const EXPIRY_SKEW_MS: u64 = 60_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const GATEWAY_CONFIG_METADATA_KEY: &str = "gatewayConfig";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RadiusGatewayConfig {
+    pub(crate) base_url: String,
+    pub(crate) models: Vec<RadiusGatewayModel>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RadiusGatewayModel {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) reasoning: bool,
+    pub(crate) context_window: u64,
+    pub(crate) max_tokens: u32,
+}
+
+impl RadiusGatewayConfig {
+    pub(crate) fn from_metadata(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
+}
 
 struct HttpPayload {
     status: StatusCode,
@@ -49,7 +74,7 @@ pub(super) async fn login(
         LoginMode::DeviceCode => device_login(interaction, &gateway, &signal).await?,
     };
     let config = load_gateway_config(&gateway, &credential.access, &signal).await?;
-    credential.set_metadata("gatewayConfig", config);
+    credential.set_metadata(GATEWAY_CONFIG_METADATA_KEY, serde_json::to_value(config)?);
     Ok(credential)
 }
 
@@ -61,7 +86,7 @@ pub(super) async fn refresh(
         bail!("Radius credential is missing a refresh token");
     }
     let gateway = gateway_url()?;
-    let previous_config = credential.metadata("gatewayConfig").cloned();
+    let previous_config = credential.metadata(GATEWAY_CONFIG_METADATA_KEY).cloned();
     let response = post_form(
         endpoint(&gateway, "/v1/oauth/token")?,
         &[
@@ -78,11 +103,13 @@ pub(super) async fn refresh(
     // The refresh token may rotate. A transient catalog failure must not lose
     // the freshly issued credential, so keep the previous validated catalog.
     match load_gateway_config(&gateway, &refreshed.access, &signal).await {
-        Ok(config) => refreshed.set_metadata("gatewayConfig", config),
+        Ok(config) => {
+            refreshed.set_metadata(GATEWAY_CONFIG_METADATA_KEY, serde_json::to_value(config)?)
+        }
         Err(error) => {
             tracing::warn!(%error, "provider auth: Radius model catalog refresh failed");
             if let Some(config) = previous_config {
-                refreshed.set_metadata("gatewayConfig", config);
+                refreshed.set_metadata(GATEWAY_CONFIG_METADATA_KEY, config);
             }
         }
     }
@@ -270,11 +297,23 @@ async fn load_discovery(gateway: &str, signal: &CancellationToken) -> anyhow::Re
     Ok(value.to_owned())
 }
 
+pub(crate) async fn load_gateway_config_for_catalog(
+    access_token: &str,
+    signal: &CancellationToken,
+) -> anyhow::Result<RadiusGatewayConfig> {
+    let gateway = gateway_url()?;
+    load_gateway_config(&gateway, access_token, signal).await
+}
+
+pub(crate) fn gateway_cache_origin() -> anyhow::Result<String> {
+    gateway_url()
+}
+
 async fn load_gateway_config(
     gateway: &str,
     access_token: &str,
     signal: &CancellationToken,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<RadiusGatewayConfig> {
     let response = get(
         endpoint(gateway, "/v1/config")?,
         Some(access_token),
@@ -283,12 +322,12 @@ async fn load_gateway_config(
     )
     .await?;
     if !response.status.is_success() {
-        return response_error("Radius gateway config", &response);
+        return response_error_redacted("Radius gateway config", &response, &[access_token]);
     }
     sanitize_gateway_config(&response.json)
 }
 
-fn sanitize_gateway_config(value: &Value) -> anyhow::Result<Value> {
+fn sanitize_gateway_config(value: &Value) -> anyhow::Result<RadiusGatewayConfig> {
     let base_url = value
         .get("baseUrl")
         .and_then(Value::as_str)
@@ -300,10 +339,25 @@ fn sanitize_gateway_config(value: &Value) -> anyhow::Result<Value> {
         .context("Radius gateway config is missing models")?;
     let models = models
         .iter()
-        .filter(|model| valid_gateway_model(model))
-        .cloned()
+        .filter_map(sanitized_gateway_model)
         .collect::<Vec<_>>();
-    Ok(serde_json::json!({ "baseUrl": base_url, "models": models }))
+    Ok(RadiusGatewayConfig {
+        base_url: base_url.to_owned(),
+        models,
+    })
+}
+
+fn sanitized_gateway_model(value: &Value) -> Option<RadiusGatewayModel> {
+    if !valid_gateway_model(value) {
+        return None;
+    }
+    Some(RadiusGatewayModel {
+        id: value.get("id")?.as_str()?.to_owned(),
+        name: value.get("name")?.as_str()?.to_owned(),
+        reasoning: value.get("reasoning")?.as_bool()?,
+        context_window: value.get("contextWindow")?.as_u64()?,
+        max_tokens: u32::try_from(value.get("maxTokens")?.as_u64()?).ok()?,
+    })
 }
 
 fn valid_gateway_model(value: &Value) -> bool {
@@ -511,7 +565,18 @@ fn oauth_error<T>(response: &HttpPayload, operation: &str) -> anyhow::Result<T> 
 }
 
 fn response_error<T>(operation: &str, response: &HttpPayload) -> anyhow::Result<T> {
-    let body = truncate_error_body(response.body.trim());
+    response_error_redacted(operation, response, &[])
+}
+
+fn response_error_redacted<T>(
+    operation: &str,
+    response: &HttpPayload,
+    redactions: &[&str],
+) -> anyhow::Result<T> {
+    let mut body = truncate_error_body(response.body.trim());
+    for secret in redactions.iter().filter(|secret| !secret.is_empty()) {
+        body = body.replace(secret, "[REDACTED]");
+    }
     if body.is_empty() {
         bail!("{operation} failed ({})", response.status)
     }
@@ -586,9 +651,25 @@ mod tests {
             ]
         });
         let sanitized = sanitize_gateway_config(&config).unwrap();
-        assert_eq!(sanitized["models"].as_array().unwrap().len(), 1);
-        assert_eq!(sanitized["models"][0]["id"], "valid");
+        assert_eq!(sanitized.models.len(), 1);
+        assert_eq!(sanitized.models[0].id, "valid");
         assert!(sanitize_gateway_config(&serde_json::json!({"models": []})).is_err());
+    }
+
+    #[test]
+    fn gateway_config_errors_redact_bearer_and_truncate_body() {
+        let secret = "radius-secret-token";
+        let response = HttpPayload {
+            status: StatusCode::UNAUTHORIZED,
+            json: Value::Null,
+            body: format!("echoed {secret} {}", "x".repeat(5000)),
+        };
+        let error = response_error_redacted::<()>("Radius gateway config", &response, &[secret])
+            .expect_err("gateway errors should fail");
+        let text = error.to_string();
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains(secret));
+        assert!(text.len() < 4300, "error body must stay bounded");
     }
 
     #[test]
