@@ -10,6 +10,7 @@ use xai_grok_sampling_types::{ConversationResponse, SamplingError};
 
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
+use crate::provider_wire::ProviderRouteHint;
 use crate::types::{RequestId, SamplingDispatch};
 
 /// Commands sent from a [`SamplerHandle`](crate::handle::SamplerHandle)
@@ -25,6 +26,7 @@ pub(crate) enum SamplerCommand {
         request_id: RequestId,
         request: SamplingDispatch,
         config: Option<Box<SamplerConfig>>,
+        route_hint: Option<ProviderRouteHint>,
         completion_tx: Option<
             oneshot::Sender<Result<(ConversationResponse, InferenceLatencyStats), SamplingError>>,
         >,
@@ -34,7 +36,10 @@ pub(crate) enum SamplerCommand {
     Cancel { request_id: RequestId },
 
     /// Update the default sampling config (model switch, auth refresh).
-    UpdateConfig { config: Box<SamplerConfig> },
+    UpdateConfig {
+        config: Box<SamplerConfig>,
+        route_hint: ProviderRouteHint,
+    },
 
     /// Query: is a specific request still in flight?
     IsActive {

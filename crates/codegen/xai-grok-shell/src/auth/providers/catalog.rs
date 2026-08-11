@@ -1,12 +1,40 @@
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use xai_grok_sampler::ApiBackend;
 use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
 
 use super::{ProviderCredential, ProviderId};
+
+pub(crate) type ThinkingLevelMap = BTreeMap<String, Option<String>>;
+
+/// pi-ai provider compatibility schema. Every source key is either consumed by
+/// sampler wire facts or explicitly registered here (`cache_control_format` is
+/// intentionally catalog-only until prompt cache-control conversion is added).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderCatalogCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) supports_store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) supports_reasoning_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_tokens_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requires_reasoning_content_on_assistant_messages: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) zai_tool_stream: Option<bool>,
+    /// Explicitly registered but not consumed by ticket-02 body transforms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_control_format: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +54,12 @@ pub(crate) struct ProviderCatalogModel {
     /// validation (legacy fallback menu in the UI).
     #[serde(default)]
     pub(crate) reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// String-or-null wire mapping. Missing keys and explicit nulls remain
+    /// distinguishable for OpenRouter's `off` behavior.
+    #[serde(default)]
+    pub(crate) thinking_level_map: ThinkingLevelMap,
+    #[serde(default)]
+    pub(crate) compat: ProviderCatalogCompat,
     #[serde(default)]
     pub(crate) headers: IndexMap<String, String>,
 }
@@ -96,6 +130,8 @@ fn radius_models(credential: Option<&ProviderCredential>) -> Vec<ProviderCatalog
                 max_tokens: u32::try_from(model.get("maxTokens")?.as_u64()?).ok()?,
                 reasoning_effort: None,
                 reasoning_efforts: Vec::new(),
+                thinking_level_map: ThinkingLevelMap::new(),
+                compat: ProviderCatalogCompat::default(),
                 headers: IndexMap::new(),
             })
         })
@@ -190,5 +226,133 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].base_url, "https://api.radius.example");
         assert_eq!(models[0].api_backend(), Some(ApiBackend::Messages));
+    }
+
+    #[test]
+    fn catalog_schema_preserves_string_or_null_maps_and_registered_compat() {
+        let model: ProviderCatalogModel = serde_json::from_value(serde_json::json!({
+            "provider": "openrouter",
+            "id": "anthropic/example",
+            "name": "Example",
+            "api": "openai-completions",
+            "baseUrl": "https://openrouter.ai/api/v1",
+            "reasoning": true,
+            "contextWindow": 128000,
+            "maxTokens": 4096,
+            "thinkingLevelMap": {"off": null, "high": "deep"},
+            "compat": {
+                "thinkingFormat": "openrouter",
+                "zaiToolStream": true,
+                "cacheControlFormat": "anthropic"
+            }
+        }))
+        .expect("catalog compat schema");
+        assert_eq!(model.thinking_level_map.get("off"), Some(&None));
+        assert_eq!(
+            model.thinking_level_map.get("high"),
+            Some(&Some("deep".to_owned()))
+        );
+        assert_eq!(model.compat.zai_tool_stream, Some(true));
+        assert_eq!(
+            model.compat.cache_control_format.as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_unregistered_compat_keys() {
+        let error = serde_json::from_value::<ProviderCatalogCompat>(serde_json::json!({
+            "thinkingFormat": "openrouter",
+            "futureSilentBehavior": true
+        }))
+        .expect_err("unknown compat keys must not be silently consumed");
+        assert!(error.to_string().contains("futureSilentBehavior"));
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct GeneratedWireFact {
+        provider: ProviderId,
+        id: String,
+        reasoning: bool,
+        #[serde(default)]
+        thinking_level_map: ThinkingLevelMap,
+        #[serde(default)]
+        compat: ProviderCatalogCompat,
+    }
+
+    fn expected_effort_menu(reasoning: bool, map: &ThinkingLevelMap) -> Vec<ReasoningEffort> {
+        if !reasoning {
+            return vec![ReasoningEffort::None];
+        }
+        [
+            ("off", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ]
+        .into_iter()
+        .filter_map(|(level, effort)| match map.get(level) {
+            Some(None) => None,
+            None if matches!(level, "xhigh" | "max") => None,
+            _ => Some(effort),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn openrouter_catalog_and_sampler_wire_facts_do_not_drift() {
+        let facts: Vec<GeneratedWireFact> = serde_json::from_str(include_str!(
+            "../../../../xai-grok-sampler/src/provider_wire/generated_wire_facts.json"
+        ))
+        .expect("generated sampler wire facts");
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../../../../scripts/openrouter_compat_manifest.json"
+        ))
+        .expect("OpenRouter sync manifest");
+        assert_eq!(static_models().len(), 358, "catalog member set changed");
+        assert_eq!(manifest["source"]["version"], "0.84.1");
+        assert_eq!(
+            manifest["source"]["generatedAt"],
+            "2026-08-07T05:53:06.539Z"
+        );
+        assert_eq!(manifest["counts"]["catalogMembers"], 358);
+        assert_eq!(manifest["counts"]["catalogOpenRouterMembers"], 303);
+        assert_eq!(
+            facts.len(),
+            manifest["counts"]["generatedWireFacts"]
+                .as_u64()
+                .expect("manifest generated fact count") as usize
+        );
+
+        for fact in facts {
+            assert_eq!(fact.provider, ProviderId::Openrouter);
+            let catalog = static_models()
+                .iter()
+                .find(|model| model.provider == fact.provider && model.id == fact.id)
+                .unwrap_or_else(|| panic!("generated fact missing from catalog: {}", fact.id));
+            assert_eq!(catalog.reasoning, fact.reasoning, "{} reasoning", fact.id);
+            assert_eq!(
+                catalog.thinking_level_map, fact.thinking_level_map,
+                "{} thinkingLevelMap",
+                fact.id
+            );
+            assert_eq!(catalog.compat, fact.compat, "{} compat", fact.id);
+
+            let menu = catalog
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                menu,
+                expected_effort_menu(fact.reasoning, &fact.thinking_level_map),
+                "{} reasoning effort menu",
+                fact.id
+            );
+        }
     }
 }

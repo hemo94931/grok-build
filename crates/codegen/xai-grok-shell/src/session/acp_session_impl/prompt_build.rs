@@ -925,7 +925,10 @@ impl SessionActor {
                 self.client_identifier.clone(),
                 Some(self.max_retries),
             );
-        let client = xai_grok_sampler::SamplingClient::new(sampler_config).map_err(|e| {
+        let route_hint =
+            crate::auth::providers::sampler_route_hint(&describe_model, &sampler_config.model);
+        let client = xai_grok_sampler::SamplingClient::new_with_route(sampler_config, route_hint)
+            .map_err(|e| {
             acp::Error::internal_error().data(format!(
                 "failed to build image-describe sampling client: {e}"
             ))

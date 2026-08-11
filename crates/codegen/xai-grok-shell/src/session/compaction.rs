@@ -340,7 +340,14 @@ impl SessionActor {
         config.compactions_remaining = None;
         config.compaction_at_tokens = None;
         config.doom_loop_recovery = None;
-        let client = xai_grok_sampler::SamplingClient::new(config.clone())
+        let current_catalog_model_id = self.models_manager.current_model_id().0.to_string();
+        let catalog_model_id = compact_model
+            .as_deref()
+            .filter(|model| *model != current.model)
+            .unwrap_or(&current_catalog_model_id);
+        let route_hint =
+            crate::auth::providers::sampler_route_hint(catalog_model_id, &config.model);
+        let client = xai_grok_sampler::SamplingClient::new_with_route(config.clone(), route_hint)
             .map_err(|error| self.to_acp_error(error))?;
         Ok((config, client))
     }

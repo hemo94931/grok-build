@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "package": "@earendil-works/pi-ai",
+    "version": "0.84.1",
+    "dataFile": "@earendil-works/pi-ai/dist/providers/data/openrouter.json",
+    "generatedAt": "2026-08-07T05:53:06.539Z",
+    "api": "openai-completions"
+  },
+  "counts": {
+    "catalogMembers": 358,
+    "catalogOpenRouterMembers": 303,
+    "sourceOpenRouterMembers": 335,
+    "matchingOpenRouterMembers": 297,
+    "generatedWireFacts": 297,
+    "catalogOnlyOpenRouterMembers": 6,
+    "sourceOnlyOpenRouterMembers": 38
+  },
+  "drift": {
+    "catalogOnlyOpenRouterIds": [
+      "inclusionai/ling-3.0-flash:free",
+      "mistralai/devstral-2512",
+      "openai/gpt-5-codex",
+      "openai/gpt-5.1-chat",
+      "openai/o3-deep-research",
+      "openai/o4-mini-deep-research"
+    ],
+    "sourceOnlyOpenRouterIds": [
+      "anthropic/claude-opus-5:batch",
+      "anthropic/claude-sonnet-4.6:batch",
+      "deepseek/deepseek-v4-flash-0731",
+      "inclusionai/ling-3.0-flash",
+      "inclusionai/ling-3.0-tiny:free",
+      "meta/muse-spark-1.2",
+      "moonshotai/kimi-k2.7-code:batch",
+      "nvidia/nemotron-3-ultra-550b-a55b:batch",
+      "openai/gpt-3.5-turbo:batch",
+      "openai/gpt-4-turbo:batch",
+      "openai/gpt-4.1-mini:batch",
+      "openai/gpt-4.1-nano:batch",
+      "openai/gpt-4.1:batch",
+      "openai/gpt-4o-mini:batch",
+      "openai/gpt-4o:batch",
+      "openai/gpt-5-codex:batch",
+      "openai/gpt-5-pro:batch",
+      "openai/gpt-5.2-pro:batch",
+      "openai/gpt-5.4-pro:batch",
+      "openai/gpt-5.5-pro:batch",
+      "openai/gpt-5.6-luna-pro:batch",
+      "openai/gpt-5.6-luna:batch",
+      "openai/gpt-5.6-sol-pro:batch",
+      "openai/gpt-5.6-sol:batch",
+      "openai/gpt-5.6-terra-pro:batch",
+      "openai/gpt-5.6-terra:batch",
+      "openai/o1:batch",
+      "openai/o3-mini-high:batch",
+      "openai/o3-mini:batch",
+      "openai/o3-pro:batch",
+      "openai/o3:batch",
+      "openai/o4-mini-high:batch",
+      "openai/o4-mini:batch",
+      "qwen/qwen3.8-max",
+      "thinkingmachines/inkling-small",
+      "thinkingmachines/inkling:batch",
+      "z-ai/glm-5.2:batch",
+      "~deepseek/deepseek-v4-flash-latest"
+    ]
+  },
+  "compatKeys": {
+    "consumed": [
+      "maxTokensField",
+      "requiresReasoningContentOnAssistantMessages",
+      "supportsDeveloperRole",
+      "supportsReasoningEffort",
+      "supportsStore",
+      "thinkingFormat",
+      "zaiToolStream"
+    ],
+    "registeredIgnored": {
+      "cacheControlFormat": "Registered for schema/drift visibility; prompt cache-control conversion is outside ticket 02 and is not consumed by the sampler body adapter."
+    }
+  }
+}

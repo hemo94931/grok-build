@@ -16,6 +16,7 @@ use crate::commands::SamplerCommand;
 use crate::config::{RetryPolicy, SamplerConfig};
 use crate::events::SamplingEvent;
 use crate::handle::SamplerHandle;
+use crate::provider_wire::ProviderRouteHint;
 use state::{ActiveRequest, ActorState};
 
 use crate::types::RequestId;
@@ -44,11 +45,21 @@ impl SamplerActor {
         retry_policy: RetryPolicy,
         event_tx: mpsc::UnboundedSender<SamplingEvent>,
     ) -> SamplerHandle {
+        Self::spawn_with_route(config, ProviderRouteHint::Auto, retry_policy, event_tx)
+    }
+
+    /// Spawn with explicit sampler-owned provider-route provenance.
+    pub fn spawn_with_route(
+        config: SamplerConfig,
+        route_hint: ProviderRouteHint,
+        retry_policy: RetryPolicy,
+        event_tx: mpsc::UnboundedSender<SamplingEvent>,
+    ) -> SamplerHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let actor = Self {
             cmd_rx,
             event_tx,
-            state: ActorState::new(config, retry_policy),
+            state: ActorState::new(config, route_hint, retry_policy),
             tasks: JoinSet::new(),
         };
         tokio::spawn(actor.run());
@@ -101,6 +112,7 @@ impl SamplerActor {
                 request_id,
                 request,
                 config,
+                route_hint,
                 completion_tx,
             } => {
                 let cancel_token = CancellationToken::new();
@@ -115,12 +127,14 @@ impl SamplerActor {
                 let effective_config = config
                     .map(|b| *b)
                     .unwrap_or_else(|| self.state.config.clone());
+                let effective_route_hint = route_hint.unwrap_or(self.state.route_hint);
                 let event_tx = self.event_tx.clone();
                 let retry_policy = self.state.retry_policy.clone();
                 self.tasks.spawn(request_task::run_request_task(
                     request_id,
                     request,
                     effective_config,
+                    effective_route_hint,
                     retry_policy,
                     event_tx,
                     cancel_token,
@@ -130,8 +144,8 @@ impl SamplerActor {
             SamplerCommand::Cancel { request_id } => {
                 self.state.cancel(&request_id);
             }
-            SamplerCommand::UpdateConfig { config } => {
-                self.state.update_config(*config);
+            SamplerCommand::UpdateConfig { config, route_hint } => {
+                self.state.update_config(*config, route_hint);
             }
             SamplerCommand::IsActive { request_id, reply } => {
                 let _ = reply.send(self.state.active_requests.contains_key(&request_id));

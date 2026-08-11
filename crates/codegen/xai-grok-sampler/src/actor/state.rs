@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{RetryPolicy, SamplerConfig};
+use crate::provider_wire::ProviderRouteHint;
 use crate::types::RequestId;
 
 /// In-flight request bookkeeping.
@@ -25,14 +26,20 @@ pub(crate) struct ActiveRequest {
 pub(crate) struct ActorState {
     pub(crate) active_requests: HashMap<RequestId, ActiveRequest>,
     pub(crate) config: SamplerConfig,
+    pub(crate) route_hint: ProviderRouteHint,
     pub(crate) retry_policy: RetryPolicy,
 }
 
 impl ActorState {
-    pub(crate) fn new(config: SamplerConfig, retry_policy: RetryPolicy) -> Self {
+    pub(crate) fn new(
+        config: SamplerConfig,
+        route_hint: ProviderRouteHint,
+        retry_policy: RetryPolicy,
+    ) -> Self {
         Self {
             active_requests: HashMap::new(),
             config,
+            route_hint,
             retry_policy,
         }
     }
@@ -67,8 +74,9 @@ impl ActorState {
 
     /// Replace the default config. The next request submitted without
     /// an override will use this.
-    pub(crate) fn update_config(&mut self, config: SamplerConfig) {
+    pub(crate) fn update_config(&mut self, config: SamplerConfig, route_hint: ProviderRouteHint) {
         self.config = config;
+        self.route_hint = route_hint;
     }
 }
 
@@ -115,13 +123,13 @@ mod tests {
 
     #[test]
     fn cancel_unknown_request_returns_false() {
-        let mut state = ActorState::new(cfg(), RetryPolicy::default());
+        let mut state = ActorState::new(cfg(), ProviderRouteHint::Auto, RetryPolicy::default());
         assert!(!state.cancel(&RequestId::from("unknown")));
     }
 
     #[test]
     fn register_then_cancel_removes() {
-        let mut state = ActorState::new(cfg(), RetryPolicy::default());
+        let mut state = ActorState::new(cfg(), ProviderRouteHint::Auto, RetryPolicy::default());
         let id = RequestId::from("req-1");
         state.register(
             id.clone(),
@@ -136,7 +144,7 @@ mod tests {
 
     #[test]
     fn register_returns_previous_when_same_id() {
-        let mut state = ActorState::new(cfg(), RetryPolicy::default());
+        let mut state = ActorState::new(cfg(), ProviderRouteHint::Auto, RetryPolicy::default());
         let id = RequestId::from("req-1");
         let first = ActiveRequest {
             cancel_token: CancellationToken::new(),

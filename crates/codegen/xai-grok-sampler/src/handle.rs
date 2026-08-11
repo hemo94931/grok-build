@@ -7,6 +7,7 @@ use xai_grok_sampling_types::{ConversationRequest, ConversationResponse, Samplin
 use crate::commands::SamplerCommand;
 use crate::config::SamplerConfig;
 use crate::metrics::InferenceLatencyStats;
+use crate::provider_wire::ProviderRouteHint;
 use crate::types::RequestId;
 
 /// Cheaply-cloneable handle to the sampler actor.
@@ -47,6 +48,7 @@ impl SamplerHandle {
             request_id,
             request: crate::types::SamplingDispatch::from(request),
             config: None,
+            route_hint: None,
             completion_tx: None,
         });
     }
@@ -59,10 +61,24 @@ impl SamplerHandle {
         request: ConversationRequest,
         config: SamplerConfig,
     ) {
+        self.submit_with_config_and_route(request_id, request, config, ProviderRouteHint::Auto);
+    }
+
+    /// Submit a per-request config together with its provider provenance.
+    /// Callers that do not own authoritative provenance should use
+    /// [`Self::submit_with_config`], which retains the safe `Auto` behavior.
+    pub fn submit_with_config_and_route(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+        config: SamplerConfig,
+        route_hint: ProviderRouteHint,
+    ) {
         let _ = self.cmd_tx.send(SamplerCommand::Submit {
             request_id,
             request: crate::types::SamplingDispatch::from(request),
             config: Some(Box::new(config)),
+            route_hint: Some(route_hint),
             completion_tx: None,
         });
     }
@@ -77,8 +93,14 @@ impl SamplerHandle {
     /// or auth refresh). The next request submitted without an
     /// override will use it.
     pub fn update_config(&self, config: SamplerConfig) {
+        self.update_config_with_route(config, ProviderRouteHint::Auto);
+    }
+
+    /// Update the default config together with explicit route provenance.
+    pub fn update_config_with_route(&self, config: SamplerConfig, route_hint: ProviderRouteHint) {
         let _ = self.cmd_tx.send(SamplerCommand::UpdateConfig {
             config: Box::new(config),
+            route_hint,
         });
     }
 
@@ -155,6 +177,7 @@ impl SamplerHandle {
                 request_id,
                 request: dispatch,
                 config: None,
+                route_hint: None,
                 completion_tx: Some(completion_tx),
             })
             .ok()

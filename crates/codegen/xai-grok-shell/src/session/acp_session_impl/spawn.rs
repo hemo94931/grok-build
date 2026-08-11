@@ -1161,8 +1161,13 @@ pub(crate) async fn spawn_session_actor(
     };
     let (sampler_event_tx, sampler_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
-    let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
+    let sampler_route_hint = crate::auth::providers::sampler_route_hint(
+        models_manager.current_model_id().0.as_ref(),
+        &sampler_config_initial.model,
+    );
+    let sampler_handle = xai_grok_sampler::SamplerActor::spawn_with_route(
         sampler_config_initial,
+        sampler_route_hint,
         sampler_retry_policy,
         sampler_event_tx,
     );

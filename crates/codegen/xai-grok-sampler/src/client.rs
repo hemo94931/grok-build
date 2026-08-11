@@ -31,7 +31,9 @@ use xai_grok_sampling_types::{
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
-use crate::provider_wire::{PiMessagesEventDecoder, ProviderWireRoute, radius_payload};
+use crate::provider_wire::{
+    PiMessagesEventDecoder, ProviderRouteHint, ProviderWireRoute, radius_payload,
+};
 use xai_grok_auth::bearer_suffix;
 
 pub mod responses_compact;
@@ -528,7 +530,14 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
-        let provider_wire = ProviderWireRoute::from_config(&config.model, &config.base_url);
+        Self::new_with_route(config, ProviderRouteHint::Auto)
+    }
+
+    /// Construct with explicit provider-route provenance. The hint is a
+    /// sampler-owned sidecar and deliberately does not live in `SamplerConfig`.
+    pub fn new_with_route(config: SamplerConfig, route_hint: ProviderRouteHint) -> Result<Self> {
+        let provider_wire =
+            ProviderWireRoute::from_config_with_hint(&config.model, &config.base_url, route_hint);
         if provider_wire
             .as_ref()
             .is_some_and(ProviderWireRoute::is_known_provider)

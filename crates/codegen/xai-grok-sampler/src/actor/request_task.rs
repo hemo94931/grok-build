@@ -26,6 +26,7 @@ use crate::client::{ApiBackend, SamplingClient};
 use crate::config::{RetryPolicy, SamplerConfig};
 use crate::events::{SamplingErrorInfo, SamplingErrorKind, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
+use crate::provider_wire::ProviderRouteHint;
 use crate::retry::{
     self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
 };
@@ -82,6 +83,7 @@ pub(crate) async fn run_request_task(
     request_id: RequestId,
     request: SamplingDispatch,
     config: SamplerConfig,
+    route_hint: ProviderRouteHint,
     retry_policy: RetryPolicy,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: CancellationToken,
@@ -102,7 +104,7 @@ pub(crate) async fn run_request_task(
 
     // Build the initial client. Configuration errors here are fatal
     // (no point retrying with the same broken config).
-    let mut client = match SamplingClient::new(config.clone()) {
+    let mut client = match SamplingClient::new_with_route(config.clone(), route_hint) {
         Ok(c) => c,
         Err(err) => {
             emit_failed(&event_tx, &request_id, &err);
@@ -223,6 +225,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    route_hint,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -276,6 +279,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    route_hint,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -299,6 +303,7 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    route_hint,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -327,6 +332,7 @@ async fn apply_retry_decision(
     request: &mut SamplingDispatch,
     client: &mut SamplingClient,
     config: &SamplerConfig,
+    route_hint: ProviderRouteHint,
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
@@ -405,7 +411,7 @@ async fn apply_retry_decision(
             // HTTP/2 connection pools.
             let mut http1_config = config.clone();
             http1_config.force_http1 = true;
-            match SamplingClient::new(http1_config) {
+            match SamplingClient::new_with_route(http1_config, route_hint) {
                 Ok(fresh) => {
                     *client = fresh;
                     tracing::info!("rebuilt sampling client with HTTP/1.1 fallback for retry");
@@ -1081,6 +1087,7 @@ mod tests {
             &mut request,
             &mut client,
             &config,
+            ProviderRouteHint::Auto,
             &cancel_token,
             &mut completion_tx,
         )

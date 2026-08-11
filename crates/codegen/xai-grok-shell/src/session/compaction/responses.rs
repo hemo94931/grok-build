@@ -259,8 +259,13 @@ impl SessionActor {
         let wire_instructions = self.current_wire_instructions(&request).await;
         request.instructions = (!wire_instructions.is_empty()).then_some(wire_instructions);
 
-        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
-            .map_err(|error| self.to_acp_error(error))?;
+        let route_hint = crate::auth::providers::sampler_route_hint(
+            self.models_manager.current_model_id().0.as_ref(),
+            &full_config.model,
+        );
+        let client =
+            xai_grok_sampler::SamplingClient::new_with_route(full_config.clone(), route_hint)
+                .map_err(|error| self.to_acp_error(error))?;
         let Some((credential, principal)) = self.compact_credential(&full_config) else {
             return Ok(None);
         };
@@ -530,8 +535,13 @@ impl SessionActor {
         let request_history_revision = request.history_revision.ok_or_else(|| {
             acp::Error::internal_error().data("responses_compaction_missing_request_revision")
         })?;
-        let client = xai_grok_sampler::SamplingClient::new(full_config.clone())
-            .map_err(|error| self.to_acp_error(error))?;
+        let route_hint = crate::auth::providers::sampler_route_hint(
+            self.models_manager.current_model_id().0.as_ref(),
+            &full_config.model,
+        );
+        let client =
+            xai_grok_sampler::SamplingClient::new_with_route(full_config.clone(), route_hint)
+                .map_err(|error| self.to_acp_error(error))?;
         let Some((_, principal)) = self.compact_credential(full_config) else {
             return self
                 .run_checkpoint_builtin_migration(request, full_config, "continuity_mismatch")

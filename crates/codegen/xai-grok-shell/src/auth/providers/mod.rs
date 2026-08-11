@@ -82,6 +82,35 @@ impl ProviderId {
             Self::Radius => "Radius",
         }
     }
+
+    /// Narrow shell-to-sampler identity mapping. Provider provenance stays a
+    /// sidecar and never enters shared model or request structs.
+    pub(crate) const fn sampler_provider(self) -> xai_grok_sampler::KnownProvider {
+        match self {
+            Self::Anthropic => xai_grok_sampler::KnownProvider::Anthropic,
+            Self::OpenaiCodex => xai_grok_sampler::KnownProvider::OpenaiCodex,
+            Self::GithubCopilot => xai_grok_sampler::KnownProvider::GithubCopilot,
+            Self::Openrouter => xai_grok_sampler::KnownProvider::Openrouter,
+            Self::KimiCoding => xai_grok_sampler::KnownProvider::KimiCoding,
+            Self::Radius => xai_grok_sampler::KnownProvider::Radius,
+        }
+    }
+}
+
+/// Resolve sampler route provenance from the shell's catalog identity, not
+/// from the slash-prefixed upstream model sent on the wire. A custom catalog
+/// entry may legitimately route to `anthropic/*` or `openai/*` on OpenRouter.
+pub(crate) fn sampler_route_hint(
+    catalog_model_id: &str,
+    upstream_model_id: &str,
+) -> xai_grok_sampler::ProviderRouteHint {
+    if let Some((provider, _)) = parse_namespaced_model_id(catalog_model_id) {
+        xai_grok_sampler::ProviderRouteHint::Known(provider.sampler_provider())
+    } else if upstream_model_id.contains('/') {
+        xai_grok_sampler::ProviderRouteHint::CustomThirdParty
+    } else {
+        xai_grok_sampler::ProviderRouteHint::Auto
+    }
 }
 
 impl fmt::Display for ProviderId {
@@ -224,5 +253,28 @@ mod tests {
                 format!("\"{provider}\"")
             );
         }
+    }
+
+    #[test]
+    fn sampler_route_hint_uses_catalog_provenance_not_upstream_prefix() {
+        assert_eq!(
+            sampler_route_hint(
+                "openrouter/anthropic/claude-sonnet-4.6",
+                "openrouter/anthropic/claude-sonnet-4.6"
+            ),
+            xai_grok_sampler::ProviderRouteHint::Known(xai_grok_sampler::KnownProvider::Openrouter)
+        );
+        assert_eq!(
+            sampler_route_hint("custom-openrouter", "anthropic/claude-sonnet-4.6"),
+            xai_grok_sampler::ProviderRouteHint::CustomThirdParty
+        );
+        assert_eq!(
+            sampler_route_hint("custom-openrouter", "openai/gpt-5.4"),
+            xai_grok_sampler::ProviderRouteHint::CustomThirdParty
+        );
+        assert_eq!(
+            sampler_route_hint("grok-4.5", "grok-4.5"),
+            xai_grok_sampler::ProviderRouteHint::Auto
+        );
     }
 }

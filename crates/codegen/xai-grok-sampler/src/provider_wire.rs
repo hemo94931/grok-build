@@ -5,8 +5,50 @@ use xai_grok_sampling_types::{ApiBackend, messages};
 
 use crate::config::AuthScheme;
 
+mod compat;
 mod radius;
 pub(crate) use radius::{PiMessagesEventDecoder, radius_payload};
+
+use compat::{
+    BaseUrlProfile, ResolvedProviderModelWireFacts, apply_chat_completions_compat,
+    base_url_profile, generated_wire_fact, resolve_wire_facts,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KnownProvider {
+    Anthropic,
+    OpenaiCodex,
+    GithubCopilot,
+    Openrouter,
+    KimiCoding,
+    Radius,
+}
+
+impl KnownProvider {
+    fn namespace(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenaiCodex => "openai-codex",
+            Self::GithubCopilot => "github-copilot",
+            Self::Openrouter => "openrouter",
+            Self::KimiCoding => "kimi-coding",
+            Self::Radius => "radius",
+        }
+    }
+}
+
+/// Provider-route provenance supplied alongside `SamplerConfig` without
+/// adding provider fields to shared sampling types.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProviderRouteHint {
+    /// Safe compatibility fallback for sampler-only callers: a namespaced
+    /// model is considered known only when its parsed base URL matches that
+    /// provider. Otherwise it remains a custom third-party route.
+    #[default]
+    Auto,
+    Known(KnownProvider),
+    CustomThirdParty,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderKind {
@@ -19,47 +61,140 @@ enum ProviderKind {
     CustomThirdParty,
 }
 
+impl From<KnownProvider> for ProviderKind {
+    fn from(provider: KnownProvider) -> Self {
+        match provider {
+            KnownProvider::Anthropic => Self::Anthropic,
+            KnownProvider::OpenaiCodex => Self::OpenaiCodex,
+            KnownProvider::GithubCopilot => Self::GithubCopilot,
+            KnownProvider::Openrouter => Self::Openrouter,
+            KnownProvider::KimiCoding => Self::KimiCoding,
+            KnownProvider::Radius => Self::Radius,
+        }
+    }
+}
+
+impl ProviderKind {
+    fn from_namespace(namespace: &str) -> Option<Self> {
+        match namespace {
+            "anthropic" => Some(Self::Anthropic),
+            "openai-codex" => Some(Self::OpenaiCodex),
+            "github-copilot" => Some(Self::GithubCopilot),
+            "openrouter" => Some(Self::Openrouter),
+            "kimi-coding" => Some(Self::KimiCoding),
+            "radius" => Some(Self::Radius),
+            _ => None,
+        }
+    }
+
+    fn provider_name(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("anthropic"),
+            Self::OpenaiCodex => Some("openai-codex"),
+            Self::GithubCopilot => Some("github-copilot"),
+            Self::Openrouter => Some("openrouter"),
+            Self::KimiCoding => Some("kimi-coding"),
+            Self::Radius => Some("radius"),
+            Self::CustomThirdParty => None,
+        }
+    }
+
+    fn matches_base_url(self, base_url: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(base_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+            return false;
+        };
+        match self {
+            Self::Anthropic => host == "api.anthropic.com" || host.ends_with(".anthropic.com"),
+            Self::OpenaiCodex => host == "chatgpt.com" || host.ends_with(".chatgpt.com"),
+            Self::GithubCopilot => {
+                host == "githubcopilot.com" || host.ends_with(".githubcopilot.com")
+            }
+            Self::Openrouter => host == "openrouter.ai" || host.ends_with(".openrouter.ai"),
+            Self::KimiCoding => host == "api.kimi.com" || host.ends_with(".kimi.com"),
+            Self::Radius => host == "radius.pi.dev" || host.ends_with(".radius.pi.dev"),
+            Self::CustomThirdParty => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderWireRoute {
     kind: ProviderKind,
     upstream_model: String,
     base_ends_in_v1: bool,
+    facts: ResolvedProviderModelWireFacts,
 }
 
 impl ProviderWireRoute {
+    #[cfg(test)]
     pub(crate) fn from_config(model: &str, base_url: &str) -> Option<Self> {
-        let (kind, upstream_model) = match model.split_once('/') {
-            Some(("anthropic", upstream)) if !upstream.is_empty() => {
-                (ProviderKind::Anthropic, upstream)
+        Self::from_config_with_hint(model, base_url, ProviderRouteHint::Auto)
+    }
+
+    pub(crate) fn from_config_with_hint(
+        model: &str,
+        base_url: &str,
+        hint: ProviderRouteHint,
+    ) -> Option<Self> {
+        let (kind, upstream_model) = match hint {
+            ProviderRouteHint::Known(provider) => {
+                let upstream = model
+                    .split_once('/')
+                    .filter(|(namespace, upstream)| {
+                        *namespace == provider.namespace() && !upstream.is_empty()
+                    })
+                    .map_or(model, |(_, upstream)| upstream);
+                (ProviderKind::from(provider), upstream)
             }
-            Some(("openai-codex", upstream)) if !upstream.is_empty() => {
-                (ProviderKind::OpenaiCodex, upstream)
+            ProviderRouteHint::CustomThirdParty => (ProviderKind::CustomThirdParty, model),
+            ProviderRouteHint::Auto => {
+                if is_first_party_xai_url(base_url) {
+                    return None;
+                }
+                match model.split_once('/') {
+                    Some((namespace, upstream))
+                        if !upstream.is_empty()
+                            && ProviderKind::from_namespace(namespace)
+                                .is_some_and(|kind| kind.matches_base_url(base_url)) =>
+                    {
+                        (
+                            ProviderKind::from_namespace(namespace)
+                                .expect("guard checked known provider namespace"),
+                            upstream,
+                        )
+                    }
+                    _ => (ProviderKind::CustomThirdParty, model),
+                }
             }
-            Some(("github-copilot", upstream)) if !upstream.is_empty() => {
-                (ProviderKind::GithubCopilot, upstream)
-            }
-            Some(("openrouter", upstream)) if !upstream.is_empty() => {
-                (ProviderKind::Openrouter, upstream)
-            }
-            Some(("kimi-coding", upstream)) if !upstream.is_empty() => {
-                (ProviderKind::KimiCoding, upstream)
-            }
-            Some(("radius", upstream)) if !upstream.is_empty() => (ProviderKind::Radius, upstream),
-            _ if !is_first_party_xai_url(base_url) => (ProviderKind::CustomThirdParty, model),
-            _ => return None,
         };
         let base_ends_in_v1 = reqwest::Url::parse(base_url)
             .ok()
             .is_some_and(|url| url.path().trim_end_matches('/').ends_with("/v1"));
+        let fact_provider = match (kind.provider_name(), base_url_profile(base_url)) {
+            (_, Some(BaseUrlProfile::Openrouter)) => Some("openrouter"),
+            (provider, _) => provider,
+        };
+        let explicit =
+            fact_provider.and_then(|provider| generated_wire_fact(provider, upstream_model));
+        let facts = resolve_wire_facts(kind.provider_name(), base_url, upstream_model, explicit);
         Some(Self {
             kind,
             upstream_model: upstream_model.to_owned(),
             base_ends_in_v1,
+            facts,
         })
     }
 
     pub(crate) fn upstream_model(&self) -> &str {
         &self.upstream_model
+    }
+
+    #[cfg(test)]
+    fn kind(&self) -> ProviderKind {
+        self.kind
     }
 
     pub(crate) fn is_known_provider(&self) -> bool {
@@ -199,6 +334,9 @@ impl ProviderWireRoute {
             "cache_family",
         ] {
             object.remove(key);
+        }
+        if *backend == ApiBackend::ChatCompletions {
+            apply_chat_completions_compat(object, &self.upstream_model, &self.facts);
         }
         if *backend == ApiBackend::Responses {
             if self.kind == ProviderKind::OpenaiCodex {
@@ -513,6 +651,176 @@ mod tests {
         assert!(headers.contains_key("traceparent"));
         assert!(!headers.contains_key("x-grok-conv-id"));
         assert!(!headers.contains_key("x-xai-token-auth"));
+    }
+
+    fn openrouter_route(model: &str) -> ProviderWireRoute {
+        ProviderWireRoute::from_config_with_hint(
+            &format!("openrouter/{model}"),
+            "https://openrouter.ai/api/v1",
+            ProviderRouteHint::Known(KnownProvider::Openrouter),
+        )
+        .expect("OpenRouter route")
+    }
+
+    fn chat_body(model: &str, effort: Option<&str>) -> Value {
+        let mut body = serde_json::json!({
+            "model": format!("openrouter/{model}"),
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        if let Some(effort) = effort {
+            body.as_object_mut().unwrap().insert(
+                "reasoning_effort".to_owned(),
+                Value::String(effort.to_owned()),
+            );
+        }
+        body
+    }
+
+    #[test]
+    fn openrouter_reasoning_off_unset_and_explicit_none_match() {
+        let route = openrouter_route("openai/gpt-5.2");
+        for effort in [None, Some("none")] {
+            let mut body = chat_body("openai/gpt-5.2", effort);
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            assert_eq!(body["reasoning"], serde_json::json!({"effort": "none"}));
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_reasoning_uses_thinking_level_map() {
+        let route = openrouter_route("openai/gpt-5.2");
+        let mut body = chat_body("openai/gpt-5.2", Some("xhigh"));
+        route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "xhigh"}));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openrouter_explicit_null_off_omits_reasoning() {
+        let route = openrouter_route("anthropic/claude-fable-5");
+        for effort in [None, Some("none")] {
+            let mut body = chat_body("anthropic/claude-fable-5", effort);
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            assert!(body.get("reasoning").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_nonreasoning_model_omits_reasoning() {
+        let route = openrouter_route("ai21/jamba-large-1.7");
+        let mut body = chat_body("ai21/jamba-large-1.7", Some("high"));
+        route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openrouter_uses_only_max_completion_tokens() {
+        let route = openrouter_route("openai/gpt-5.2");
+        let mut body = chat_body("openai/gpt-5.2", None);
+        route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn openrouter_developer_role_truth_table_is_effort_independent() {
+        let cases = [
+            ("anthropic/claude-opus-4.6", true),
+            ("openai/gpt-5.2", true),
+            ("deepseek/deepseek-r1", false),
+            ("anthropic/claude-3-haiku", false),
+            ("openai/gpt-3.5-turbo", false),
+        ];
+        for (model, developer) in cases {
+            for effort in [None, Some("high")] {
+                let route = openrouter_route(model);
+                let mut body = chat_body(model, effort);
+                route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+                let role = body["messages"][0]["role"].as_str().unwrap();
+                assert_eq!(
+                    role,
+                    if developer { "developer" } else { "system" },
+                    "{model} effort={effort:?}"
+                );
+                assert_eq!(body["messages"][1]["role"], "user");
+            }
+        }
+    }
+
+    #[test]
+    fn custom_openrouter_slash_prefix_keeps_custom_route_and_headers() {
+        for model in ["anthropic/claude-opus-4.6", "openai/gpt-5.2"] {
+            let route = ProviderWireRoute::from_config_with_hint(
+                model,
+                "https://OPENROUTER.ai/api/v1/",
+                ProviderRouteHint::CustomThirdParty,
+            )
+            .unwrap();
+            assert_eq!(route.kind(), ProviderKind::CustomThirdParty);
+            assert!(!route.is_known_provider());
+            assert_eq!(route.upstream_model(), model);
+
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", HeaderValue::from_static("Bearer custom"));
+            headers.insert(
+                "anthropic-version",
+                HeaderValue::from_static("custom-value"),
+            );
+            headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
+            route.sanitize_headers(&mut headers);
+            assert_eq!(
+                headers.get("authorization").unwrap(),
+                HeaderValue::from_static("Bearer custom")
+            );
+            assert!(headers.contains_key("anthropic-version"));
+            assert!(!headers.contains_key("x-grok-conv-id"));
+
+            let mut body = chat_body(model, Some("high"));
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            assert_eq!(body["model"], model);
+            assert!(body.get("max_completion_tokens").is_some());
+        }
+    }
+
+    #[test]
+    fn auto_route_does_not_promote_openrouter_upstream_prefixes() {
+        for model in ["anthropic/claude-opus-4.6", "openai/gpt-5.2"] {
+            let route =
+                ProviderWireRoute::from_config(model, "https://edge.openrouter.ai/custom/v1/")
+                    .unwrap();
+            assert_eq!(route.kind(), ProviderKind::CustomThirdParty);
+            assert_eq!(route.upstream_model(), model);
+        }
+    }
+
+    #[test]
+    fn non_openrouter_chat_body_keeps_generic_fields_and_system_role() {
+        let route = ProviderWireRoute::from_config_with_hint(
+            "github-copilot/gpt-4.1",
+            "https://api.individual.githubcopilot.com",
+            ProviderRouteHint::Known(KnownProvider::GithubCopilot),
+        )
+        .unwrap();
+        let mut body = serde_json::json!({
+            "model": "github-copilot/gpt-4.1",
+            "max_tokens": 2048,
+            "reasoning_effort": "high",
+            "messages": [{"role": "system", "content": "prompt"}]
+        });
+        route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+        assert_eq!(body["model"], "gpt-4.1");
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]

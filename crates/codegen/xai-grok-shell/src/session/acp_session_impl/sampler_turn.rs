@@ -858,7 +858,8 @@ impl SessionActor {
             Some(self.max_retries),
         );
         let model = cfg.model.clone();
-        let client = xai_grok_sampler::SamplingClient::new(cfg)
+        let route_hint = crate::auth::providers::sampler_route_hint(slug, &cfg.model);
+        let client = xai_grok_sampler::SamplingClient::new_with_route(cfg, route_hint)
             .map_err(|e| {
                 tracing::warn!(error = %e, "auto classifier aux sampler build failed; using session model")
             })
@@ -877,10 +878,23 @@ impl SessionActor {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
+        let route_hint = self.sampler_route_hint_for_config(&full_config);
         let sampling_client =
-            xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
+            xai_grok_sampler::SamplingClient::new_with_route(full_config, route_hint)
+                .map_err(|e| self.to_acp_error(e))?;
         Ok(sampling_client)
     }
+
+    fn sampler_route_hint_for_config(
+        &self,
+        config: &xai_grok_sampler::SamplerConfig,
+    ) -> xai_grok_sampler::ProviderRouteHint {
+        crate::auth::providers::sampler_route_hint(
+            self.models_manager.current_model_id().0.as_ref(),
+            &config.model,
+        )
+    }
+
     /// Push a fresh `SamplerConfig` into the per-session sampler actor
     /// before each turn. Mirrors `prepare_chat_completion`'s
     /// auth-refresh + config rebuild, but routes the result to the
@@ -901,7 +915,9 @@ impl SessionActor {
             sampler_config.doom_loop_recovery = None;
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
-        self.sampler_handle.update_config(sampler_config.clone());
+        let route_hint = self.sampler_route_hint_for_config(&sampler_config);
+        self.sampler_handle
+            .update_config_with_route(sampler_config.clone(), route_hint);
         sampler_config
     }
     /// Stage-D3 (plan 阶段 7) stable cache routing for `model` on
@@ -1521,7 +1537,9 @@ impl SessionActor {
             // again against the current request identity.
             let mut request_config = full_config.clone();
             request_config.bearer_resolver = None;
-            self.sampler_handle.update_config(request_config);
+            let route_hint = self.sampler_route_hint_for_config(&request_config);
+            self.sampler_handle
+                .update_config_with_route(request_config, route_hint);
             let mut frozen = request.clone();
             let wire_instructions = self.current_wire_instructions(&request).await;
             frozen.instructions = (!wire_instructions.is_empty()).then_some(wire_instructions);

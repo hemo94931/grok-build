@@ -53,6 +53,7 @@ pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent};
 pub use handle::SamplerHandle;
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
+pub use provider_wire::{KnownProvider, ProviderRouteHint};
 pub use retry::{
     DEFAULT_MAX_RETRIES, RATE_LIMIT_RETRY_THRESHOLD, RetryDecision, classify_error,
     format_sampling_error, resolve_max_retries, retry_backoff_with_jitter,
