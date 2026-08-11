@@ -783,28 +783,16 @@ impl SamplingClient {
             route.sanitize_headers(&mut headers);
         }
         let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
-        {
-            let auth_prefix = headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.chars().take(20).collect::<String>());
-            let x_api_key_prefix = headers
-                .get(HeaderName::from_static("x-api-key"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.chars().take(12).collect::<String>());
-            tracing::info!(
-                target: crate::sampling_log::TARGET,
-                event = "client_post",
-                model = %self.defaults.model,
-                api_backend = ?self.defaults.api_backend,
-                auth_scheme = ?self.defaults.auth_scheme,
-                has_bearer_resolver = self.bearer_resolver.is_some(),
-                has_authorization_header = headers.get(AUTHORIZATION).is_some(),
-                has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
-                auth_header_prefix = auth_prefix.as_deref().unwrap_or("none"),
-                x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
-            );
-        }
+        tracing::info!(
+            target: crate::sampling_log::TARGET,
+            event = "client_post",
+            model = %self.defaults.model,
+            api_backend = ?self.defaults.api_backend,
+            auth_scheme = ?self.defaults.auth_scheme,
+            has_bearer_resolver = self.bearer_resolver.is_some(),
+            has_authorization_header = headers.get(AUTHORIZATION).is_some(),
+            has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
+        );
         SentRequest {
             builder: self.http.post(url).headers(headers),
             sent_bearer,

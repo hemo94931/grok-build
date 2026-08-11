@@ -720,17 +720,8 @@ async fn resolve_effective_model_config(
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
-/// Truncate an API key to a safe prefix for logging. Counts characters, not
-/// bytes: a configured key with a multi-byte character would panic a byte
-/// slice, and this only ever runs to build a log line.
-fn key_prefix(key: &Option<String>) -> String {
-    match key {
-        Some(k) => k.chars().take(8).collect(),
-        None => "<none>".to_string(),
-    }
-}
-/// Emit a unified log entry recording which model and credentials a subagent
-/// resolved to, and how they compare to the parent's.
+/// Emit a unified log entry recording which model and credential presence a
+/// subagent resolved to, and how they compare to the parent's.
 fn log_subagent_model_resolution(
     agent_name: &str,
     priority: &str,
@@ -738,9 +729,6 @@ fn log_subagent_model_resolution(
     resolved_id: &acp::ModelId,
     parent: &xai_grok_sampler::SamplerConfig,
 ) {
-    let child_key = key_prefix(&resolved.api_key);
-    let parent_key = key_prefix(&parent.api_key);
-    let keys_match = resolved.api_key == parent.api_key;
     xai_grok_telemetry::unified_log::debug(
         "subagent model resolved",
         None,
@@ -749,11 +737,12 @@ fn log_subagent_model_resolution(
             "priority": priority,
             "child_model": resolved_id.0.as_ref(),
             "child_base_url": &resolved.base_url,
-            "child_key_prefix": child_key,
+            "child_has_credential": resolved.api_key.is_some(),
+            "child_auth_scheme": format!("{:?}", resolved.auth_scheme),
             "parent_model": &parent.model,
             "parent_base_url": &parent.base_url,
-            "parent_key_prefix": parent_key,
-            "keys_match": keys_match,
+            "parent_has_credential": parent.api_key.is_some(),
+            "parent_auth_scheme": format!("{:?}", parent.auth_scheme),
         })),
     );
 }
@@ -862,7 +851,8 @@ async fn read_parent_sampling_config(
                 Some(serde_json::json!({
                     "parent_model": &inherited.model,
                     "parent_base_url": &inherited.base_url,
-                    "parent_key_prefix": key_prefix(&inherited.api_key),
+                    "parent_has_credential": inherited.api_key.is_some(),
+                    "parent_auth_scheme": format!("{:?}", inherited.auth_scheme),
                     "session_model_id": model_id.0.as_ref(),
                     "global_model_id": global_model_id.0.as_ref(),
                     "source": "chat_state",
@@ -881,7 +871,8 @@ async fn read_parent_sampling_config(
         Some(serde_json::json!({
             "parent_model": &ctx.sampling_config.model,
             "parent_base_url": &ctx.sampling_config.base_url,
-            "parent_key_prefix": key_prefix(&ctx.sampling_config.api_key),
+            "parent_has_credential": ctx.sampling_config.api_key.is_some(),
+            "parent_auth_scheme": format!("{:?}", ctx.sampling_config.auth_scheme),
             "source": "spawn_context_baseline",
             "has_chat_state": ctx.parent_chat_state.is_some(),
         })),
@@ -966,7 +957,8 @@ fn resolve_model_override_to_config(
             "canonical_model": canonical_model_id.0.as_ref(),
             "resolved_model_raw": &config.model,
             "base_url": &config.base_url,
-            "key_prefix": key_prefix(&config.api_key),
+            "has_credential": config.api_key.is_some(),
+            "auth_scheme": format!("{:?}", config.auth_scheme),
             "has_own_credentials": entry.has_own_credentials(),
             "has_session_key": has_session_key,
             "auth_type": format!("{:?}", resolved_auth_type),

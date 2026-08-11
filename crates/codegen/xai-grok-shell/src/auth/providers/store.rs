@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use super::{ProviderId, ProviderRefreshOutcome};
 
@@ -19,11 +20,11 @@ const PERMANENT_EXPIRY_MS: u64 = 9_007_199_254_740_991;
 static PROCESS_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-type CredentialTable = BTreeMap<String, ProviderCredential>;
+type RawCredentialTable = Map<String, Value>;
 
 /// Canonical pi-compatible OAuth credential. Provider-specific fields are
 /// retained in `metadata`, so newer providers can add fields without changing
-/// the storage schema or dropping sibling-process data during an RMW.
+/// the storage schema.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProviderCredential {
     #[serde(rename = "type")]
@@ -33,7 +34,7 @@ pub(crate) struct ProviderCredential {
     pub(crate) refresh: String,
     pub(crate) expires: u64,
     #[serde(flatten)]
-    metadata: BTreeMap<String, serde_json::Value>,
+    metadata: BTreeMap<String, Value>,
 }
 
 impl ProviderCredential {
@@ -59,7 +60,7 @@ impl ProviderCredential {
         self.expires <= unix_millis().saturating_add(window.as_millis() as u64)
     }
 
-    pub(crate) fn metadata(&self, key: &str) -> Option<&serde_json::Value> {
+    pub(crate) fn metadata(&self, key: &str) -> Option<&Value> {
         self.metadata.get(key)
     }
 
@@ -79,7 +80,7 @@ impl ProviderCredential {
     pub(crate) fn set_metadata(
         &mut self,
         key: impl Into<String>,
-        value: impl Into<serde_json::Value>,
+        value: impl Into<Value>,
     ) {
         self.metadata.insert(key.into(), value.into());
     }
@@ -104,6 +105,146 @@ impl fmt::Debug for ProviderCredential {
             .field("expires", &self.expires)
             .field("metadata_keys", &self.metadata.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+/// Canonical stored API-key credential. Extra fields are retained so a future
+/// writer can add provider metadata without an older writer dropping it when
+/// the credential itself is intentionally re-saved.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ProviderApiKeyCredential {
+    #[serde(rename = "type")]
+    credential_type: String,
+    pub(crate) key: String,
+    #[serde(flatten)]
+    metadata: BTreeMap<String, Value>,
+}
+
+impl ProviderApiKeyCredential {
+    pub(crate) fn new(key: impl Into<String>) -> Self {
+        Self {
+            credential_type: "api_key".to_owned(),
+            key: key.into(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn metadata(&self, key: &str) -> Option<&Value> {
+        self.metadata.get(key)
+    }
+
+    pub(crate) fn metadata_str(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key)?.as_str()
+    }
+
+    pub(crate) fn set_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<Value>,
+    ) {
+        self.metadata.insert(key.into(), value.into());
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.credential_type != "api_key" {
+            bail!("unsupported provider credential type");
+        }
+        if self.key.trim().is_empty() {
+            bail!("provider API key is empty");
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ProviderApiKeyCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderApiKeyCredential")
+            .field("credential_type", &self.credential_type)
+            .field("key", &"[REDACTED]")
+            .field("metadata_keys", &self.metadata.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderStoredCredential {
+    OAuth(ProviderCredential),
+    ApiKey(ProviderApiKeyCredential),
+}
+
+impl ProviderStoredCredential {
+    pub(crate) fn oauth(&self) -> Option<&ProviderCredential> {
+        match self {
+            Self::OAuth(credential) => Some(credential),
+            Self::ApiKey(_) => None,
+        }
+    }
+
+    pub(crate) fn metadata(&self, key: &str) -> Option<&Value> {
+        match self {
+            Self::OAuth(credential) => credential.metadata(key),
+            Self::ApiKey(credential) => credential.metadata(key),
+        }
+    }
+
+    pub(crate) fn metadata_str(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::OAuth(credential) => credential.metadata_str(key),
+            Self::ApiKey(credential) => credential.metadata_str(key),
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::OAuth(credential) => credential.validate(),
+            Self::ApiKey(credential) => credential.validate(),
+        }
+    }
+
+    fn to_raw(&self) -> anyhow::Result<Value> {
+        match self {
+            Self::OAuth(credential) => Ok(serde_json::to_value(credential)?),
+            Self::ApiKey(credential) => Ok(serde_json::to_value(credential)?),
+        }
+    }
+}
+
+impl From<ProviderCredential> for ProviderStoredCredential {
+    fn from(value: ProviderCredential) -> Self {
+        Self::OAuth(value)
+    }
+}
+
+impl From<ProviderApiKeyCredential> for ProviderStoredCredential {
+    fn from(value: ProviderApiKeyCredential) -> Self {
+        Self::ApiKey(value)
+    }
+}
+
+/// State of one provider-owned credential slot. A present-but-unrecognized or
+/// malformed value deliberately remains distinct from `Missing`: only the
+/// latter permits provider environment fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderSlotState {
+    Missing,
+    Known(ProviderStoredCredential),
+    PresentUnsupportedOrInvalid,
+}
+
+impl ProviderSlotState {
+    pub(crate) fn known(&self) -> Option<&ProviderStoredCredential> {
+        match self {
+            Self::Known(credential) => Some(credential),
+            Self::Missing | Self::PresentUnsupportedOrInvalid => None,
+        }
+    }
+
+    pub(crate) fn oauth(&self) -> Option<&ProviderCredential> {
+        self.known()?.oauth()
+    }
+
+    pub(crate) fn is_known(&self) -> bool {
+        matches!(self, Self::Known(_))
     }
 }
 
@@ -141,34 +282,36 @@ impl ProviderStore {
         &self.path
     }
 
-    pub(crate) fn get(&self, provider: ProviderId) -> anyhow::Result<Option<ProviderCredential>> {
-        let mut table = read_table(&self.path)?;
-        Ok(table.remove(provider.as_str()))
+    pub(crate) fn get(&self, provider: ProviderId) -> anyhow::Result<ProviderSlotState> {
+        let table = read_table(&self.path)?;
+        Ok(classify_slot(provider, table.get(provider.as_str())))
     }
 
-    pub(crate) fn list(&self) -> anyhow::Result<BTreeMap<ProviderId, ProviderCredential>> {
-        read_table(&self.path)?
-            .into_iter()
-            .filter_map(|(key, value)| key.parse().ok().map(|provider| (provider, value)))
-            .map(|(provider, credential)| {
-                credential.validate()?;
-                Ok((provider, credential))
+    pub(crate) fn list(&self) -> anyhow::Result<BTreeMap<ProviderId, ProviderSlotState>> {
+        let table = read_table(&self.path)?;
+        Ok(table
+            .iter()
+            .filter_map(|(key, value)| {
+                key.parse()
+                    .ok()
+                    .map(|provider| (provider, classify_slot(provider, Some(value))))
             })
-            .collect()
+            .collect())
     }
 
-    pub(crate) async fn put(
-        &self,
-        provider: ProviderId,
-        credential: ProviderCredential,
-    ) -> anyhow::Result<()> {
+    pub(crate) async fn put<C>(&self, provider: ProviderId, credential: C) -> anyhow::Result<()>
+    where
+        C: Into<ProviderStoredCredential>,
+    {
+        let credential = credential.into();
         credential.validate()?;
+        let raw = credential.to_raw()?;
         let _process_guard = PROCESS_MUTATION_LOCK.lock().await;
         let lock = self
             .acquire(crate::auth::manager::AUTH_LOCK_TIMEOUT)
             .await?;
         let mut table = read_table(&self.path)?;
-        table.insert(provider.as_str().to_owned(), credential);
+        table.insert(provider.as_str().to_owned(), raw);
         self.ensure_live(&lock)?;
         write_table(&self.path, &table)
     }
@@ -218,10 +361,16 @@ impl ProviderStore {
             .acquire(crate::auth::manager::REFRESH_LOCK_TIMEOUT)
             .await?;
         let mut table = read_table(&self.path)?;
-        let current = table
-            .get(provider.as_str())
-            .cloned()
-            .with_context(|| format!("{provider} is not logged in"))?;
+        let current = match classify_slot(provider, table.get(provider.as_str())) {
+            ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) => credential,
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(_)) => {
+                bail!("{provider} stores an API key, which cannot be refreshed")
+            }
+            ProviderSlotState::Missing => bail!("{provider} is not logged in"),
+            ProviderSlotState::PresentUnsupportedOrInvalid => {
+                bail!("{provider} credential slot is unsupported or invalid")
+            }
+        };
         current.validate()?;
 
         match &reason {
@@ -249,7 +398,10 @@ impl ProviderStore {
         match outcome {
             ProviderRefreshOutcome::Save(credential) => {
                 credential.validate()?;
-                table.insert(provider.as_str().to_owned(), credential.clone());
+                table.insert(
+                    provider.as_str().to_owned(),
+                    ProviderStoredCredential::OAuth(credential.clone()).to_raw()?,
+                );
                 write_table(&self.path, &table)?;
                 Ok(credential)
             }
@@ -299,11 +451,50 @@ pub(crate) fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn read_table(path: &Path) -> anyhow::Result<CredentialTable> {
+fn classify_slot(provider: ProviderId, raw: Option<&Value>) -> ProviderSlotState {
+    let Some(raw) = raw else {
+        return ProviderSlotState::Missing;
+    };
+    let credential_type = raw
+        .as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str);
+    let parsed = match credential_type {
+        Some("oauth") => serde_json::from_value::<ProviderCredential>(raw.clone())
+            .ok()
+            .and_then(|credential| credential.validate().ok().map(|()| credential))
+            .map(ProviderStoredCredential::OAuth),
+        Some("api_key") => serde_json::from_value::<ProviderApiKeyCredential>(raw.clone())
+            .ok()
+            .and_then(|credential| credential.validate().ok().map(|()| credential))
+            .map(ProviderStoredCredential::ApiKey),
+        Some(_) | None => None,
+    };
+    match parsed {
+        Some(credential) => ProviderSlotState::Known(credential),
+        None => {
+            let type_class = match credential_type {
+                Some("oauth") => "oauth",
+                Some("api_key") => "api_key",
+                Some(_) => "unsupported",
+                None => "missing_or_non_string",
+            };
+            tracing::warn!(
+                %provider,
+                credential_type = type_class,
+                classification = "present_unsupported_or_invalid",
+                "provider credential slot is not usable; environment fallback is blocked"
+            );
+            ProviderSlotState::PresentUnsupportedOrInvalid
+        }
+    }
+}
+
+fn read_table(path: &Path) -> anyhow::Result<RawCredentialTable> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CredentialTable::new());
+            return Ok(RawCredentialTable::new());
         }
         Err(error) => return Err(error.into()),
     };
@@ -313,12 +504,17 @@ fn read_table(path: &Path) -> anyhow::Result<CredentialTable> {
         tracing::warn!(path = %path.display(), %error, "provider auth: failed to tighten providers.json permissions");
     }
     if contents.trim().is_empty() {
-        return Ok(CredentialTable::new());
+        return Ok(RawCredentialTable::new());
     }
-    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    match value {
+        Value::Object(table) => Ok(table),
+        _ => bail!("failed to parse {}: root must be a JSON object", path.display()),
+    }
 }
 
-fn write_or_remove_table(path: &Path, table: &CredentialTable) -> anyhow::Result<()> {
+fn write_or_remove_table(path: &Path, table: &RawCredentialTable) -> anyhow::Result<()> {
     if table.is_empty() {
         remove_file_if_present(path)
     } else {
@@ -334,7 +530,7 @@ fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn write_table(path: &Path, table: &CredentialTable) -> anyhow::Result<()> {
+fn write_table(path: &Path, table: &RawCredentialTable) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -399,36 +595,159 @@ mod tests {
         )
     }
 
+    fn oauth(slot: ProviderSlotState) -> ProviderCredential {
+        match slot {
+            ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) => credential,
+            other => panic!("expected OAuth slot, got {other:?}"),
+        }
+    }
+
+    fn api_key(slot: ProviderSlotState) -> ProviderApiKeyCredential {
+        match slot {
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(credential)) => credential,
+            other => panic!("expected API-key slot, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn credential_round_trip_preserves_provider_metadata_and_redacts_debug() {
-        let mut credential = ProviderCredential::oauth("access-secret", "refresh-secret", 123);
-        credential.set_metadata("accountId", "acct-1");
-        let json = serde_json::to_string(&credential).unwrap();
-        let decoded: ProviderCredential = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.metadata_str("accountId"), Some("acct-1"));
-        let debug = format!("{decoded:?}");
-        assert!(!debug.contains("access-secret"));
-        assert!(!debug.contains("refresh-secret"));
+    fn credentials_round_trip_metadata_and_redact_debug() {
+        let mut oauth_credential = ProviderCredential::oauth("access-secret", "refresh-secret", 123);
+        oauth_credential.set_metadata("accountId", "acct-1");
+        let oauth_json = serde_json::to_string(&oauth_credential).unwrap();
+        let oauth_decoded: ProviderCredential = serde_json::from_str(&oauth_json).unwrap();
+        assert_eq!(oauth_decoded.metadata_str("accountId"), Some("acct-1"));
+        let oauth_debug = format!("{oauth_decoded:?}");
+        assert!(!oauth_debug.contains("access-secret"));
+        assert!(!oauth_debug.contains("refresh-secret"));
+
+        let mut api_key_credential = ProviderApiKeyCredential::new("api-key-secret");
+        api_key_credential.set_metadata("future", serde_json::json!({"enabled": true}));
+        let api_key_json = serde_json::to_string(&api_key_credential).unwrap();
+        let api_key_decoded: ProviderApiKeyCredential =
+            serde_json::from_str(&api_key_json).unwrap();
+        assert_eq!(
+            api_key_decoded.metadata("future"),
+            Some(&serde_json::json!({"enabled": true}))
+        );
+        assert!(!format!("{api_key_decoded:?}").contains("api-key-secret"));
+        assert!(!format!("{:?}", ProviderStoredCredential::ApiKey(api_key_decoded))
+            .contains("api-key-secret"));
     }
 
     #[tokio::test]
-    async fn put_and_remove_use_separate_provider_file() {
+    async fn api_key_round_trip_overwrite_remove_and_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store
             .put(
                 ProviderId::Anthropic,
-                ProviderCredential::oauth("access", "refresh", u64::MAX),
+                ProviderCredential::oauth("oauth-access", "oauth-refresh", u64::MAX),
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.get(ProviderId::Anthropic).unwrap().unwrap().access,
-            "access"
-        );
-        assert!(!dir.path().join("auth.json").exists());
+        store
+            .put(
+                ProviderId::Anthropic,
+                ProviderApiKeyCredential::new("stored-api-key"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_key(store.get(ProviderId::Anthropic).unwrap()).key, "stored-api-key");
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(raw.as_object().unwrap().len(), 1);
+        assert_eq!(raw["anthropic"]["type"], "api_key");
+        assert!(raw["anthropic"].get("access").is_none());
+
+        store
+            .put(
+                ProviderId::Anthropic,
+                ProviderCredential::oauth("last-access", "last-refresh", u64::MAX),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oauth(store.get(ProviderId::Anthropic).unwrap()).access, "last-access");
         assert!(store.remove(ProviderId::Anthropic).await.unwrap());
         assert!(!store.path().exists());
+        assert!(!dir.path().join("auth.json").exists());
+    }
+
+    #[tokio::test]
+    async fn raw_rmw_preserves_unknown_entries_and_future_fields_semantically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let original = serde_json::json!({
+            "future-provider": {
+                "type": "future_credential",
+                "nested": {"array": [1, true, {"secret": "opaque"}]}
+            },
+            "anthropic": {
+                "type": "oauth-v2",
+                "access": "must-not-be-treated-as-oauth",
+                "refresh": "opaque",
+                "expires": 42,
+                "future": ["kept"]
+            },
+            "radius": {
+                "type": "api_key",
+                "key": "radius-key",
+                "futureMetadata": {"region": "mars"}
+            }
+        });
+        std::fs::write(store.path(), serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        assert_eq!(
+            store.get(ProviderId::Anthropic).unwrap(),
+            ProviderSlotState::PresentUnsupportedOrInvalid
+        );
+        store
+            .put(
+                ProviderId::Openrouter,
+                ProviderApiKeyCredential::new("openrouter-key"),
+            )
+            .await
+            .unwrap();
+        let after_put: Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        for key in ["future-provider", "anthropic", "radius"] {
+            assert_eq!(after_put[key], original[key]);
+        }
+
+        assert!(store.remove(ProviderId::Openrouter).await.unwrap());
+        let after_remove: Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(after_remove, original);
+    }
+
+    #[test]
+    fn invalid_root_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        std::fs::write(store.path(), "[]").unwrap();
+        assert!(store.get(ProviderId::Anthropic).is_err());
+        std::fs::write(store.path(), "{").unwrap();
+        assert!(store.get(ProviderId::Anthropic).is_err());
+    }
+
+    #[tokio::test]
+    async fn api_key_refresh_never_invokes_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store
+            .put(
+                ProviderId::Anthropic,
+                ProviderApiKeyCredential::new("stored-api-key"),
+            )
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = store
+            .refresh(ProviderId::Anthropic, RefreshReason::Expiring, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { panic!("API-key refresh callback must not run") }
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -582,28 +901,41 @@ mod tests {
 
         let spends = std::fs::read_to_string(dir.path().join("refresh-spends.txt")).unwrap();
         assert_eq!(spends.lines().count(), 1);
-        let stored = store.get(ProviderId::Anthropic).unwrap().unwrap();
+        let stored = oauth(store.get(ProviderId::Anthropic).unwrap());
         assert_eq!(stored.access, "rotated-access");
         assert_eq!(stored.refresh, "rotated-refresh");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn providers_file_is_owner_only() {
+    async fn providers_file_is_owner_only_for_api_keys() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        store
-            .put(
-                ProviderId::Radius,
-                ProviderCredential::oauth("access", "refresh", u64::MAX),
-            )
-            .await
-            .unwrap();
-        let mode = std::fs::metadata(store.path())
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            store.path(),
+            r#"{"radius":{"type":"api_key","key":"sentinel"}}"#,
+        )
+        .unwrap();
+        let _ = store.get(ProviderId::Radius).unwrap();
+        let tightened_mode = std::fs::metadata(store.path())
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(tightened_mode & 0o777, 0o600);
+
+        store
+            .put(
+                ProviderId::Radius,
+                ProviderApiKeyCredential::new("replacement"),
+            )
+            .await
+            .unwrap();
+        let written_mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(written_mode & 0o777, 0o600);
     }
 }

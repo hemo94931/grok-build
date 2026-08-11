@@ -4845,7 +4845,7 @@ fn build_provider_request_context(
     provider: crate::auth::ProviderId,
     upstream_model_id: &str,
     secret: crate::auth::providers::ProviderSecret,
-    credential: Option<&crate::auth::providers::ProviderCredential>,
+    credential: Option<&crate::auth::providers::ProviderStoredCredential>,
 ) -> anyhow::Result<crate::auth::providers::ProviderRequestContext> {
     let descriptor = crate::auth::providers::provider_descriptor(provider);
     let configured_base = model.info.base_url.trim_end_matches('/');

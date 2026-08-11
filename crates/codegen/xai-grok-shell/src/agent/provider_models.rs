@@ -5,30 +5,47 @@ use xai_grok_sampler::AuthScheme;
 
 use super::config::{ModelEntry, ModelInfo};
 use crate::auth::providers::{
-    ProviderId, ProviderSecret, ProviderStore, namespaced_model_id, provider_models,
+    ProviderId, ProviderSecret, ProviderSlotState, ProviderStore, ProviderStoredCredential,
+    namespaced_model_id, provider_models,
 };
 
 pub(crate) fn append_available_provider_models(resolved: &mut IndexMap<String, ModelEntry>) {
     let store = ProviderStore::default();
     for provider in ProviderId::ALL {
-        let credential = match store.get(provider) {
+        let slot = match store.get(provider) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(%provider, %error, "provider model catalog: credential read failed");
+                continue;
+            }
+        };
+        let credential = match &slot {
+            ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) => {
+                Some(credential)
+            }
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(_))
+                if provider == ProviderId::OpenaiCodex =>
+            {
+                tracing::warn!(%provider, "provider model catalog: Codex API-key slot is unusable");
+                continue;
+            }
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(_)) => None,
+            ProviderSlotState::PresentUnsupportedOrInvalid => continue,
+            ProviderSlotState::Missing => {
+                let has_environment_key = ProviderSecret::from_environment(provider)
+                    .map(|value| value.is_some())
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%provider, %error, "provider model catalog: environment credential invalid");
+                        false
+                    });
+                if !has_environment_key {
+                    continue;
+                }
                 None
             }
         };
-        let has_environment_key = ProviderSecret::from_environment(provider)
-            .map(|value| value.is_some())
-            .unwrap_or_else(|error| {
-                tracing::warn!(%provider, %error, "provider model catalog: environment credential invalid");
-                false
-            });
-        if credential.is_none() && !has_environment_key {
-            continue;
-        }
 
-        for model in provider_models(provider, credential.as_ref()) {
+        for model in provider_models(provider, credential) {
             let Some(api_backend) = model.api_backend() else {
                 continue;
             };

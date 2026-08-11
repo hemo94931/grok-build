@@ -140,16 +140,16 @@ struct ProviderInfo {
 async fn handle_info() -> ExtResult {
     let mut providers = Vec::with_capacity(ProviderId::ALL.len());
     for provider in ProviderId::ALL {
-        let credential = crate::auth::providers::stored_credential(provider)
+        let slot = crate::auth::providers::stored_slot(provider)
             .await
             .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        let oauth = slot.oauth();
         providers.push(ProviderInfo {
             id: provider.as_str(),
             display_name: provider.display_name(),
-            authenticated: credential.is_some(),
-            expires_at: credential.as_ref().map(|credential| credential.expires),
-            model_count: crate::auth::providers::provider_models(provider, credential.as_ref())
-                .len(),
+            authenticated: slot.is_known(),
+            expires_at: oauth.map(|credential| credential.expires),
+            model_count: crate::auth::providers::provider_models(provider, oauth).len(),
         });
     }
     to_raw_response(&serde_json::json!({ "providers": providers }))

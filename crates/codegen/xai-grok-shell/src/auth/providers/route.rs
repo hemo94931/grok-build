@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use xai_grok_sampler::{ApiBackend, AuthScheme};
 
 use super::flow::validate_http_url;
-use super::{ProviderCredential, ProviderId, ProviderStore};
+use super::{
+    ProviderCredential, ProviderId, ProviderSlotState, ProviderStore, ProviderStoredCredential,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderLoginFlow {
@@ -106,7 +108,83 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
 pub(crate) enum ProviderSecretSource {
     Model,
     StoredOAuth,
+    StoredApiKey,
     Environment(&'static str),
+}
+
+impl ProviderSecretSource {
+    pub(crate) const fn method(self) -> ProviderCredentialMethod {
+        match self {
+            Self::StoredOAuth => ProviderCredentialMethod::OAuth,
+            Self::Model | Self::StoredApiKey | Self::Environment(_) => {
+                ProviderCredentialMethod::ApiKey
+            }
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::StoredOAuth => "stored_oauth",
+            Self::StoredApiKey => "stored_api_key",
+            Self::Environment(_) => "environment",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderCredentialMethod {
+    OAuth,
+    ApiKey,
+}
+
+impl ProviderCredentialMethod {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OAuth => "oauth",
+            Self::ApiKey => "api_key",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderAuthRemedy {
+    pub(crate) provider: ProviderId,
+    pub(crate) source: ProviderSecretSource,
+    pub(crate) method: ProviderCredentialMethod,
+}
+
+impl ProviderAuthRemedy {
+    pub(crate) fn advice(self) -> String {
+        match self.source {
+            ProviderSecretSource::StoredOAuth => format!(
+                "Run `grok login --provider {}` to refresh the stored OAuth credential.",
+                self.provider
+            ),
+            ProviderSecretSource::StoredApiKey => format!(
+                "Run `grok login --provider {} --api-key` to replace the stored API key.",
+                self.provider
+            ),
+            ProviderSecretSource::Environment(key) => format!(
+                "Update `{key}`, or run `grok login --provider {} --api-key` to store a credential that owns this provider.",
+                self.provider
+            ),
+            ProviderSecretSource::Model => {
+                "Update the model's `api_key`/`env_key` credential; model-scoped BYOK takes precedence over stored provider credentials.".to_owned()
+            }
+        }
+    }
+}
+
+pub(crate) fn provider_auth_remedy(
+    provider: ProviderId,
+    source: ProviderSecretSource,
+) -> ProviderAuthRemedy {
+    ProviderAuthRemedy {
+        provider,
+        source,
+        method: source.method(),
+    }
 }
 
 #[derive(Clone)]
@@ -130,6 +208,10 @@ impl ProviderSecret {
             auth_scheme: oauth_scheme(provider),
             source: ProviderSecretSource::StoredOAuth,
         }
+    }
+
+    pub(crate) fn from_api_key(provider: ProviderId, key: String) -> anyhow::Result<Self> {
+        secret(provider, key, ProviderSecretSource::StoredApiKey)
     }
 
     /// Resolve only provider-scoped variables. This intentionally never reads
@@ -161,15 +243,24 @@ struct ProviderBearerResolver {
 
 impl xai_grok_sampler::BearerResolver for ProviderBearerResolver {
     fn current_bearer(&self) -> Option<String> {
-        ProviderStore::default()
-            .get(self.provider)
-            .map_err(|error| {
+        match ProviderStore::default().get(self.provider) {
+            Ok(ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential))) => {
+                Some(credential.access)
+            }
+            Ok(ProviderSlotState::Missing) => None,
+            Ok(ProviderSlotState::Known(ProviderStoredCredential::ApiKey(_))) => {
+                tracing::warn!(provider = %self.provider, "provider bearer reload found an API-key slot; OAuth resolver disabled");
+                None
+            }
+            Ok(ProviderSlotState::PresentUnsupportedOrInvalid) => {
+                tracing::warn!(provider = %self.provider, "provider bearer reload found an unsupported or invalid slot");
+                None
+            }
+            Err(error) => {
                 tracing::warn!(provider = %self.provider, %error, "provider bearer reload failed");
-                error
-            })
-            .ok()
-            .flatten()
-            .map(|credential| credential.access)
+                None
+            }
+        }
     }
 }
 
@@ -182,34 +273,64 @@ pub(crate) fn provider_bearer_resolver(
 fn model_provider_secret(
     provider: ProviderId,
     model_secret: Option<String>,
-) -> anyhow::Result<Option<(ProviderSecret, Option<ProviderCredential>)>> {
+) -> anyhow::Result<Option<(ProviderSecret, Option<ProviderStoredCredential>)>> {
     model_secret
         .filter(|token| !token.trim().is_empty())
         .map(|token| ProviderSecret::from_model(provider, token).map(|secret| (secret, None)))
         .transpose()
 }
 
+fn stored_or_environment_secret_with<F>(
+    provider: ProviderId,
+    slot: ProviderSlotState,
+    environment: F,
+) -> anyhow::Result<(ProviderSecret, Option<ProviderStoredCredential>)>
+where
+    F: FnOnce(ProviderId) -> anyhow::Result<Option<ProviderSecret>>,
+{
+    match slot {
+        ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) => {
+            let secret = ProviderSecret::from_oauth(provider, &credential);
+            Ok((secret, Some(ProviderStoredCredential::OAuth(credential))))
+        }
+        ProviderSlotState::Known(ProviderStoredCredential::ApiKey(credential)) => {
+            let secret = ProviderSecret::from_api_key(provider, credential.key.clone())?;
+            Ok((secret, Some(ProviderStoredCredential::ApiKey(credential))))
+        }
+        ProviderSlotState::PresentUnsupportedOrInvalid => {
+            bail!(
+                "{provider} credential slot is unsupported or invalid; remove or replace the stored credential"
+            )
+        }
+        ProviderSlotState::Missing => {
+            if let Some(secret) = environment(provider)? {
+                return Ok((secret, None));
+            }
+            let env_keys = provider_descriptor(provider).env_keys;
+            if env_keys.is_empty() {
+                bail!(
+                    "{provider} credentials are missing; run `grok login --provider {provider}`"
+                );
+            }
+            bail!(
+                "{provider} credentials are missing; run `grok login --provider {provider}` or set one of: {}",
+                env_keys.join(", ")
+            )
+        }
+    }
+}
+
 fn stored_or_environment_secret(
     provider: ProviderId,
-    credential: Option<ProviderCredential>,
-) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
-    if let Some(credential) = credential {
-        let secret = ProviderSecret::from_oauth(provider, &credential);
-        return Ok((secret, Some(credential)));
-    }
-    if let Some(secret) = ProviderSecret::from_environment(provider)? {
-        return Ok((secret, None));
-    }
-    bail!(
-        "{provider} credentials are missing; run `grok login --provider {provider}` or set one of: {}",
-        provider_descriptor(provider).env_keys.join(", ")
-    )
+    slot: ProviderSlotState,
+) -> anyhow::Result<(ProviderSecret, Option<ProviderStoredCredential>)> {
+    stored_or_environment_secret_with(provider, slot, ProviderSecret::from_environment)
 }
 
 pub(crate) fn resolve_provider_secret(
     provider: ProviderId,
     model_secret: Option<String>,
-) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
+) -> anyhow::Result<(ProviderSecret, Option<ProviderStoredCredential>)> {
     if let Some(secret) = model_provider_secret(provider, model_secret)? {
         return Ok(secret);
     }
@@ -219,14 +340,11 @@ pub(crate) fn resolve_provider_secret(
 pub(crate) async fn resolve_fresh_provider_secret(
     provider: ProviderId,
     model_secret: Option<String>,
-) -> anyhow::Result<(ProviderSecret, Option<ProviderCredential>)> {
+) -> anyhow::Result<(ProviderSecret, Option<ProviderStoredCredential>)> {
     if let Some(secret) = model_provider_secret(provider, model_secret)? {
         return Ok(secret);
     }
-    stored_or_environment_secret(
-        provider,
-        super::fresh_stored_credential(provider, None).await?,
-    )
+    stored_or_environment_secret(provider, super::fresh_stored_slot(provider, None).await?)
 }
 
 impl fmt::Debug for ProviderSecret {
@@ -247,12 +365,16 @@ fn secret(
     if token.trim().is_empty() {
         bail!("{provider} credential is empty");
     }
+    if provider == ProviderId::OpenaiCodex {
+        bail!("OpenAI Codex requires OAuth login and does not accept API-key credentials");
+    }
     let auth_scheme = if provider == ProviderId::Anthropic
-        && !token.starts_with("sk-ant-oat")
         && !matches!(
             source,
-            ProviderSecretSource::Environment("ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_OAUTH_TOKEN")
-        ) {
+            ProviderSecretSource::Environment("ANTHROPIC_AUTH_TOKEN")
+        )
+        && !token.contains("sk-ant-oat")
+    {
         AuthScheme::XApiKey
     } else {
         AuthScheme::Bearer
@@ -296,7 +418,7 @@ impl ProviderRequestContext {
         provider_id: ProviderId,
         upstream_model_id: impl Into<String>,
         secret: ProviderSecret,
-        credential: Option<&ProviderCredential>,
+        credential: Option<&ProviderStoredCredential>,
         base_url_override: Option<&str>,
         api_backend_override: Option<ApiBackend>,
         wire_dialect_override: Option<ProviderWireDialect>,
@@ -357,7 +479,7 @@ impl fmt::Debug for ProviderRequestContext {
 
 fn dynamic_base_url<'a>(
     provider: ProviderId,
-    credential: Option<&'a ProviderCredential>,
+    credential: Option<&'a ProviderStoredCredential>,
     override_url: Option<&'a str>,
 ) -> Option<&'a str> {
     override_url.or_else(|| match provider {
@@ -373,7 +495,7 @@ fn dynamic_base_url<'a>(
 
 fn provider_headers(
     provider: ProviderId,
-    credential: Option<&ProviderCredential>,
+    credential: Option<&ProviderStoredCredential>,
     secret: &ProviderSecret,
 ) -> anyhow::Result<IndexMap<String, String>> {
     let mut headers = IndexMap::new();
@@ -458,22 +580,125 @@ mod tests {
         assert!(parse_namespaced_model_id("grok-4").is_none());
     }
 
+    fn anthropic_context(secret: ProviderSecret) -> ProviderRequestContext {
+        ProviderRequestContext::build(
+            ProviderId::Anthropic,
+            "claude-test",
+            secret,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn multi_provider_regression_anthropic_oauth_env_is_bearer() {
-        let oauth = secret(
+    fn anthropic_scheme_and_oauth_header_truth_table() {
+        let oauth = ProviderCredential::oauth("stored-oauth", "refresh", u64::MAX);
+        let cases = [
+            ProviderSecret::from_oauth(ProviderId::Anthropic, &oauth),
+            secret(
+                ProviderId::Anthropic,
+                "opaque-auth-token".to_owned(),
+                ProviderSecretSource::Environment("ANTHROPIC_AUTH_TOKEN"),
+            )
+            .unwrap(),
+            secret(
+                ProviderId::Anthropic,
+                "plain-stored-key".to_owned(),
+                ProviderSecretSource::StoredApiKey,
+            )
+            .unwrap(),
+            secret(
+                ProviderId::Anthropic,
+                "prefix-sk-ant-oat-middle".to_owned(),
+                ProviderSecretSource::StoredApiKey,
+            )
+            .unwrap(),
+            secret(
+                ProviderId::Anthropic,
+                "plain-oauth-env-value".to_owned(),
+                ProviderSecretSource::Environment("ANTHROPIC_OAUTH_TOKEN"),
+            )
+            .unwrap(),
+            secret(
+                ProviderId::Anthropic,
+                "prefix-sk-ant-oat-middle".to_owned(),
+                ProviderSecretSource::Environment("ANTHROPIC_API_KEY"),
+            )
+            .unwrap(),
+        ];
+        let expected = [
+            AuthScheme::Bearer,
+            AuthScheme::Bearer,
+            AuthScheme::XApiKey,
+            AuthScheme::Bearer,
+            AuthScheme::XApiKey,
+            AuthScheme::Bearer,
+        ];
+        for (secret, expected_scheme) in cases.into_iter().zip(expected) {
+            let context = anthropic_context(secret);
+            assert_eq!(context.auth_scheme, expected_scheme);
+            assert_eq!(
+                context.headers.contains_key("anthropic-beta"),
+                expected_scheme == AuthScheme::Bearer
+            );
+            assert_eq!(
+                context.headers.contains_key("x-app"),
+                expected_scheme == AuthScheme::Bearer
+            );
+        }
+    }
+
+    #[test]
+    fn present_invalid_slot_blocks_environment_fallback() {
+        let calls = std::cell::Cell::new(0);
+        let result = stored_or_environment_secret_with(
             ProviderId::Anthropic,
-            "opaque-oauth-token".to_owned(),
-            ProviderSecretSource::Environment("ANTHROPIC_OAUTH_TOKEN"),
-        )
-        .unwrap();
-        let api_key = secret(
+            ProviderSlotState::PresentUnsupportedOrInvalid,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(Some(secret(
+                    ProviderId::Anthropic,
+                    "environment-key".to_owned(),
+                    ProviderSecretSource::Environment("ANTHROPIC_API_KEY"),
+                )?))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn codex_rejects_all_api_key_sources() {
+        for source in [
+            ProviderSecretSource::Model,
+            ProviderSecretSource::StoredApiKey,
+            ProviderSecretSource::Environment("OPENAI_API_KEY"),
+        ] {
+            assert!(secret(ProviderId::OpenaiCodex, "key".to_owned(), source).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_auth_remedies_are_source_and_method_aware() {
+        let stored = provider_auth_remedy(
             ProviderId::Anthropic,
-            "sk-ant-api".to_owned(),
-            ProviderSecretSource::Environment("ANTHROPIC_API_KEY"),
-        )
-        .unwrap();
-        assert_eq!(oauth.auth_scheme, AuthScheme::Bearer);
-        assert_eq!(api_key.auth_scheme, AuthScheme::XApiKey);
+            ProviderSecretSource::StoredApiKey,
+        );
+        assert_eq!(stored.method, ProviderCredentialMethod::ApiKey);
+        assert_eq!(stored.source.as_str(), "stored_api_key");
+        assert!(stored.advice().contains("--api-key"));
+
+        let environment = provider_auth_remedy(
+            ProviderId::Openrouter,
+            ProviderSecretSource::Environment("OPENROUTER_API_KEY"),
+        );
+        assert!(environment.advice().contains("OPENROUTER_API_KEY"));
+
+        let model = provider_auth_remedy(ProviderId::Radius, ProviderSecretSource::Model);
+        assert!(model.advice().contains("model-scoped BYOK"));
     }
 
     #[test]
@@ -493,11 +718,12 @@ mod tests {
     fn context_uses_dynamic_copilot_base_and_redacts_token() {
         let mut credential = ProviderCredential::oauth("oauth-secret", "github-token", u64::MAX);
         credential.set_metadata("baseUrl", "https://api.enterprise.example");
+        let stored = ProviderStoredCredential::OAuth(credential.clone());
         let context = ProviderRequestContext::build(
             ProviderId::GithubCopilot,
             "gpt-4.1",
             ProviderSecret::from_oauth(ProviderId::GithubCopilot, &credential),
-            Some(&credential),
+            Some(&stored),
             None,
             Some(ApiBackend::Responses),
             None,

@@ -29,11 +29,15 @@ pub(crate) use cli::{
 };
 pub(crate) use flow::{AuthInteraction, AuthNotification, AuthPrompt, DeviceCode, SelectOption};
 pub(crate) use route::{
-    ProviderDescriptor, ProviderRequestContext, ProviderSecret, ProviderSecretSource,
-    ProviderWireDialect, namespaced_model_id, parse_namespaced_model_id, provider_bearer_resolver,
-    provider_descriptor, resolve_fresh_provider_secret, resolve_provider_secret,
+    ProviderAuthRemedy, ProviderCredentialMethod, ProviderDescriptor, ProviderRequestContext,
+    ProviderSecret, ProviderSecretSource, ProviderWireDialect, namespaced_model_id,
+    parse_namespaced_model_id, provider_auth_remedy, provider_bearer_resolver, provider_descriptor,
+    resolve_fresh_provider_secret, resolve_provider_secret,
 };
-pub(crate) use store::{ProviderCredential, ProviderStore, RefreshReason};
+pub(crate) use store::{
+    ProviderApiKeyCredential, ProviderCredential, ProviderSlotState, ProviderStore,
+    ProviderStoredCredential, RefreshReason,
+};
 
 /// Provider IDs are stable storage keys and catalog namespace prefixes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -151,22 +155,23 @@ pub(crate) async fn login_and_store(
     Ok(credential)
 }
 
-pub(crate) async fn stored_credential(
-    provider: ProviderId,
-) -> anyhow::Result<Option<ProviderCredential>> {
+pub(crate) async fn stored_slot(provider: ProviderId) -> anyhow::Result<ProviderSlotState> {
     ProviderStore::default().get(provider)
 }
 
-pub(crate) async fn fresh_stored_credential(
+pub(crate) async fn fresh_stored_slot(
     provider: ProviderId,
     rejected_access: Option<&str>,
-) -> anyhow::Result<Option<ProviderCredential>> {
+) -> anyhow::Result<ProviderSlotState> {
     let store = ProviderStore::default();
-    let Some(credential) = store.get(provider)? else {
-        return Ok(None);
+    let slot = store.get(provider)?;
+    let ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) = slot else {
+        return Ok(slot);
     };
     if rejected_access.is_none() && !credential.expires_within(store::REFRESH_WINDOW) {
-        return Ok(Some(credential));
+        return Ok(ProviderSlotState::Known(ProviderStoredCredential::OAuth(
+            credential,
+        )));
     }
 
     let reason = match rejected_access {
@@ -181,7 +186,27 @@ pub(crate) async fn fresh_stored_credential(
             refresh(provider, credential, signal)
         })
         .await
-        .map(Some)
+        .map(|credential| {
+            ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential))
+        })
+}
+
+pub(crate) async fn fresh_stored_credential(
+    provider: ProviderId,
+    rejected_access: Option<&str>,
+) -> anyhow::Result<Option<ProviderCredential>> {
+    match fresh_stored_slot(provider, rejected_access).await? {
+        ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)) => {
+            Ok(Some(credential))
+        }
+        ProviderSlotState::Missing => Ok(None),
+        ProviderSlotState::Known(ProviderStoredCredential::ApiKey(_)) => {
+            anyhow::bail!("{provider} stores an API key, which cannot be refreshed")
+        }
+        ProviderSlotState::PresentUnsupportedOrInvalid => {
+            anyhow::bail!("{provider} credential slot is unsupported or invalid")
+        }
+    }
 }
 
 pub(crate) async fn logout(provider: ProviderId) -> anyhow::Result<bool> {

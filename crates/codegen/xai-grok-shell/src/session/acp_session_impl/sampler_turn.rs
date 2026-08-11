@@ -391,6 +391,24 @@ impl SessionActor {
             }
         }
     }
+    fn provider_auth_remedy_for_model(
+        &self,
+        provider: crate::auth::ProviderId,
+        model_id: &str,
+    ) -> Option<crate::auth::providers::ProviderAuthRemedy> {
+        let model = self.models_manager.model_entry(model_id)?;
+        let context = crate::agent::config::resolve_provider_request_context(&model)
+            .map_err(|error| {
+                tracing::warn!(%provider, %error, "provider 401 remedy could not rebuild route");
+                error
+            })
+            .ok()
+            .flatten()?;
+        Some(crate::auth::providers::provider_auth_remedy(
+            provider,
+            context.credential_source,
+        ))
+    }
     /// Gate inputs for `model_id` routed to `base_url`. See
     /// [`crate::agent::auth_method::session_token_auth_gate`] for the rationale
     /// (`base_url` keeps an `Unknown` BYOK status refreshable only
@@ -971,19 +989,20 @@ impl SessionActor {
     /// repeated 401s ended in silence.
     pub(crate) async fn fail_turn_auth_budget_exhausted(&self, message: String) -> acp::Error {
         const STATUS: Option<u16> = Some(401);
-        let provider = self
+        let provider_model = self
             .chat_state_handle
             .get_sampling_config()
             .await
             .and_then(|config| {
                 crate::auth::providers::parse_namespaced_model_id(&config.model)
-                    .map(|(provider, _)| provider)
+                    .map(|(provider, _)| (provider, config.model))
             });
-        let (error_type, message) = if let Some(provider) = provider {
-            (
-                format!("provider_auth:{provider}"),
-                format!("{message}\n\nRun /login {provider} to re-authenticate."),
-            )
+        let (error_type, message) = if let Some((provider, model_id)) = provider_model {
+            let advice = self
+                .provider_auth_remedy_for_model(provider, &model_id)
+                .map(|remedy| remedy.advice())
+                .unwrap_or_else(|| format!("Run /login {provider} to re-authenticate."));
+            (format!("provider_auth:{provider}"), format!("{message}\n\n{advice}"))
         } else {
             let (error_type, message) = match self.auth_manager.as_ref() {
                 Some(auth_manager) => self.apply_auth_remedy(
@@ -1171,15 +1190,17 @@ impl SessionActor {
         let auth_provider = auth_failure
             .then(|| self.model_auth_provider(&failed_model_id))
             .flatten();
-        let oauth_provider = auth_failure
+        let namespaced_provider = auth_failure
             .then(|| crate::auth::providers::parse_namespaced_model_id(&failed_model_id))
             .flatten()
             .map(|(provider, _)| provider);
+        let provider_remedy = namespaced_provider
+            .and_then(|provider| self.provider_auth_remedy_for_model(provider, &failed_model_id));
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
             let gate = self.auth_gate(&failed_model_id, &failed_base_url);
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
-            if !eligible && auth_provider.is_none() && oauth_provider.is_none() {
+            if !eligible && auth_provider.is_none() && namespaced_provider.is_none() {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
                     is_session_based = gate.is_session_based,
@@ -1202,13 +1223,13 @@ impl SessionActor {
             eligible
         };
         debug_assert!(
-            !(auth_recovery_eligible && (auth_provider.is_some() || oauth_provider.is_some())),
+            !(auth_recovery_eligible && (auth_provider.is_some() || namespaced_provider.is_some())),
             "a provider-backed model must not be session-recovery-eligible"
         );
         if !matches!(error.kind, SamplingErrorKind::Auth)
             && error.status_code == Some(401)
             && auth_provider.is_none()
-            && oauth_provider.is_none()
+            && namespaced_provider.is_none()
         {
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401 not eligible (non-auth error kind)",
@@ -1252,7 +1273,7 @@ impl SessionActor {
                 store: RecoveredStore::AuthProvider,
             });
         }
-        if let Some(provider) = oauth_provider
+        if let Some(provider) = namespaced_provider
             && self
                 .try_oauth_provider_401_recovery(provider, &failed_model_id, error.credential)
                 .await
@@ -1300,7 +1321,7 @@ impl SessionActor {
             .unwrap_or(crate::auth::AuthMode::ApiKey);
         let auth_mode_str = format!("{auth_mode:?}");
         let client_version = xai_grok_version::VERSION;
-        if auth_mode == crate::auth::AuthMode::WebLogin {
+        if namespaced_provider.is_none() && auth_mode == crate::auth::AuthMode::WebLogin {
             let msg = format!(
                 "{detailed_message}\n\n\
                  You are using a deprecated authentication method (WebLogin).\n\
@@ -1346,9 +1367,13 @@ impl SessionActor {
                     provider.name
                 ),
                 );
-            } else if let Some(provider) = oauth_provider {
+            } else if let Some(provider) = namespaced_provider {
                 msg.push_str(&format!("\n  Provider:  {provider}"));
-                msg.push_str(&format!("\n  Re-auth:   /login {provider}"));
+                if let Some(remedy) = provider_remedy {
+                    msg.push_str(&format!("\n  Method:    {}", remedy.method.as_str()));
+                    msg.push_str(&format!("\n  Source:    {}", remedy.source.as_str()));
+                    msg.push_str(&format!("\n\n{}", remedy.advice()));
+                }
             }
             msg.push_str(&format!("\n  Version:   {client_version}"));
             if available.is_empty() {
@@ -1367,7 +1392,7 @@ impl SessionActor {
         } else {
             detailed_message
         };
-        let error_type = if is_auth_401 && let Some(provider) = oauth_provider {
+        let error_type = if is_auth_401 && let Some(provider) = namespaced_provider {
             format!("provider_auth:{provider}")
         } else if xai_grok_sampling_types::is_context_length_error(&error.message) {
             "context_length".to_owned()
@@ -1385,6 +1410,17 @@ impl SessionActor {
             }
             _ => (error_type, detailed_message),
         };
+        if let Some(remedy) = provider_remedy {
+            xai_grok_telemetry::unified_log::info(
+                "provider auth: terminal remedy",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({
+                    "provider_id": remedy.provider.as_str(),
+                    "credential_method": remedy.method.as_str(),
+                    "credential_source": remedy.source.as_str(),
+                })),
+            );
+        }
         self.log_terminal_failure(&error_type, error.status_code, &detailed_message)
             .await;
         self.send_xai_notification(XaiSessionUpdate::RetryState(
