@@ -369,9 +369,7 @@ pub enum PromptInputMode {
     Normal,
     /// Bash mode (`!` prefix): Enter sends `Action::SendBashCommand`.
     Bash,
-    /// Feedback mode (`~` prefix, teal accent): Enter sends `Action::SendFeedback`.
-    Feedback,
-    /// Remember mode (`#` prefix, green accent): Enter sends `Action::SendRememberNote`.
+    /// Remember mode (`#` prefix): Enter sends `Action::SendRememberNote`.
     Remember,
 }
 impl PromptInputMode {
@@ -379,7 +377,6 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some(theme.command),
-            PromptInputMode::Feedback => Some(theme.accent_feedback),
             PromptInputMode::Remember => Some(theme.accent_remember),
         }
     }
@@ -387,14 +384,12 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some(("! ", theme.command)),
-            PromptInputMode::Feedback => Some(("~ ", theme.accent_feedback)),
             PromptInputMode::Remember => Some(("# ", theme.accent_remember)),
         }
     }
     pub fn placeholder_override(self, multiline: bool) -> Option<&'static str> {
         match self {
             PromptInputMode::Normal | PromptInputMode::Bash => None,
-            PromptInputMode::Feedback => Some("Type your feedback..."),
             PromptInputMode::Remember => {
                 if multiline {
                     Some("Save a memory note... (Enter for newline, Shift+Enter to save)")
@@ -408,7 +403,6 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some("Run shell command"),
-            PromptInputMode::Feedback => Some("Send feedback"),
             PromptInputMode::Remember => Some("Save memory note"),
         }
     }
@@ -416,7 +410,6 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => Action::SendPrompt(text),
             PromptInputMode::Bash => Action::SendBashCommand(text),
-            PromptInputMode::Feedback => Action::SendFeedback(text),
             PromptInputMode::Remember => Action::SendRememberNote(text),
         }
     }
@@ -433,7 +426,6 @@ impl PromptInputMode {
                     || ctrl_u
                     || ctrl_c
             }
-            PromptInputMode::Feedback => key.code == KeyCode::Backspace || key.code == KeyCode::Esc,
         }
     }
 }
@@ -581,6 +573,42 @@ pub(crate) struct PendingTurnEnd {
     /// When the broadcast arrived; the reconcile fires after
     /// [`super::dispatch::TURN_END_RECONCILE_GRACE`].
     pub received_at: std::time::Instant,
+}
+/// The wake turn currently streaming on this session. A wake turn is a turn
+/// the shell starts on its own when background work finishes, to tell the
+/// model about it; the pager never adopts one (`AgentState` stays `Idle`),
+/// so this is the only record that one is in flight. Drives the [stop]/Esc/Ctrl+C cancel
+/// affordance and the status-row chrome; lifecycle on
+/// [`AgentView::note_streaming_wake_turn`].
+#[derive(Debug, Clone)]
+pub(crate) struct RunningWakeTurn {
+    /// The wake turn's synthetic prompt id (`task-completed-…` family).
+    pub prompt_id: String,
+    /// True once a cancel was sent for it: the status row reads Cancelling
+    /// and the cancel-resend reconcile stays armed until the terminal lands.
+    pub cancel_sent: bool,
+}
+/// A cancel sent while the pane is in a cancelling state, awaiting proof the
+/// shell received it. See [`AgentView::pending_cancel_resend`].
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCancelResend {
+    /// The turn the cancel targeted (the wake prompt id or the adopted
+    /// prompt id; `None` for cancels with no adopted prompt, such as
+    /// `/compact`); a record from another target is never reused.
+    pub prompt_id: Option<String>,
+    /// When the cancel was (last) sent.
+    pub sent_at: std::time::Instant,
+    /// Sends so far, capped at [`crate::app::dispatch::turn::CANCEL_RESEND_MAX_ATTEMPTS`].
+    pub attempts: u8,
+    /// The turn-end broadcast arrived, proving the cancel landed: the
+    /// auto-resend stops, but the record stays so a manual retry can reuse
+    /// the recorded subagent choice.
+    pub confirmed: bool,
+    /// The first cancel's subagent decision; retries replay it instead of
+    /// escalating past a one-shot "Continue to run".
+    pub cancel_subagents: bool,
+    /// Replayed so a resend still arms the shell's task-wake barrier.
+    pub trigger: crate::app::actions::CancelTrigger,
 }
 /// Stop/stop_failure hook runs held for the live turn's terminal marker.
 /// See [`AgentView::pending_stop_hooks`].
@@ -816,6 +844,11 @@ pub struct AgentView {
     /// drop log to one `warn!` per incident (a late replay is one line per
     /// event — thousands for a large transcript).
     pub(crate) unexpected_replay_drops: u32,
+    /// After `SessionLoaded` clears `loading_replay`, keep accepting this-session
+    /// `isReplay` until this instant (or the first this-session live update).
+    /// The load barrier may release on an Unrelated firehose timeout while
+    /// remaining replay still sits behind the ACP peek.
+    pub(crate) late_replay_until: Option<std::time::Instant>,
     /// Prompt ids whose durable `TurnCompleted` terminal arrived during THIS
     /// load's replay window (`loading_replay`). The running turn is not adopted
     /// until replay finishes, so a terminal seen mid-replay can't be finalized
@@ -828,10 +861,17 @@ pub struct AgentView {
     /// errored wake terminal must not stack a second "Turn failed" row (the
     /// output-epoch dedupe only covers chatty closes; failures bypass it).
     pub(crate) failed_wake_marker_for: Option<String>,
+    /// Wake prompts whose terminals landed; a late delta for one must not
+    /// revive the stop affordance (see `note_streaming_wake_turn`). Cleared
+    /// at replay-window entry; a queue broadcast naming one as running again
+    /// removes that entry.
+    pub(crate) finished_wake_prompts: std::collections::HashSet<String>,
+    /// The wake turn currently streaming, if any. See [`RunningWakeTurn`].
+    pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
     /// Current mode of the prompt widget (normal vs editing a queued prompt).
     pub prompt_mode: PromptMode,
-    /// Current special prompt input mode (Normal/Bash/Feedback/Remember).
+    /// Current special prompt input mode (Normal/Bash/Remember).
     pub prompt_input_mode: PromptInputMode,
     /// Multiline input mode: swap Enter (insert newline) and Shift+Enter (send).
     /// Toggled by `Ctrl+M` or `/multiline`. Not persisted across sessions.
@@ -876,7 +916,14 @@ pub struct AgentView {
     /// Gateway light-frontend session (`kind: "chat"` / `--chat` / conversation
     /// resume). Suppresses Build credits / local sampler context telemetry so the
     /// status bar and prompt never imply remote usage from wrong metrics.
+    /// OR'd with sticky `--chat` for UI/focus matching — not the ACP rename
+    /// `kind` bit; see [`Self::conversation_entry`].
     pub chat_kind: bool,
+    /// Whether this session opened on the chat lane (ACP `kind=chat`).
+    /// True for conversation-entry loads, `/chat` create, and sticky
+    /// `--chat` gateway resumes. False for history-bypass local-disk
+    /// Build rows (those keep [`Self::chat_kind`] for UI only).
+    pub conversation_entry: bool,
     /// Process-wide `--chat` (mirrors `AppView::chat_mode`; set via
     /// [`Self::apply_app_scoped_gates`]). UI policy only: hides picker
     /// source filter / delete / deep search on a conversations-only list.
@@ -1476,12 +1523,17 @@ pub struct AgentView {
     /// from disk on resume (`TaskResult::SessionMetaFromDisk`). Drives the
     /// prompt-border inline title and wins precedence for the dashboard
     /// modal label and the OSC terminal title. The on-disk write is
-    /// best-effort (failure surfaces a toast through the existing
+    /// best-effort (failure surfaces a system block through the existing
     /// `RenameSessionFailed` arm).
     pub display_name: Option<String>,
     /// Short title from shell `SessionSummaryGenerated` or `summary.json` on load/resume.
     /// Precedence in the dashboard title is below `display_name`, above first-prompt text.
     pub generated_session_title: Option<String>,
+    /// Shell already fanned out `titleIsManual: false` for this unpin. A
+    /// dropped RPC then surfaces `ResetSessionTitleFailed`; restoring the
+    /// pin would stick a manual title that later absent-meta auto titles
+    /// refuse to clear.
+    pub title_unpin_committed: bool,
     /// Ultra-short summary of the most recent successful turn (shell
     /// `LastTurnSummary`), preferred over the last-message preview for the
     /// idle dashboard row's secondary line. Shown until replaced by the next
@@ -1515,6 +1567,11 @@ pub struct AgentView {
     /// (a lost response would otherwise leave the TUI on "Cancelling…" with
     /// Esc and the input dead until a restart).
     pub(crate) pending_turn_end_reconcile: Option<PendingTurnEnd>,
+    /// Armed whenever `Effect::CancelTurn` leaves the pane cancelling:
+    /// `session/cancel` is fire-and-forget with known loss windows, so the
+    /// event loop re-sends the idempotent cancel after
+    /// [`super::dispatch::CANCEL_RESEND_GRACE`] while still cancelling.
+    pub(crate) pending_cancel_resend: Option<PendingCancelResend>,
     /// Send-now cancel expectation: the client-minted id of an explicit
     /// cancel-and-send this client dispatched into a running turn (send-now
     /// chord / `SendPromptNow`, or queue-row "Send now"). The running turn's
@@ -1761,6 +1818,9 @@ fn translate_local_submit(
             InputOutcome::Action(Action::DeleteCurrentSessionAnswered {
                 confirmed: *idx == 0,
             })
+        }
+        LocalQuestionKind::Feedback => {
+            unreachable!("feedback submits through submit_feedback_pane, which returns first")
         }
     }
 }
@@ -3522,10 +3582,6 @@ mod prompt_input_mode_tests {
             Some(theme.command)
         );
         assert_eq!(
-            PromptInputMode::Feedback.accent_color(&theme),
-            Some(theme.accent_feedback)
-        );
-        assert_eq!(
             PromptInputMode::Remember.accent_color(&theme),
             Some(theme.accent_remember)
         );
@@ -3539,10 +3595,6 @@ mod prompt_input_mode_tests {
             Some(("! ", theme.command))
         );
         assert_eq!(
-            PromptInputMode::Feedback.prefix_override(&theme),
-            Some(("~ ", theme.accent_feedback))
-        );
-        assert_eq!(
             PromptInputMode::Remember.prefix_override(&theme),
             Some(("# ", theme.accent_remember))
         );
@@ -3553,14 +3605,6 @@ mod prompt_input_mode_tests {
         assert_eq!(PromptInputMode::Normal.placeholder_override(true), None);
         assert_eq!(PromptInputMode::Bash.placeholder_override(false), None);
         assert_eq!(PromptInputMode::Bash.placeholder_override(true), None);
-        assert_eq!(
-            PromptInputMode::Feedback.placeholder_override(false),
-            Some("Type your feedback...")
-        );
-        assert_eq!(
-            PromptInputMode::Feedback.placeholder_override(true),
-            Some("Type your feedback...")
-        );
         assert_eq!(
             PromptInputMode::Remember.placeholder_override(false),
             Some("Save a memory note... (Shift+Enter for multiline)")
@@ -3578,10 +3622,6 @@ mod prompt_input_mode_tests {
             Some("Run shell command")
         );
         assert_eq!(
-            PromptInputMode::Feedback.prompt_info_override(),
-            Some("Send feedback")
-        );
-        assert_eq!(
             PromptInputMode::Remember.prompt_info_override(),
             Some("Save memory note")
         );
@@ -3597,11 +3637,6 @@ mod prompt_input_mode_tests {
         assert!(matches!(
             PromptInputMode::Bash.send_action(t2.clone()),
             Action::SendBashCommand(t) if t == t2
-        ));
-        let t3 = "this is feedback".to_string();
-        assert!(matches!(
-            PromptInputMode::Feedback.send_action(t3.clone()),
-            Action::SendFeedback(t) if t == t3
         ));
         let t4 = "remember this".to_string();
         assert!(matches!(
@@ -3630,18 +3665,6 @@ mod prompt_input_mode_tests {
             assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
             assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
             assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
-            assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
         }
-    }
-    #[test]
-    fn is_exit_key_feedback_uses_stricter_set() {
-        let mode = PromptInputMode::Feedback;
-        assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
-        assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
-        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
-        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
-        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)));
     }
 }

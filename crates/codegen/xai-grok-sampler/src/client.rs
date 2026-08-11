@@ -31,8 +31,8 @@ use xai_grok_sampling_types::{
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
-use xai_grok_auth::bearer_suffix;
 use crate::provider_wire::{PiMessagesEventDecoder, ProviderWireRoute, radius_payload};
+use xai_grok_auth::bearer_suffix;
 
 pub mod responses_compact;
 

@@ -223,19 +223,15 @@ pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     ns_lockdown::install(&mut filter)
 }
 
-/// No-op on platforms without the Linux seccomp implementation.
-///
 /// # Safety
-/// This stub performs no unsafe operation.
+/// After fork / before exec.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
     Ok(())
 }
 
-/// No-op on platforms without the Linux seccomp implementation.
-///
 /// # Safety
-/// This stub performs no unsafe operation.
+/// Process-wide; call after bwrap re-exec / at apply.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     Ok(())

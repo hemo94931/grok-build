@@ -13588,7 +13588,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager"
-version = "0.2.120"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
@@ -13646,6 +13646,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wait-timeout",
+ "walkdir",
  "windows-sys 0.59.0",
  "xai-acp-lib",
  "xai-crash-handler",
@@ -13678,7 +13679,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager-bin"
-version = "0.2.120"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -13949,7 +13950,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-shell"
-version = "0.2.120"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -14122,21 +14123,16 @@ dependencies = [
 name = "xai-grok-shell-session-support"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
  "axum",
- "chrono",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tracing",
  "xai-file-utils",
  "xai-grok-http",
- "xai-grok-shell-base",
  "xai-grok-version",
- "xai-grok-workspace",
 ]
 
 [[package]]
@@ -14367,7 +14363,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-version"
-version = "0.2.120"
+version = "1.0.0"
 dependencies = [
  "semver",
 ]
@@ -14494,6 +14490,7 @@ name = "xai-grok-workspace-client"
 version = "0.1.0"
 dependencies = [
  "schemars 1.0.4",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
