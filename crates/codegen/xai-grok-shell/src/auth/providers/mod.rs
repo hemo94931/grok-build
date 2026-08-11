@@ -186,9 +186,7 @@ pub(crate) async fn fresh_stored_slot(
             refresh(provider, credential, signal)
         })
         .await
-        .map(|credential| {
-            ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential))
-        })
+        .map(|credential| ProviderSlotState::Known(ProviderStoredCredential::OAuth(credential)))
 }
 
 pub(crate) async fn fresh_stored_credential(

@@ -989,20 +989,24 @@ impl SessionActor {
     /// repeated 401s ended in silence.
     pub(crate) async fn fail_turn_auth_budget_exhausted(&self, message: String) -> acp::Error {
         const STATUS: Option<u16> = Some(401);
-        let provider_model = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .and_then(|config| {
-                crate::auth::providers::parse_namespaced_model_id(&config.model)
-                    .map(|(provider, _)| (provider, config.model))
-            });
+        let provider_model =
+            self.chat_state_handle
+                .get_sampling_config()
+                .await
+                .and_then(|config| {
+                    let model_id = config.model;
+                    let provider = crate::auth::providers::parse_namespaced_model_id(&model_id)?.0;
+                    Some((provider, model_id))
+                });
         let (error_type, message) = if let Some((provider, model_id)) = provider_model {
             let advice = self
                 .provider_auth_remedy_for_model(provider, &model_id)
                 .map(|remedy| remedy.advice())
                 .unwrap_or_else(|| format!("Run /login {provider} to re-authenticate."));
-            (format!("provider_auth:{provider}"), format!("{message}\n\n{advice}"))
+            (
+                format!("provider_auth:{provider}"),
+                format!("{message}\n\n{advice}"),
+            )
         } else {
             let (error_type, message) = match self.auth_manager.as_ref() {
                 Some(auth_manager) => self.apply_auth_remedy(

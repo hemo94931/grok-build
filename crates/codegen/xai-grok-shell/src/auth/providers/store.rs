@@ -77,11 +77,7 @@ impl ProviderCredential {
             .collect()
     }
 
-    pub(crate) fn set_metadata(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<Value>,
-    ) {
+    pub(crate) fn set_metadata(&mut self, key: impl Into<String>, value: impl Into<Value>) {
         self.metadata.insert(key.into(), value.into());
     }
 
@@ -137,11 +133,7 @@ impl ProviderApiKeyCredential {
         self.metadata.get(key)?.as_str()
     }
 
-    pub(crate) fn set_metadata(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<Value>,
-    ) {
+    pub(crate) fn set_metadata(&mut self, key: impl Into<String>, value: impl Into<Value>) {
         self.metadata.insert(key.into(), value.into());
     }
 
@@ -510,7 +502,10 @@ fn read_table(path: &Path) -> anyhow::Result<RawCredentialTable> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
     match value {
         Value::Object(table) => Ok(table),
-        _ => bail!("failed to parse {}: root must be a JSON object", path.display()),
+        _ => bail!(
+            "failed to parse {}: root must be a JSON object",
+            path.display()
+        ),
     }
 }
 
@@ -611,7 +606,8 @@ mod tests {
 
     #[test]
     fn credentials_round_trip_metadata_and_redact_debug() {
-        let mut oauth_credential = ProviderCredential::oauth("access-secret", "refresh-secret", 123);
+        let mut oauth_credential =
+            ProviderCredential::oauth("access-secret", "refresh-secret", 123);
         oauth_credential.set_metadata("accountId", "acct-1");
         let oauth_json = serde_json::to_string(&oauth_credential).unwrap();
         let oauth_decoded: ProviderCredential = serde_json::from_str(&oauth_json).unwrap();
@@ -630,8 +626,10 @@ mod tests {
             Some(&serde_json::json!({"enabled": true}))
         );
         assert!(!format!("{api_key_decoded:?}").contains("api-key-secret"));
-        assert!(!format!("{:?}", ProviderStoredCredential::ApiKey(api_key_decoded))
-            .contains("api-key-secret"));
+        assert!(
+            !format!("{:?}", ProviderStoredCredential::ApiKey(api_key_decoded))
+                .contains("api-key-secret")
+        );
     }
 
     #[tokio::test]
@@ -652,8 +650,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(api_key(store.get(ProviderId::Anthropic).unwrap()).key, "stored-api-key");
-        let raw: Value = serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(
+            api_key(store.get(ProviderId::Anthropic).unwrap()).key,
+            "stored-api-key"
+        );
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
         assert_eq!(raw.as_object().unwrap().len(), 1);
         assert_eq!(raw["anthropic"]["type"], "api_key");
         assert!(raw["anthropic"].get("access").is_none());
@@ -665,7 +667,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(oauth(store.get(ProviderId::Anthropic).unwrap()).access, "last-access");
+        assert_eq!(
+            oauth(store.get(ProviderId::Anthropic).unwrap()).access,
+            "last-access"
+        );
         assert!(store.remove(ProviderId::Anthropic).await.unwrap());
         assert!(!store.path().exists());
         assert!(!dir.path().join("auth.json").exists());

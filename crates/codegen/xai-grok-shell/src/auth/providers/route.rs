@@ -308,9 +308,7 @@ where
             }
             let env_keys = provider_descriptor(provider).env_keys;
             if env_keys.is_empty() {
-                bail!(
-                    "{provider} credentials are missing; run `grok login --provider {provider}`"
-                );
+                bail!("{provider} credentials are missing; run `grok login --provider {provider}`");
             }
             bail!(
                 "{provider} credentials are missing; run `grok login --provider {provider}` or set one of: {}",
@@ -683,10 +681,8 @@ mod tests {
 
     #[test]
     fn provider_auth_remedies_are_source_and_method_aware() {
-        let stored = provider_auth_remedy(
-            ProviderId::Anthropic,
-            ProviderSecretSource::StoredApiKey,
-        );
+        let stored =
+            provider_auth_remedy(ProviderId::Anthropic, ProviderSecretSource::StoredApiKey);
         assert_eq!(stored.method, ProviderCredentialMethod::ApiKey);
         assert_eq!(stored.source.as_str(), "stored_api_key");
         assert!(stored.advice().contains("--api-key"));

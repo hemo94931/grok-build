@@ -222,11 +222,14 @@ impl MvpAgent {
         arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
-        tracing::debug!(
-            model = %self.sampling_config.model,
-            has_credential = self.sampling_config.api_key.is_some(),
-            "Received new session request {arguments:?}"
-        );
+        {
+            let sampling_config = self.sampling_config.borrow();
+            tracing::debug!(
+                model = %sampling_config.model,
+                has_credential = sampling_config.api_key.is_some(),
+                "Received new session request {arguments:?}"
+            );
+        }
         let init = self.initialize_request.get().ok_or_else(|| {
             acp::Error::invalid_params().data("initialize must be called before new_session")
         })?;
