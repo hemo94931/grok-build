@@ -60,7 +60,8 @@ pub(super) async fn login(
             message: "GitHub Enterprise URL/domain (blank for github.com)".to_owned(),
             placeholder: "company.ghe.com".to_owned(),
         })
-        .await?;
+        .await?
+        .into_text()?;
     if signal.is_cancelled() {
         bail!("login cancelled");
     }

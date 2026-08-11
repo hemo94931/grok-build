@@ -140,7 +140,8 @@ async fn select_login_mode(
             ],
         }),
     )
-    .await?;
+    .await?
+    .into_text()?;
 
     match selected.trim() {
         "browser" => Ok(LoginMode::Browser),

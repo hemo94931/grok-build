@@ -140,8 +140,10 @@ struct Inner {
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
     refresh_in_flight: AtomicBool,
-    /// Single-flight for the Radius provider catalog refresh.
-    radius_refresh_in_flight: AtomicBool,
+    /// Number of Radius catalog refreshes in flight. Startup refreshes are
+    /// single-flight; an auth-change refresh may overlap a stale startup call
+    /// and is fenced by catalog generation before applying or persisting.
+    radius_refresh_in_flight: AtomicUsize,
     fetches_in_flight: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
@@ -170,7 +172,7 @@ impl Drop for RadiusRefreshInFlightGuard {
     fn drop(&mut self) {
         self.0
             .radius_refresh_in_flight
-            .store(false, Ordering::Release);
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -307,9 +309,11 @@ impl ModelsManagerBuilder {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
         let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
-        let radius_catalog = self
-            .initial_radius_catalog
-            .or_else(|| self.radius_cache.load_fresh_for_current_gateway());
+        let radius_catalog = self.initial_radius_catalog.or_else(|| {
+            radius_catalog_credential_available()
+                .then(|| self.radius_cache.load_fresh_for_current_gateway())
+                .flatten()
+        });
         let models = if radius_catalog.is_some() {
             resolve_model_catalog_with_radius(
                 &self.cfg,
@@ -339,7 +343,7 @@ impl ModelsManagerBuilder {
                 radius_endpoint: self.radius_endpoint,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
-                radius_refresh_in_flight: AtomicBool::new(false),
+                radius_refresh_in_flight: AtomicUsize::new(0),
                 fetches_in_flight: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
@@ -347,6 +351,14 @@ impl ModelsManagerBuilder {
             }),
         }
     }
+}
+
+fn radius_catalog_credential_available() -> bool {
+    crate::auth::providers::resolve_provider_secret(
+        crate::auth::providers::ProviderId::Radius,
+        None,
+    )
+    .is_ok()
 }
 
 impl ModelsManager {
@@ -394,7 +406,9 @@ impl ModelsManager {
                     c.models
                 })
         });
-        let radius_catalog = RadiusCatalogCacheManager::new().load_fresh_for_current_gateway();
+        let radius_catalog = radius_catalog_credential_available()
+            .then(|| RadiusCatalogCacheManager::new().load_fresh_for_current_gateway())
+            .flatten();
         let has_prefetched = prefetched_models.is_some();
         let catalog = resolve_model_catalog_with_radius(
             cfg,
@@ -731,14 +745,18 @@ impl ModelsManager {
         if !remote_fetch_enabled {
             return false;
         }
-        // Signed out with a session-only endpoint: no fetch is coming.
+        let radius_refresh_in_flight =
+            self.inner.radius_refresh_in_flight.load(Ordering::Acquire) > 0;
+        // Signed out with a session-only xAI endpoint: only a Radius refresh can
+        // still produce a usable remote catalog.
         if *self.inner.fetch_auth.read() == ModelFetchAuth::Session
             && self.inner.auth_manager.current_or_expired().is_none()
+            && !radius_refresh_in_flight
         {
             return false;
         }
         // Attempts latch `Failed` on exit, so pending plus idle means none started.
-        if self.inner.fetches_in_flight.load(Ordering::Acquire) == 0 {
+        if self.inner.fetches_in_flight.load(Ordering::Acquire) == 0 && !radius_refresh_in_flight {
             return *progress.borrow() == CatalogProgress::Ready;
         }
         matches!(
@@ -801,7 +819,7 @@ impl ModelsManager {
     }
 
     /// Auth identity changed: invalidate the disk cache and refresh the catalog.
-    pub(crate) async fn on_auth_changed(&self) {
+    pub(crate) async fn on_auth_changed(&self) -> bool {
         let config = self.inner.cfg.read().clone();
         crate::agent::init::update_telemetry_config(&config, &self.inner.auth_manager);
         self.inner.cache.invalidate();
@@ -816,7 +834,7 @@ impl ModelsManager {
         // models become visible without an xAI login. Transient failures leave
         // the existing keyless cache/in-memory catalog intact for retry.
         let generation = self.inner.catalog.read().generation;
-        self.refresh_radius_catalog_fenced(generation).await;
+        let radius_catalog_refreshed = self.refresh_radius_catalog_fenced(generation, true).await;
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
@@ -829,17 +847,22 @@ impl ModelsManager {
             // No fetch is coming; wake parked waiters. Lock and gate like
             // every other outcome publish.
             {
-                let _cat = self.inner.catalog.read();
-                self.inner.catalog_progress.send_if_modified(|p| {
-                    let pending = *p == CatalogProgress::Pending;
-                    if pending {
-                        *p = CatalogProgress::Failed;
+                let cat = self.inner.catalog.read();
+                let outcome = if cat.radius_catalog.is_some() {
+                    CatalogProgress::Ready
+                } else {
+                    CatalogProgress::Failed
+                };
+                self.inner.catalog_progress.send_if_modified(|progress| {
+                    let changed = *progress != outcome;
+                    if changed {
+                        *progress = outcome;
                     }
-                    pending
+                    changed
                 });
             }
             self.notify_models_updated();
-            return;
+            return radius_catalog_refreshed;
         }
 
         let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
@@ -870,6 +893,7 @@ impl ModelsManager {
         }
 
         self.notify_models_updated();
+        radius_catalog_refreshed
     }
 
     fn notify_models_updated(&self) {
@@ -1035,15 +1059,19 @@ impl ModelsManager {
         let mgr = self.clone();
         let generation = self.inner.catalog.read().generation;
         tokio::task::spawn(async move {
-            mgr.refresh_radius_catalog_fenced(generation).await;
+            mgr.refresh_radius_catalog_fenced(generation, false).await;
         });
     }
 
-    async fn refresh_radius_catalog_fenced(&self, generation: u64) -> bool {
-        if self
+    async fn refresh_radius_catalog_fenced(&self, generation: u64, force: bool) -> bool {
+        if force {
+            self.inner
+                .radius_refresh_in_flight
+                .fetch_add(1, Ordering::AcqRel);
+        } else if self
             .inner
             .radius_refresh_in_flight
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             tracing::debug!("Radius catalog refresh already in flight, skipping");
@@ -1073,15 +1101,22 @@ impl ModelsManager {
 
         match result {
             Some(result) => {
-                self.inner
-                    .radius_cache
-                    .persist(&result.catalog, &result.origin)
-                    .await;
-                self.apply_radius_catalog_fenced(Some(result.catalog), generation)
+                let applied =
+                    self.apply_radius_catalog_fenced(Some(result.catalog.clone()), generation);
+                if applied {
+                    self.inner
+                        .radius_cache
+                        .persist(&result.catalog, &result.origin)
+                        .await;
+                }
+                applied
             }
             None => {
-                self.inner.radius_cache.invalidate().await;
-                self.apply_radius_catalog_fenced(None, generation)
+                let applied = self.apply_radius_catalog_fenced(None, generation);
+                if applied {
+                    self.inner.radius_cache.invalidate().await;
+                }
+                applied
             }
         }
     }
@@ -1107,6 +1142,11 @@ impl ModelsManager {
             cat.allowlist_excludes_all = allowlist_matches_nothing(&cfg, &cat.models);
         }
         self.reselect_current_model_if_missing(&cfg);
+        if self.inner.catalog.read().radius_catalog.is_some() {
+            self.inner
+                .catalog_progress
+                .send_replace(CatalogProgress::Ready);
+        }
         self.notify_models_updated();
         true
     }

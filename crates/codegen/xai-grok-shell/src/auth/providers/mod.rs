@@ -24,18 +24,23 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use catalog::{ProviderCatalogModel, provider_models, radius_models_from_config};
 pub(crate) use cli::{
-    CliAuthInteraction, ProviderTarget, report_provider_login, select_target,
+    CliAuthInteraction, ProviderLoginTarget, ProviderTarget, cli_login_options,
+    report_provider_api_key_login, report_provider_login, select_login_target, select_target,
     terminal_is_interactive,
 };
-pub(crate) use flow::{AuthInteraction, AuthNotification, AuthPrompt, DeviceCode, SelectOption};
+pub(crate) use flow::{
+    AuthInteraction, AuthNotification, AuthPrompt, AuthPromptResponse, AuthSecret, DeviceCode,
+    SelectOption,
+};
 pub(crate) use radius::{
     GATEWAY_CONFIG_METADATA_KEY, RadiusGatewayConfig, RadiusGatewayModel, gateway_cache_origin,
     load_gateway_config_for_catalog,
 };
 pub(crate) use route::{
-    ProviderAuthRemedy, ProviderCredentialMethod, ProviderDescriptor, ProviderRequestContext,
-    ProviderSecret, ProviderSecretSource, ProviderWireDialect, namespaced_model_id,
-    parse_namespaced_model_id, provider_auth_remedy, provider_bearer_resolver, provider_descriptor,
+    ProviderAuthRemedy, ProviderCredentialMethod, ProviderDescriptor, ProviderLoginOption,
+    ProviderLoginTransport, ProviderRequestContext, ProviderSecret, ProviderSecretSource,
+    ProviderWireDialect, namespaced_model_id, parse_namespaced_model_id, provider_auth_remedy,
+    provider_bearer_resolver, provider_descriptor, provider_login_options,
     resolve_fresh_provider_secret, resolve_provider_secret,
 };
 pub(crate) use store::{
@@ -141,6 +146,15 @@ pub(crate) enum LoginMode {
     DeviceCode,
 }
 
+impl LoginMode {
+    pub(crate) const fn as_transport(self) -> ProviderLoginTransport {
+        match self {
+            Self::Browser => ProviderLoginTransport::Browser,
+            Self::DeviceCode => ProviderLoginTransport::Device,
+        }
+    }
+}
+
 pub(crate) enum ProviderRefreshOutcome {
     Save(ProviderCredential),
     Remove { message: String },
@@ -181,10 +195,68 @@ pub(crate) async fn login_and_store(
     interaction: &dyn AuthInteraction,
     mode: Option<LoginMode>,
 ) -> anyhow::Result<ProviderCredential> {
+    validate_oauth_login_request(provider, mode)?;
     let credential = login(provider, interaction, mode).await?;
     ProviderStore::default()
         .put(provider, credential.clone())
         .await?;
+    Ok(credential)
+}
+
+pub(crate) fn validate_oauth_login_request(
+    provider: ProviderId,
+    mode: Option<LoginMode>,
+) -> anyhow::Result<()> {
+    let descriptor = provider_descriptor(provider);
+    if !descriptor.supports_method(ProviderCredentialMethod::OAuth) {
+        anyhow::bail!("{} does not support OAuth login", descriptor.display_name);
+    }
+    if let Some(mode) = mode {
+        let transport = mode.as_transport();
+        if !descriptor.supports_oauth_transport(transport) {
+            anyhow::bail!(
+                "{} does not support {} OAuth login",
+                descriptor.display_name,
+                match transport {
+                    ProviderLoginTransport::Browser => "browser",
+                    ProviderLoginTransport::Device => "device-code",
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn login_api_key_and_store(
+    provider: ProviderId,
+    interaction: &dyn AuthInteraction,
+) -> anyhow::Result<ProviderApiKeyCredential> {
+    login_api_key_and_store_with_store(provider, interaction, &ProviderStore::default()).await
+}
+
+async fn login_api_key_and_store_with_store(
+    provider: ProviderId,
+    interaction: &dyn AuthInteraction,
+    store: &ProviderStore,
+) -> anyhow::Result<ProviderApiKeyCredential> {
+    let descriptor = provider_descriptor(provider);
+    if !descriptor.supports_method(ProviderCredentialMethod::ApiKey) {
+        anyhow::bail!("{} does not support API-key login", descriptor.display_name);
+    }
+    let key = interaction
+        .prompt(AuthPrompt::Secret {
+            message: format!("Enter API key for {}:", descriptor.display_name),
+            placeholder: "API key".to_owned(),
+        })
+        .await?
+        .into_secret()?
+        .into_zeroizing_string();
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("API key cannot be empty");
+    }
+    let credential = ProviderApiKeyCredential::new(key.to_owned());
+    store.put(provider, credential.clone()).await?;
     Ok(credential)
 }
 
@@ -246,7 +318,82 @@ pub(crate) async fn logout(provider: ProviderId) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
+
+    struct ApiKeyInteraction {
+        value: Option<&'static str>,
+    }
+
+    #[async_trait(?Send)]
+    impl AuthInteraction for ApiKeyInteraction {
+        fn signal(&self) -> CancellationToken {
+            CancellationToken::new()
+        }
+
+        async fn notify(&self, _notification: AuthNotification) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn prompt(&self, prompt: AuthPrompt) -> anyhow::Result<AuthPromptResponse> {
+            assert!(matches!(prompt, AuthPrompt::Secret { .. }));
+            match self.value {
+                Some(value) => Ok(AuthPromptResponse::Secret(AuthSecret::new(value))),
+                None => anyhow::bail!("login cancelled"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_login_blindly_overwrites_oauth_and_cancel_does_not_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ProviderStore::with_paths(
+            tmp.path().join("providers.json"),
+            tmp.path().join("auth.json"),
+        );
+        store
+            .put(
+                ProviderId::Anthropic,
+                ProviderCredential::oauth("old-access", "old-refresh", u64::MAX),
+            )
+            .await
+            .unwrap();
+
+        login_api_key_and_store_with_store(
+            ProviderId::Anthropic,
+            &ApiKeyInteraction {
+                value: Some("  sk-blind-store  "),
+            },
+            &store,
+        )
+        .await
+        .unwrap();
+        match store.get(ProviderId::Anthropic).unwrap() {
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(credential)) => {
+                assert_eq!(credential.key, "sk-blind-store");
+            }
+            other => panic!("expected API-key slot, got {other:?}"),
+        }
+
+        let cancelled_store = ProviderStore::with_paths(
+            tmp.path().join("cancelled-providers.json"),
+            tmp.path().join("cancelled-auth.json"),
+        );
+        assert!(
+            login_api_key_and_store_with_store(
+                ProviderId::Anthropic,
+                &ApiKeyInteraction { value: None },
+                &cancelled_store,
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            cancelled_store.get(ProviderId::Anthropic).unwrap(),
+            ProviderSlotState::Missing
+        ));
+    }
 
     #[test]
     fn provider_ids_round_trip() {
@@ -257,6 +404,41 @@ mod tests {
                 format!("\"{provider}\"")
             );
         }
+    }
+
+    #[test]
+    fn provider_login_options_project_authoritative_method_matrix() {
+        let options = provider_login_options();
+        assert_eq!(options.len(), 11);
+
+        let methods = |provider| {
+            options
+                .iter()
+                .filter(|option| option.provider == provider)
+                .map(|option| option.method)
+                .collect::<Vec<_>>()
+        };
+        for provider in [
+            ProviderId::Anthropic,
+            ProviderId::GithubCopilot,
+            ProviderId::Openrouter,
+            ProviderId::KimiCoding,
+            ProviderId::Radius,
+        ] {
+            assert_eq!(
+                methods(provider),
+                vec![
+                    ProviderCredentialMethod::OAuth,
+                    ProviderCredentialMethod::ApiKey
+                ],
+                "{provider} should offer OAuth and API-key login"
+            );
+        }
+        assert_eq!(
+            methods(ProviderId::OpenaiCodex),
+            vec![ProviderCredentialMethod::OAuth]
+        );
+        assert_eq!(cli_login_options().len(), 12);
     }
 
     #[test]

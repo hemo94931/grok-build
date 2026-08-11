@@ -27,6 +27,12 @@ pub(crate) fn reply_headless_ext_method(args: AcpArgsBox<acp::ExtRequest>) {
     // Known methods are answered without parsing params: even a malformed
     // request gets the policy reply rather than a dropped channel.
     let response = match method {
+        // Secret entry must fail closed in headless mode: no ask-user-question
+        // fallback and no insecure annotation/free-form path.
+        xai_acp_lib::PROMPT_SECRET_METHOD => Err(acp::Error::new(
+            -32004,
+            "x.ai/providerAuth.promptSecret unsupported in headless pager".to_string(),
+        )),
         // Model sees the tool's NO_OPERATOR_TEXT (headless sessions are
         // non-interactive), not the interactive "user declined" cancel text.
         "x.ai/ask_user_question" => ext_response_from(&AskUserQuestionExtResponse::Cancelled),

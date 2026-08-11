@@ -165,6 +165,7 @@ xai-grok-models = { workspace = true }
 prod-mc-cli-chat-proxy-types = { path = "../../../prod/mc/cli-chat-proxy-types" }
 flate2 = { workspace = true }
 fs2 = { workspace = true }
+zeroize = "1"
 zstd = { workspace = true }
 tar = { workspace = true }
 url = { workspace = true }

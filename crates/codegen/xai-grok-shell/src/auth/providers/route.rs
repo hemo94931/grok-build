@@ -12,9 +12,34 @@ use super::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderLoginFlow {
+    None,
     Browser,
     DeviceCode,
     BrowserOrDevice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderLoginTransport {
+    Browser,
+    Device,
+}
+
+impl ProviderLoginTransport {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::Device => "device",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderLoginOption {
+    pub(crate) provider: ProviderId,
+    pub(crate) display_name: &'static str,
+    pub(crate) method: ProviderCredentialMethod,
+    pub(crate) oauth_transports: Vec<ProviderLoginTransport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,10 +57,82 @@ pub(crate) struct ProviderDescriptor {
     pub(crate) id: ProviderId,
     pub(crate) display_name: &'static str,
     pub(crate) login_flow: ProviderLoginFlow,
+    pub(crate) api_key_login: bool,
     pub(crate) base_url: &'static str,
     pub(crate) api_backend: ApiBackend,
     pub(crate) wire_dialect: ProviderWireDialect,
     pub(crate) env_keys: &'static [&'static str],
+}
+
+impl ProviderDescriptor {
+    pub(crate) fn supports_method(&self, method: ProviderCredentialMethod) -> bool {
+        match method {
+            ProviderCredentialMethod::OAuth => self.supports_oauth(),
+            ProviderCredentialMethod::ApiKey => self.supports_api_key(),
+        }
+    }
+
+    pub(crate) fn supports_oauth(&self) -> bool {
+        !self.oauth_transports().is_empty()
+    }
+
+    pub(crate) const fn supports_api_key(&self) -> bool {
+        self.api_key_login
+    }
+
+    pub(crate) fn default_login_method(&self) -> ProviderCredentialMethod {
+        if self.supports_oauth() {
+            ProviderCredentialMethod::OAuth
+        } else {
+            ProviderCredentialMethod::ApiKey
+        }
+    }
+
+    pub(crate) fn oauth_transports(&self) -> Vec<ProviderLoginTransport> {
+        match self.login_flow {
+            ProviderLoginFlow::None => Vec::new(),
+            ProviderLoginFlow::Browser => vec![ProviderLoginTransport::Browser],
+            ProviderLoginFlow::DeviceCode => vec![ProviderLoginTransport::Device],
+            ProviderLoginFlow::BrowserOrDevice => {
+                vec![
+                    ProviderLoginTransport::Browser,
+                    ProviderLoginTransport::Device,
+                ]
+            }
+        }
+    }
+
+    pub(crate) fn supports_oauth_transport(&self, transport: ProviderLoginTransport) -> bool {
+        self.oauth_transports().contains(&transport)
+    }
+
+    pub(crate) fn login_options(&self) -> Vec<ProviderLoginOption> {
+        let mut options = Vec::new();
+        if self.supports_oauth() {
+            options.push(ProviderLoginOption {
+                provider: self.id,
+                display_name: self.display_name,
+                method: ProviderCredentialMethod::OAuth,
+                oauth_transports: self.oauth_transports(),
+            });
+        }
+        if self.supports_api_key() {
+            options.push(ProviderLoginOption {
+                provider: self.id,
+                display_name: self.display_name,
+                method: ProviderCredentialMethod::ApiKey,
+                oauth_transports: Vec::new(),
+            });
+        }
+        options
+    }
+}
+
+pub(crate) fn provider_login_options() -> Vec<ProviderLoginOption> {
+    ProviderId::ALL
+        .into_iter()
+        .flat_map(|provider| provider_descriptor(provider).login_options())
+        .collect()
 }
 
 pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
@@ -44,6 +141,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "Anthropic",
             login_flow: ProviderLoginFlow::Browser,
+            api_key_login: true,
             base_url: "https://api.anthropic.com",
             api_backend: ApiBackend::Messages,
             wire_dialect: ProviderWireDialect::AnthropicMessages,
@@ -57,6 +155,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "OpenAI Codex",
             login_flow: ProviderLoginFlow::BrowserOrDevice,
+            api_key_login: false,
             base_url: "https://chatgpt.com/backend-api",
             api_backend: ApiBackend::Responses,
             wire_dialect: ProviderWireDialect::OpenaiCodexResponses,
@@ -66,6 +165,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "GitHub Copilot",
             login_flow: ProviderLoginFlow::DeviceCode,
+            api_key_login: true,
             base_url: "https://api.individual.githubcopilot.com",
             api_backend: ApiBackend::ChatCompletions,
             wire_dialect: ProviderWireDialect::GithubCopilot,
@@ -75,6 +175,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "OpenRouter",
             login_flow: ProviderLoginFlow::Browser,
+            api_key_login: true,
             base_url: "https://openrouter.ai/api/v1",
             api_backend: ApiBackend::ChatCompletions,
             wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
@@ -84,6 +185,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "Kimi Coding",
             login_flow: ProviderLoginFlow::DeviceCode,
+            api_key_login: true,
             base_url: "https://api.kimi.com/coding",
             api_backend: ApiBackend::Messages,
             wire_dialect: ProviderWireDialect::KimiAnthropicMessages,
@@ -93,6 +195,7 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             id,
             display_name: "Radius",
             login_flow: ProviderLoginFlow::BrowserOrDevice,
+            api_key_login: true,
             base_url: "https://radius.pi.dev",
             // The provider wire dispatcher intercepts this dialect before the
             // generic Messages conversion. No fourth shared ApiBackend variant
@@ -132,9 +235,11 @@ impl ProviderSecretSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) enum ProviderCredentialMethod {
+    #[serde(rename = "oauth")]
     OAuth,
+    #[serde(rename = "api_key")]
     ApiKey,
 }
 
@@ -144,6 +249,19 @@ impl ProviderCredentialMethod {
             Self::OAuth => "oauth",
             Self::ApiKey => "api_key",
         }
+    }
+
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::OAuth => "OAuth",
+            Self::ApiKey => "API key",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderCredentialMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

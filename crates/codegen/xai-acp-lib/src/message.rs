@@ -43,6 +43,20 @@ impl AcpSide for acp::ClientSide {
 /// Extends each request/response type pair with the side marker type and schema method name.
 pub trait AcpMethod {
     fn method_name(&self) -> &'static str;
+
+    /// Method label used for diagnostic tracing. Extension requests keep their
+    /// ACP carrier method for routing (`ext_method`) but expose the inner
+    /// `x.ai/*` method here so method-level redaction can be precise.
+    fn trace_method_name(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.method_name())
+    }
+
+    /// Whether generic gateway tracing may serialize request/response payloads
+    /// for this method. Secret-bearing extension methods must opt out here so
+    /// tracing never needs to inspect or redact already-serialized bytes.
+    fn trace_payload_allowed(&self) -> bool {
+        true
+    }
 }
 
 /// Connect together ACP request and response types for each rpc method.
@@ -104,8 +118,41 @@ macro_rules! acp_define_request_response {
     };
 }
 
-acp_define_request_response!(acp::ExtRequest, acp::ExtResponse, "ext_method");
-acp_define_request_response!(acp::ExtNotification, (), "ext_notification");
+impl AcpRequest for acp::ExtRequest {
+    type Response = acp::ExtResponse;
+}
+
+impl AcpMethod for acp::ExtRequest {
+    fn method_name(&self) -> &'static str {
+        "ext_method"
+    }
+
+    fn trace_method_name(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.method.as_ref())
+    }
+
+    fn trace_payload_allowed(&self) -> bool {
+        self.method.as_ref() != crate::provider_auth::PROMPT_SECRET_METHOD
+    }
+}
+
+impl AcpRequest for acp::ExtNotification {
+    type Response = ();
+}
+
+impl AcpMethod for acp::ExtNotification {
+    fn method_name(&self) -> &'static str {
+        "ext_notification"
+    }
+
+    fn trace_method_name(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.method.as_ref())
+    }
+
+    fn trace_payload_allowed(&self) -> bool {
+        self.method.as_ref() != crate::provider_auth::PROMPT_SECRET_METHOD
+    }
+}
 
 pub trait StorageMarker: fmt::Debug + Clone + Copy {
     type Type<T>: Borrow<T> + From<T>;

@@ -127,6 +127,29 @@ impl RadiusCatalogEndpoint for PendingRadiusEndpoint {
     }
 }
 
+struct PendingThenRadiusEndpoint {
+    calls: AtomicUsize,
+}
+
+impl PendingThenRadiusEndpoint {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl RadiusCatalogEndpoint for PendingThenRadiusEndpoint {
+    fn fetch_radius_catalog(&self) -> RadiusCatalogFetchFuture {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(async { Ok(Some(radius_fetch_result("fresh-after-auth-change"))) })
+        }
+    }
+}
+
 fn test_radius_cache_manager(dir: &std::path::Path) -> RadiusCatalogCacheManager {
     RadiusCatalogCacheManager {
         path: dir.join(RADIUS_CATALOG_CACHE_FILE),
@@ -171,9 +194,16 @@ async fn radius_catalog_refresh_makes_models_visible_when_signed_out() {
             .contains_key(&acp::ModelId::new("radius/stored-model")),
         "Radius models should be visible without an xAI session"
     );
+    assert_eq!(
+        *mgr.inner.catalog_progress.borrow(),
+        CatalogProgress::Ready,
+        "a successful signed-out Radius refresh is a usable catalog"
+    );
+    assert!(mgr.wait_for_first_catalog_inner(true).await);
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn radius_catalog_uses_warm_cache_after_restart() {
     let tmp = tempfile::TempDir::new().unwrap();
     let cache = test_radius_cache_manager(tmp.path());
@@ -182,6 +212,7 @@ async fn radius_catalog_uses_warm_cache_after_restart() {
         .await;
 
     let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", "https://radius.test");
+    let _radius_key = EnvGuard::set("RADIUS_API_KEY", "warm-key");
     let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
     let mgr = ModelsManagerBuilder::new(
         None,
@@ -200,6 +231,42 @@ async fn radius_catalog_uses_warm_cache_after_restart() {
         mgr.available()
             .contains_key(&acp::ModelId::new("radius/warm-model")),
         "startup should recover Radius models from the keyless cache"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn radius_catalog_cache_is_not_applied_without_provider_credential() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache = test_radius_cache_manager(tmp.path());
+    cache
+        .persist(
+            &radius_gateway_config("hidden-model"),
+            "https://radius.test",
+        )
+        .await;
+
+    let _home = EnvGuard::set("GROK_HOME", tmp.path());
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", "https://radius.test");
+    let _radius_key = EnvGuard::unset("RADIUS_API_KEY");
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .endpoint(Arc::new(FailingEndpoint))
+    .cache(test_cache_manager(tmp.path()))
+    .radius_endpoint(Arc::new(QueueRadiusEndpoint::new(vec![])))
+    .radius_cache(cache)
+    .build();
+
+    assert!(
+        !mgr.available()
+            .contains_key(&acp::ModelId::new("radius/hidden-model")),
+        "a keyless cache must not expose a provider catalog after logout"
     );
 }
 
@@ -250,6 +317,30 @@ async fn radius_catalog_cache_contains_no_secret_material() {
     }
 }
 
+#[tokio::test]
+async fn forced_radius_refresh_supersedes_pending_startup_fetch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let endpoint = Arc::new(PendingThenRadiusEndpoint::new());
+    let mgr = radius_manager_with_endpoint(endpoint.clone(), tmp.path()).await;
+
+    mgr.spawn_radius_catalog_refresh(true);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while endpoint.calls.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup Radius fetch should begin");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), mgr.on_auth_changed())
+        .await
+        .expect("forced auth-change refresh must not wait for the stale startup fetch");
+    assert!(
+        mgr.models().contains_key("radius/fresh-after-auth-change"),
+        "forced refresh should publish the newly resolved Radius catalog"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn radius_catalog_timeout_is_bounded_and_preserves_existing_catalog() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -292,6 +383,38 @@ async fn radius_http_catalog_uses_stored_api_key_bearer() {
 
 #[tokio::test]
 #[serial]
+async fn radius_catalog_failure_does_not_delete_stored_api_key() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (gateway, _seen) = start_radius_config_server("different-key").await;
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", &gateway);
+    let _env_key = EnvGuard::unset("RADIUS_API_KEY");
+    let store = crate::auth::providers::ProviderStore::with_paths(
+        tmp.path().join("providers.json"),
+        tmp.path().join("auth.json"),
+    );
+    store
+        .put(
+            crate::auth::providers::ProviderId::Radius,
+            crate::auth::providers::ProviderApiKeyCredential::new("stored-survives"),
+        )
+        .await
+        .unwrap();
+    let endpoint = HttpRadiusCatalogEndpoint::with_store(store.clone());
+
+    assert!(endpoint.fetch_radius_catalog().await.is_err());
+    match store
+        .get(crate::auth::providers::ProviderId::Radius)
+        .unwrap()
+    {
+        crate::auth::providers::ProviderSlotState::Known(
+            crate::auth::providers::ProviderStoredCredential::ApiKey(credential),
+        ) => assert_eq!(credential.key, "stored-survives"),
+        other => panic!("stored API key should survive catalog failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn radius_http_catalog_uses_env_key_without_provider_slot() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (gateway, seen) = start_radius_config_server("env-key").await;
@@ -307,6 +430,72 @@ async fn radius_http_catalog_uses_env_key_without_provider_slot() {
 
     assert_eq!(result.catalog.models[0].id, "server-model");
     assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer env-key"));
+}
+
+#[tokio::test]
+#[serial]
+async fn forced_radius_catalog_refresh_rereads_changed_env_key() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (gateway, seen) = start_radius_capture_server().await;
+    let _gateway = EnvGuard::set("GROK_RADIUS_GATEWAY", &gateway);
+    let store = crate::auth::providers::ProviderStore::with_paths(
+        tmp.path().join("providers.json"),
+        tmp.path().join("auth.json"),
+    );
+    let endpoint = HttpRadiusCatalogEndpoint::with_store(store);
+
+    let _old_key = EnvGuard::set("RADIUS_API_KEY", "old-env-key");
+    endpoint.fetch_radius_catalog().await.unwrap().unwrap();
+    let _new_key = EnvGuard::set("RADIUS_API_KEY", "new-env-key");
+    endpoint.fetch_radius_catalog().await.unwrap().unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["Bearer old-env-key", "Bearer new-env-key"],
+        "each forced refresh must resolve the current environment value"
+    );
+}
+
+async fn start_radius_capture_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+
+    async fn config(
+        State(seen): State<Arc<std::sync::Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+    ) -> axum::Json<serde_json::Value> {
+        if let Some(auth) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        {
+            seen.lock().unwrap().push(auth.to_owned());
+        }
+        axum::Json(serde_json::json!({
+            "baseUrl": "https://api.radius.test",
+            "models": [{
+                "id": "server-model",
+                "name": "Server Model",
+                "reasoning": true,
+                "input": ["text"],
+                "cost": {"input": 0, "output": 0},
+                "contextWindow": 123000,
+                "maxTokens": 4096
+            }]
+        }))
+    }
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/config", get(config))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
 }
 
 async fn start_radius_config_server(

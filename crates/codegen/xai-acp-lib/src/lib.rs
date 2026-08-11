@@ -4,6 +4,7 @@ mod gateway;
 mod line_reader;
 mod message;
 mod normalize;
+mod provider_auth;
 mod stdin_reader;
 
 pub use self::{
@@ -20,6 +21,10 @@ pub use self::{
         AcpAgentMessage, AcpAgentMessageBox, AcpAgentMessageGeneric, AcpArgs, AcpArgsBox,
         AcpClientMessage, AcpClientMessageBox, AcpClientMessageGeneric, AcpMethod, AcpRequest,
         AcpSide, Boxed, StorageMarker, Unboxed,
+    },
+    provider_auth::{
+        PROMPT_SECRET_CAPABILITY, PROMPT_SECRET_METHOD, PromptSecretRequest, PromptSecretResponse,
+        RedactedSecret,
     },
 };
 

@@ -507,6 +507,7 @@ fn build_headless_init_request(
         "skipGitStatus": true,
         "skipProjectLayout": true,
     });
+    meta[xai_acp_lib::PROMPT_SECRET_CAPABILITY] = serde_json::json!(false);
 
     acp::InitializeRequest::new(acp::ProtocolVersion::V1)
         .client_capabilities(

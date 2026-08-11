@@ -34,15 +34,18 @@ pub enum Command {
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
+        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "api_key"])]
         oauth: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
+            conflicts_with_all = ["oauth", "api_key"]
         )]
         device_auth: bool,
+        /// Enter a provider API key securely. Requires --provider; never accepts a value.
+        #[arg(long = "api-key", action = ArgAction::SetTrue, conflicts_with_all = ["oauth", "device_auth"])]
+        api_key: bool,
         /// Provider to sign in to (`xai`, `anthropic`, etc.).
         #[arg(long, conflicts_with = "all")]
         provider: Option<String>,
@@ -1439,6 +1442,33 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn login_accepts_boolean_api_key_flag_only() {
+        let login =
+            PagerArgs::try_parse_from(["grok", "login", "--provider", "anthropic", "--api-key"])
+                .expect("provider API-key login parses");
+        assert!(matches!(
+            login.command,
+            Some(Command::Login {
+                provider: Some(ref provider),
+                api_key: true,
+                ..
+            }) if provider == "anthropic"
+        ));
+
+        assert!(
+            PagerArgs::try_parse_from([
+                "grok",
+                "login",
+                "--provider",
+                "anthropic",
+                "--api-key",
+                "plaintext-secret",
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {
         let err = PagerArgs::try_parse_from(["grok", "-p", "headless", "interactive"])

@@ -136,7 +136,8 @@ async fn select_login_mode(
             ],
         }),
     )
-    .await?;
+    .await?
+    .into_text()?;
     match selected.trim() {
         "browser" => Ok(LoginMode::Browser),
         "device-code" => Ok(LoginMode::DeviceCode),
@@ -573,10 +574,11 @@ fn response_error_redacted<T>(
     response: &HttpPayload,
     redactions: &[&str],
 ) -> anyhow::Result<T> {
-    let mut body = truncate_error_body(response.body.trim());
+    let mut body = response.body.trim().to_owned();
     for secret in redactions.iter().filter(|secret| !secret.is_empty()) {
         body = body.replace(secret, "[REDACTED]");
     }
+    let body = truncate_error_body(&body);
     if body.is_empty() {
         bail!("{operation} failed ({})", response.status)
     }
@@ -670,6 +672,23 @@ mod tests {
         assert!(text.contains("[REDACTED]"));
         assert!(!text.contains(secret));
         assert!(text.len() < 4300, "error body must stay bounded");
+
+        let boundary_secret = "sk_PARTIAL_SECRET_MUST_NOT_LEAK";
+        let boundary_response = HttpPayload {
+            status: StatusCode::UNAUTHORIZED,
+            json: Value::Null,
+            body: format!("{}{}", "x".repeat(4090), boundary_secret),
+        };
+        let boundary_error = response_error_redacted::<()>(
+            "Radius gateway config",
+            &boundary_response,
+            &[boundary_secret],
+        )
+        .expect_err("gateway errors should fail");
+        assert!(
+            !boundary_error.to_string().contains("sk_PAR"),
+            "redaction must happen before truncation so a key prefix cannot survive at the boundary"
+        );
     }
 
     #[test]

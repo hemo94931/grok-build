@@ -3426,6 +3426,18 @@ mod tests {
         assert!(!is_interaction_request(&pv(
             r#"{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{}}"#
         )));
+        assert!(
+            !is_interaction_request(&pv(
+                r#"{"jsonrpc":"2.0","id":1,"method":"x.ai/providerAuth/promptSecret","params":{"provider":"anthropic","prompt":"Enter API key"}}"#
+            )),
+            "promptSecret must stay driver-only/non-replayable, not a shared interaction"
+        );
+        assert!(
+            !is_interaction_request(&pv(
+                r#"{"jsonrpc":"2.0","id":1,"method":"_x.ai/providerAuth/promptSecret","params":{"method":"x.ai/providerAuth/promptSecret","params":{"provider":"anthropic","prompt":"Enter API key"}}}"#
+            )),
+            "wrapped promptSecret must stay driver-only/non-replayable"
+        );
         assert!(!is_interaction_request(&pv(
             r#"{"jsonrpc":"2.0","method":"x.ai/sessions/changed","params":{}}"#
         )));

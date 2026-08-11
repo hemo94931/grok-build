@@ -51,7 +51,7 @@ pub(crate) struct AuthLink {
     pub(crate) url: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AuthPrompt {
     Text {
@@ -66,6 +66,95 @@ pub(crate) enum AuthPrompt {
         message: String,
         placeholder: String,
     },
+    Secret {
+        message: String,
+        placeholder: String,
+    },
+}
+
+impl std::fmt::Debug for AuthPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text {
+                message,
+                placeholder,
+            } => f
+                .debug_struct("Text")
+                .field("message", message)
+                .field("placeholder", placeholder)
+                .finish(),
+            Self::Select { message, options } => f
+                .debug_struct("Select")
+                .field("message", message)
+                .field("options", options)
+                .finish(),
+            Self::ManualCode {
+                message,
+                placeholder,
+            } => f
+                .debug_struct("ManualCode")
+                .field("message", message)
+                .field("placeholder", placeholder)
+                .finish(),
+            Self::Secret { .. } => f
+                .debug_struct("Secret")
+                .field("message", &"[REDACTED]")
+                .field("placeholder", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct AuthSecret(xai_acp_lib::RedactedSecret);
+
+impl AuthSecret {
+    pub(crate) fn new(secret: impl Into<String>) -> Self {
+        Self(xai_acp_lib::RedactedSecret::new(secret))
+    }
+
+    pub(crate) fn from_redacted(secret: xai_acp_lib::RedactedSecret) -> Self {
+        Self(secret)
+    }
+
+    pub(crate) fn into_zeroizing_string(self) -> zeroize::Zeroizing<String> {
+        self.0.into_zeroizing_string()
+    }
+}
+
+impl std::fmt::Debug for AuthSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthSecret([REDACTED])")
+    }
+}
+
+pub(crate) enum AuthPromptResponse {
+    Text(String),
+    Secret(AuthSecret),
+}
+
+impl AuthPromptResponse {
+    pub(crate) fn into_text(self) -> anyhow::Result<String> {
+        match self {
+            Self::Text(value) => Ok(value),
+            Self::Secret(_) => bail!("secret prompt response cannot be used as ordinary text"),
+        }
+    }
+
+    pub(crate) fn into_secret(self) -> anyhow::Result<AuthSecret> {
+        match self {
+            Self::Secret(value) => Ok(value),
+            Self::Text(_) => bail!("ordinary prompt response cannot be used as a secret"),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthPromptResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(value) => f.debug_tuple("Text").field(value).finish(),
+            Self::Secret(_) => f.write_str("Secret([REDACTED])"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,7 +167,7 @@ pub(crate) struct SelectOption {
 pub(crate) trait AuthInteraction: Send + Sync {
     fn signal(&self) -> CancellationToken;
     async fn notify(&self, notification: AuthNotification) -> anyhow::Result<()>;
-    async fn prompt(&self, prompt: AuthPrompt) -> anyhow::Result<String>;
+    async fn prompt(&self, prompt: AuthPrompt) -> anyhow::Result<AuthPromptResponse>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,7 +406,7 @@ impl LoopbackServer {
             let first = tokio::select! {
                 _ = signal.cancelled() => bail!("login cancelled"),
                 callback = &mut receiver => return callback.context("OAuth callback server stopped"),
-                manual = &mut prompt => manual?,
+                manual = &mut prompt => manual?.into_text()?,
             };
             if !first.trim().is_empty() {
                 return parse_authorization_input(&first, expected_state);
@@ -480,6 +569,27 @@ mod tests {
             }
         );
         assert!(parse_authorization_input("a#wrong", expected).is_err());
+    }
+
+    #[test]
+    fn secret_prompt_response_cannot_be_debugged_or_downgraded_to_text() {
+        let response = AuthPromptResponse::Secret(AuthSecret::new("sk-answer-must-not-leak"));
+        let debug = format!("{response:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("sk-answer-must-not-leak"));
+        assert!(response.into_text().is_err());
+    }
+
+    #[test]
+    fn secret_prompt_debug_redacts_metadata() {
+        let prompt = AuthPrompt::Secret {
+            message: "Enter API key for Anthropic".to_owned(),
+            placeholder: "API key".to_owned(),
+        };
+        let debug = format!("{prompt:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("Anthropic"));
+        assert!(!debug.contains("API key"));
     }
 
     #[test]

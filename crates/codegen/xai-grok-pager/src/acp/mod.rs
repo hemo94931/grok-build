@@ -487,6 +487,7 @@ fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
         "x.ai/hunkTracker": { "mode": hunk_mode },
         "x.ai/bashOutputNoColor": true,
         "x.ai/gitHeadChanged": true,
+        xai_acp_lib::PROMPT_SECRET_CAPABILITY: false,
     })
 }
 

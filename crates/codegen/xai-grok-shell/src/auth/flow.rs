@@ -965,39 +965,221 @@ pub async fn run_cli_login(
     config: &crate::agent::config::Config,
     oauth: bool,
     device_auth: bool,
+    api_key: bool,
     devbox: bool,
     provider: Option<&str>,
     all: bool,
 ) -> anyhow::Result<()> {
+    validate_cli_login_request(provider, all, api_key, oauth, device_auth, devbox)?;
     if devbox {
-        if provider.is_some() || all {
-            anyhow::bail!("--devbox cannot be combined with --provider or --all");
-        }
         let auth = super::devbox_login::run_devbox_login(config).await?;
         return apply_post_login_config(auth).await;
     }
 
-    let targets = cli_provider_targets(provider, all, "sign in").await?;
-    let mode = if oauth {
+    let targets = cli_login_targets(provider, all, api_key, oauth, device_auth).await?;
+    for target in targets {
+        match target {
+            super::providers::ProviderLoginTarget::Xai => {
+                run_cli_xai_login(config, oauth, device_auth).await?
+            }
+            super::providers::ProviderLoginTarget::Provider { provider, method } => {
+                let interaction = super::providers::CliAuthInteraction::new();
+                match method {
+                    super::providers::ProviderCredentialMethod::OAuth => {
+                        super::providers::login_and_store(
+                            provider,
+                            &interaction,
+                            provider_oauth_mode(oauth, device_auth),
+                        )
+                        .await?;
+                        super::providers::report_provider_login(provider);
+                    }
+                    super::providers::ProviderCredentialMethod::ApiKey => {
+                        super::providers::login_api_key_and_store(provider, &interaction).await?;
+                        super::providers::report_provider_api_key_login(provider);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn provider_oauth_mode(oauth: bool, device_auth: bool) -> Option<super::providers::LoginMode> {
+    if oauth {
         Some(super::providers::LoginMode::Browser)
     } else if device_auth {
         Some(super::providers::LoginMode::DeviceCode)
     } else {
         None
-    };
-    for target in targets {
+    }
+}
+
+fn validate_cli_login_request(
+    provider: Option<&str>,
+    all: bool,
+    api_key: bool,
+    oauth: bool,
+    device_auth: bool,
+    devbox: bool,
+) -> anyhow::Result<()> {
+    if provider.is_some() && all {
+        anyhow::bail!("--provider and --all cannot be combined");
+    }
+    if api_key && (oauth || device_auth) {
+        anyhow::bail!("--api-key cannot be combined with --oauth or --device-auth");
+    }
+    if devbox && (provider.is_some() || all || api_key) {
+        anyhow::bail!("--devbox cannot be combined with --provider, --all, or --api-key");
+    }
+    if all && api_key {
+        anyhow::bail!(
+            "--all --api-key is not supported; enter API keys one provider at a time with --provider <id> --api-key"
+        );
+    }
+    if api_key && provider.is_none() {
+        anyhow::bail!("--api-key requires --provider <id>");
+    }
+    if let Some(provider) = provider {
+        let target = super::providers::ProviderTarget::parse(provider)?;
         match target {
             super::providers::ProviderTarget::Xai => {
-                run_cli_xai_login(config, oauth, device_auth).await?
+                if api_key {
+                    anyhow::bail!(
+                        "xAI API keys are configured via environment or config; --api-key requires a third-party --provider"
+                    );
+                }
             }
             super::providers::ProviderTarget::Provider(provider) => {
-                let interaction = super::providers::CliAuthInteraction::new();
-                super::providers::login_and_store(provider, &interaction, mode).await?;
-                super::providers::report_provider_login(provider);
+                validate_explicit_provider_login(provider, api_key, oauth, device_auth)?;
             }
         }
     }
     Ok(())
+}
+
+fn validate_explicit_provider_login(
+    provider: super::providers::ProviderId,
+    api_key: bool,
+    oauth: bool,
+    device_auth: bool,
+) -> anyhow::Result<()> {
+    let descriptor = super::providers::provider_descriptor(provider);
+    let method = if api_key {
+        super::providers::ProviderCredentialMethod::ApiKey
+    } else if oauth || device_auth {
+        super::providers::ProviderCredentialMethod::OAuth
+    } else {
+        descriptor.default_login_method()
+    };
+    if !descriptor.supports_method(method) {
+        anyhow::bail!(
+            "{} does not support {} login",
+            descriptor.display_name,
+            match method {
+                super::providers::ProviderCredentialMethod::OAuth => "OAuth",
+                super::providers::ProviderCredentialMethod::ApiKey => "API-key",
+            }
+        );
+    }
+    if method == super::providers::ProviderCredentialMethod::OAuth {
+        if let Some(mode) = provider_oauth_mode(oauth, device_auth) {
+            super::providers::validate_oauth_login_request(provider, Some(mode))?;
+        }
+    } else if device_auth {
+        anyhow::bail!("--device-auth can only be used with OAuth login");
+    }
+    Ok(())
+}
+
+async fn cli_login_targets(
+    provider: Option<&str>,
+    all: bool,
+    api_key: bool,
+    oauth: bool,
+    device_auth: bool,
+) -> anyhow::Result<Vec<super::providers::ProviderLoginTarget>> {
+    if all {
+        return cli_provider_targets_for_all_login();
+    }
+    if let Some(provider) = provider {
+        return explicit_cli_login_target(provider, api_key, oauth, device_auth)
+            .map(|target| vec![target]);
+    }
+    if super::providers::terminal_is_interactive() {
+        let target = super::providers::select_login_target().await?;
+        validate_selected_login_target(&target, oauth, device_auth)?;
+        return Ok(vec![target]);
+    }
+    Ok(vec![super::providers::ProviderLoginTarget::Xai])
+}
+
+fn validate_selected_login_target(
+    target: &super::providers::ProviderLoginTarget,
+    oauth: bool,
+    device_auth: bool,
+) -> anyhow::Result<()> {
+    match target {
+        super::providers::ProviderLoginTarget::Xai => Ok(()),
+        super::providers::ProviderLoginTarget::Provider { provider, method } => match method {
+            super::providers::ProviderCredentialMethod::OAuth => {
+                validate_explicit_provider_login(*provider, false, oauth, device_auth)
+            }
+            super::providers::ProviderCredentialMethod::ApiKey => {
+                if oauth || device_auth {
+                    anyhow::bail!("--api-key cannot be combined with --oauth or --device-auth");
+                }
+                validate_explicit_provider_login(*provider, true, false, false)
+            }
+        },
+    }
+}
+
+fn explicit_cli_login_target(
+    provider: &str,
+    api_key: bool,
+    oauth: bool,
+    device_auth: bool,
+) -> anyhow::Result<super::providers::ProviderLoginTarget> {
+    match super::providers::ProviderTarget::parse(provider)? {
+        super::providers::ProviderTarget::Xai => Ok(super::providers::ProviderLoginTarget::Xai),
+        super::providers::ProviderTarget::Provider(provider) => {
+            let descriptor = super::providers::provider_descriptor(provider);
+            let method = if api_key {
+                super::providers::ProviderCredentialMethod::ApiKey
+            } else if oauth || device_auth {
+                super::providers::ProviderCredentialMethod::OAuth
+            } else {
+                descriptor.default_login_method()
+            };
+            Ok(super::providers::ProviderLoginTarget::Provider { provider, method })
+        }
+    }
+}
+
+fn cli_provider_targets_for_all_login() -> anyhow::Result<Vec<super::providers::ProviderLoginTarget>>
+{
+    Ok(std::iter::once(super::providers::ProviderLoginTarget::Xai)
+        .chain(
+            super::providers::provider_login_options()
+                .into_iter()
+                .filter(|option| option.method == super::providers::ProviderCredentialMethod::OAuth)
+                .map(|option| super::providers::ProviderLoginTarget::Provider {
+                    provider: option.provider,
+                    method: option.method,
+                }),
+        )
+        .collect())
+}
+
+fn cli_provider_targets_for_all_logout() -> anyhow::Result<Vec<super::providers::ProviderTarget>> {
+    Ok(std::iter::once(super::providers::ProviderTarget::Xai)
+        .chain(
+            super::providers::ProviderId::ALL
+                .into_iter()
+                .map(super::providers::ProviderTarget::Provider),
+        )
+        .collect())
 }
 
 async fn cli_provider_targets(
@@ -1009,13 +1191,7 @@ async fn cli_provider_targets(
         anyhow::bail!("--provider and --all cannot be combined");
     }
     if all {
-        return Ok(std::iter::once(super::providers::ProviderTarget::Xai)
-            .chain(
-                super::providers::ProviderId::ALL
-                    .into_iter()
-                    .map(super::providers::ProviderTarget::Provider),
-            )
-            .collect());
+        return cli_provider_targets_for_all_logout();
     }
     if let Some(provider) = provider {
         return Ok(vec![super::providers::ProviderTarget::parse(provider)?]);
@@ -1215,10 +1391,10 @@ pub async fn run_cli_logout(
             super::providers::ProviderTarget::Xai => run_cli_xai_logout(config)?,
             super::providers::ProviderTarget::Provider(provider) => {
                 if super::providers::logout(provider).await? {
-                    eprintln!("Logged out of {}.", provider.display_name());
+                    eprintln!("Removed cached {} credential.", provider.display_name());
                 } else {
                     eprintln!(
-                        "No cached {} session to log out of.",
+                        "No cached {} credential to remove.",
                         provider.display_name()
                     );
                 }
@@ -1262,6 +1438,57 @@ mod tests {
     /// `os_error` and the reqwest classification are covered in
     /// `xai-grok-http`; what's local is which `LoginFailureKind` each maps to,
     /// and that a decode failure never reads as a transport one.
+    #[test]
+    fn cli_login_flag_matrix_rejects_api_key_before_side_effects() {
+        assert!(
+            validate_cli_login_request(None, false, true, false, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("--provider")
+        );
+        assert!(
+            validate_cli_login_request(Some("anthropic"), false, true, true, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("--api-key cannot be combined")
+        );
+        assert!(
+            validate_cli_login_request(Some("openai-codex"), false, true, false, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support API-key")
+        );
+        assert!(
+            validate_cli_login_request(Some("anthropic"), false, false, false, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support device-code")
+        );
+        assert!(
+            validate_cli_login_request(None, true, true, false, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("one provider at a time")
+        );
+    }
+
+    #[test]
+    fn cli_login_all_is_oauth_filtered_while_logout_all_is_all_providers() {
+        let login = cli_provider_targets_for_all_login().unwrap();
+        assert_eq!(
+            login.len(),
+            1 + crate::auth::providers::provider_login_options()
+                .iter()
+                .filter(|option| option.method
+                    == crate::auth::providers::ProviderCredentialMethod::OAuth)
+                .count()
+        );
+        assert_eq!(
+            cli_provider_targets_for_all_logout().unwrap().len(),
+            1 + crate::auth::providers::ProviderId::ALL.len()
+        );
+    }
+
     #[test]
     fn failure_kinds_map_one_to_one() {
         assert_eq!(

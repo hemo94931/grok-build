@@ -108,33 +108,68 @@ pub type AcpAgentGatewaySender = AcpGatewaySender<acp::AgentSide>;
 pub type AcpClientGatewayReceiver = AcpGatewayReceiver<acp::ClientSide, acp::ClientSideConnection>;
 pub type AcpClientGatewaySender = AcpGatewaySender<acp::ClientSide>;
 
-fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpTraceContext {
+    method: String,
+    log_payload: bool,
+}
+
+fn trace_request_payload<T: Serialize + AcpMethod>(request: &T) -> Option<String> {
+    request
+        .trace_payload_allowed()
+        .then(|| crate::common::compact_json(request))
+}
+
+fn trace_response_payload<T: Serialize>(ctx: &AcpTraceContext, response: &T) -> Option<String> {
+    ctx.log_payload
+        .then(|| crate::common::compact_json(response))
+}
+
+fn trace_error_payload(ctx: &AcpTraceContext, error: &acp::Error) -> Option<String> {
+    ctx.log_payload.then(|| error.to_string())
+}
+
+fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<AcpTraceContext> {
     tracing.then(|| {
-        let method = crate::common::compact_json(&args.method_name());
-        tracing::debug!(
-            "sending {method} request: {}",
-            crate::common::compact_json(&args.request)
-        );
-        method
+        let method_name = args.request.trace_method_name();
+        let method = crate::common::compact_json(&method_name.as_ref());
+        let log_payload = args.request.trace_payload_allowed();
+        if let Some(payload) = trace_request_payload(&args.request) {
+            tracing::debug!("sending {method} request: {payload}");
+        } else {
+            tracing::debug!("sending {method} request: [payload suppressed]");
+        }
+        AcpTraceContext {
+            method: method_name.into_owned(),
+            log_payload,
+        }
     })
 }
 
 fn after_request<T: Serialize>(
     response_tx: oneshot::Sender<AcpResult<T>>,
     response: AcpResult<T>,
-    method: Option<String>,
+    trace: Option<AcpTraceContext>,
 ) -> bool {
-    if let Some(method) = method {
+    if let Some(trace) = trace {
+        let method = crate::common::compact_json(&trace.method.as_str());
         match response {
             Ok(ref response) => {
-                tracing::debug!(
-                    "received {method} response: {}",
-                    crate::common::compact_json(&response)
-                );
+                if let Some(payload) = trace_response_payload(&trace, response) {
+                    tracing::debug!("received {method} response: {payload}");
+                } else {
+                    tracing::debug!("received {method} response: [payload suppressed]");
+                }
             }
             Err(ref err) => {
-                // Log at debug level - errors are handled visually in the TUI status bar
-                tracing::debug!("received {method} error: {err}");
+                // Log at debug level - errors are handled visually in the TUI status bar.
+                // Secret methods suppress the full error too because JSON-RPC data may echo
+                // a rejected response value.
+                if let Some(error) = trace_error_payload(&trace, err) {
+                    tracing::debug!("received {method} error: {error}");
+                } else {
+                    tracing::debug!("received {method} error: [payload suppressed]");
+                }
             }
         }
     }
@@ -376,11 +411,13 @@ impl<S: AcpSide> AcpGatewaySender<S> {
         S::OutMessage: From<AcpArgs<T>>,
     {
         if self.tracing {
-            let method = crate::common::compact_json(&request.method_name());
-            tracing::debug!(
-                "received {method} request: {}",
-                crate::common::compact_json(&request)
-            );
+            let method_name = request.trace_method_name();
+            let method = crate::common::compact_json(&method_name.as_ref());
+            if let Some(payload) = trace_request_payload(&request) {
+                tracing::debug!("received {method} request: {payload}");
+            } else {
+                tracing::debug!("received {method} request: [payload suppressed]");
+            }
         }
         acp_send(request, &self.tx).await
     }
@@ -558,6 +595,56 @@ mod tests {
                 acp::TextContent::new(marker),
             ))),
         )
+    }
+
+    #[test]
+    fn prompt_secret_ext_request_and_response_tracing_are_payload_suppressed() {
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "provider": "anthropic",
+            "providerDisplayName": "Anthropic",
+            "prompt": "Enter API key"
+        }))
+        .unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let args = AcpArgs {
+            request: acp::ExtRequest::new(crate::PROMPT_SECRET_METHOD, raw.into()),
+            response_tx: tx,
+        };
+        let ctx = before_request(&args, true).expect("tracing enabled");
+        assert_eq!(ctx.method.as_str(), crate::PROMPT_SECRET_METHOD);
+        assert!(
+            !ctx.log_payload,
+            "promptSecret request payload must not be serialized"
+        );
+
+        let response = serde_json::value::to_raw_value(&serde_json::json!({
+            "outcome": "accepted",
+            "secret": "sk-never-log"
+        }))
+        .unwrap();
+        assert!(
+            trace_response_payload(&ctx, &acp::ExtResponse::new(response.into())).is_none(),
+            "promptSecret response payload must not be serialized"
+        );
+        let error = acp::Error::internal_error().data("sk-error-must-not-log");
+        assert!(
+            trace_error_payload(&ctx, &error).is_none(),
+            "promptSecret error data must not be formatted"
+        );
+    }
+
+    #[test]
+    fn ordinary_ext_request_tracing_keeps_payload_preview() {
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({"hello":"world"})).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let args = AcpArgs {
+            request: acp::ExtRequest::new("x.ai/test", raw.into()),
+            response_tx: tx,
+        };
+        let ctx = before_request(&args, true).expect("tracing enabled");
+        assert_eq!(ctx.method.as_str(), "x.ai/test");
+        assert!(ctx.log_payload);
+        assert!(trace_request_payload(&args.request).is_some());
     }
 
     /// Regression: draining completion receivers preserves notification ordering.
