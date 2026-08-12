@@ -4673,7 +4673,14 @@ mod inline_auto_compact_flow_tests {
         local
             .run_until(async {
                 let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-                let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = persistence_rx.recv().await {
+                        if let PersistenceMsg::FlushAndAck { respond_to } = msg {
+                            let _ = respond_to.send(Ok(()));
+                        }
+                    }
+                });
                 let filler = "x".repeat(8_000);
                 let mut conv = vec![ConversationItem::system("small system prompt")];
                 for i in 0..9 {
@@ -4749,6 +4756,19 @@ mod inline_auto_compact_flow_tests {
             .run_until(async {
                 let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
                 let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+                let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = persistence_rx.recv().await {
+                        match msg {
+                            PersistenceMsg::FlushAndAck { respond_to } => {
+                                let _ = respond_to.send(Ok(()));
+                            }
+                            other => {
+                                let _ = observed_tx.send(other);
+                            }
+                        }
+                    }
+                });
                 let huge_system = "s".repeat(150_000);
                 let conv = vec![
                     ConversationItem::system(huge_system),
@@ -4784,7 +4804,7 @@ mod inline_auto_compact_flow_tests {
                     "an over-threshold released history must set sticky suppression"
                 );
                 let mut saw_failure = false;
-                while let Ok(msg) = persistence_rx.try_recv() {
+                while let Ok(msg) = observed_rx.try_recv() {
                     if let PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(
                         notif,
                     )) = msg
