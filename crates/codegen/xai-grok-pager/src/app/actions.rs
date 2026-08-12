@@ -650,8 +650,13 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
-    /// Sign in to one non-xAI model provider without changing xAI auth state.
-    ProviderLogin(String),
+    /// Open or resolve one non-xAI provider login without changing xAI auth state.
+    ProviderLogin(crate::app::provider_auth::ProviderLoginIntent),
+    /// Cancel an in-flight provider login by its metadata-only sequence.
+    ProviderLoginCancel {
+        provider: String,
+        request_seq: u64,
+    },
     /// Sign out from one non-xAI model provider without changing xAI auth state.
     ProviderLogout(String),
     /// Cancel an in-progress login that was started from inside a session
@@ -1979,11 +1984,24 @@ pub enum Effect {
     },
     /// Log out via `x.ai/auth/logout` (shell clears auth.json + in-memory state).
     Logout,
+    /// Fetch the authoritative provider login registry metadata.
+    ProviderAuthInfo {
+        agent_id: AgentId,
+        intent: crate::app::provider_auth::ProviderLoginIntent,
+    },
+    /// Cancel one in-flight provider-scoped login.
+    ProviderLoginCancel {
+        agent_id: AgentId,
+        provider: String,
+        request_seq: u64,
+    },
     /// Sign in through the provider-scoped auth RPC.
     ProviderLogin {
         agent_id: AgentId,
         session_id: acp::SessionId,
         provider: String,
+        display_name: String,
+        method: xai_acp_lib::ProviderAuthMethod,
         request_seq: u64,
     },
     /// Sign out through the provider-scoped auth RPC.
@@ -2841,11 +2859,25 @@ pub enum TaskResult {
     },
     /// Shell acknowledged logout (auth cleared).
     LogoutComplete,
+    /// Authoritative provider registry metadata loaded for a login intent.
+    ProviderAuthInfoComplete {
+        agent_id: AgentId,
+        intent: crate::app::provider_auth::ProviderLoginIntent,
+        result: Result<Vec<crate::app::provider_auth::ProviderAuthInfo>, String>,
+    },
+    /// A provider-scoped cancel request finished; the original login result
+    /// owns user-visible completion copy.
+    ProviderLoginCancelComplete {
+        agent_id: AgentId,
+    },
     /// A provider-scoped login finished.
     ProviderLoginComplete {
         agent_id: AgentId,
         provider: String,
-        result: Result<(), String>,
+        display_name: String,
+        method: xai_acp_lib::ProviderAuthMethod,
+        request_seq: u64,
+        result: Result<crate::app::provider_auth::ProviderLoginSuccess, String>,
     },
     /// A provider-scoped logout finished.
     ProviderLogoutComplete {

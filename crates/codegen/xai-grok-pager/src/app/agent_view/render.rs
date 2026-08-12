@@ -1081,16 +1081,25 @@ impl AgentView {
                 .desired_height(inner_width, &prompt_style, true, max_prompt_height)
         };
         let overlay_content_w = inner_width.saturating_sub(QUESTION_VIEW_HPAD) as usize;
-        let permission_view_h = if let Some(perm) = self.permission_queue.front() {
-            crate::views::permission_view::permission_view_height(
-                perm,
-                area.height,
-                overlay_content_w,
-            )
+        let provider_secret_view_h = if self.provider_secret.is_some() {
+            crate::views::provider_secret::provider_secret_height(area.height)
         } else {
             0
         };
-        let question_view_h = if permission_view_h == 0 {
+        let permission_view_h = if provider_secret_view_h == 0 {
+            if let Some(perm) = self.permission_queue.front() {
+                crate::views::permission_view::permission_view_height(
+                    perm,
+                    area.height,
+                    overlay_content_w,
+                )
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let question_view_h = if provider_secret_view_h == 0 && permission_view_h == 0 {
             if let Some(ref mut qv) = self.question_view {
                 crate::views::question_view::question_view_height(
                     qv,
@@ -1103,25 +1112,29 @@ impl AgentView {
         } else {
             0
         };
-        let rewind_view_h = if permission_view_h == 0 && question_view_h == 0 {
-            if let Some(ref rw) = self.rewind_state {
-                crate::views::rewind::rewind_overlay_height(&rw.phase, area.height)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let cancel_turn_view_h =
-            if permission_view_h == 0 && question_view_h == 0 && rewind_view_h == 0 {
-                if self.cancel_turn_view.is_some() {
-                    modal::cancel_turn_panel_height(area.height)
+        let rewind_view_h =
+            if provider_secret_view_h == 0 && permission_view_h == 0 && question_view_h == 0 {
+                if let Some(ref rw) = self.rewind_state {
+                    crate::views::rewind::rewind_overlay_height(&rw.phase, area.height)
                 } else {
                     0
                 }
             } else {
                 0
             };
+        let cancel_turn_view_h = if provider_secret_view_h == 0
+            && permission_view_h == 0
+            && question_view_h == 0
+            && rewind_view_h == 0
+        {
+            if self.cancel_turn_view.is_some() {
+                modal::cancel_turn_panel_height(area.height)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let jump_view_h = if !self.jump_slot_taken() {
             if let Some(ref js) = self.jump_state {
                 crate::views::jump::jump_overlay_height(js, area.height)
@@ -1199,7 +1212,9 @@ impl AgentView {
             0
         };
         let question_footer_h: u16 = if question_view_h > 0 { 3 } else { 0 };
-        let prompt_height = if permission_view_h > 0 {
+        let prompt_height = if provider_secret_view_h > 0 {
+            provider_secret_view_h
+        } else if permission_view_h > 0 {
             if is_permission_followup && perm_inline_prompt_h > 1 {
                 permission_view_h + perm_inline_prompt_h.saturating_sub(1)
             } else {
@@ -1221,7 +1236,7 @@ impl AgentView {
         };
         let prompt_height =
             prompt_height.max(prompt_style.vpad_top + 1 + prompt_style.info_block(true));
-        let prompt_height = if self.is_subagent_view {
+        let prompt_height = if self.is_subagent_view && provider_secret_view_h == 0 {
             0
         } else {
             prompt_height
@@ -1373,6 +1388,7 @@ impl AgentView {
         }
         let overlay_blocks_rail_hover = self.jump_state.is_some()
             || self.rewind_state.is_some()
+            || self.provider_secret.is_some()
             || self.question_view.is_some()
             || !self.permission_queue.is_empty()
             || self.cancel_turn_view.is_some()
@@ -2236,8 +2252,9 @@ impl AgentView {
                         .tracker
                         .running_execute_tool_call_id()
                         .is_some();
-                let is_pending_user_input =
-                    !self.permission_queue.is_empty() || self.question_view.is_some();
+                let is_pending_user_input = self.provider_secret.is_some()
+                    || !self.permission_queue.is_empty()
+                    || self.question_view.is_some();
                 let goal_verifying = self
                     .goal_state
                     .as_ref()
@@ -2538,7 +2555,18 @@ impl AgentView {
         };
         let mut prompt_cursor_pos: Option<(u16, u16)> = None;
         let mut prompt_post_flush: Option<crate::terminal::overlay::PostFlush> = None;
-        if permission_view_h > 0 {
+        if provider_secret_view_h > 0 {
+            if let Some(secret) = self.provider_secret.as_ref() {
+                crate::views::provider_secret::render_provider_secret(
+                    buf,
+                    layout.prompt,
+                    secret,
+                    &theme,
+                );
+            }
+            self.inline_prompt_area = None;
+            self.question_scroll_region = None;
+        } else if permission_view_h > 0 {
             let perm_area = layout.prompt;
             if let Some(perm) = self.permission_queue.front() {
                 let followup_text = self.prompt.text();

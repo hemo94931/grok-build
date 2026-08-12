@@ -47,7 +47,9 @@ use super::prompt::{
     dispatch_show_plan_nudge, dispatch_show_undo_tip, dispatch_show_word_select_tip,
 };
 use super::provider_auth::{
-    dispatch_login as dispatch_provider_login, dispatch_logout as dispatch_provider_logout,
+    dispatch_login as dispatch_provider_login,
+    dispatch_login_cancel as dispatch_provider_login_cancel,
+    dispatch_logout as dispatch_provider_logout,
 };
 use super::queue;
 use super::queue::dispatch_drain_queue;
@@ -1159,6 +1161,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::Login => dispatch_login(app),
         Action::ProviderLogin(provider) => dispatch_provider_login(app, provider),
+        Action::ProviderLoginCancel {
+            provider,
+            request_seq,
+        } => dispatch_provider_login_cancel(app, provider, request_seq),
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
         Action::CopyAuthUrl => {

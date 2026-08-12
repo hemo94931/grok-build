@@ -61,11 +61,27 @@ pub(in crate::app::dispatch) fn dispatch_sessions_confirm_close(
             show_welcome(app);
         }
     }
-    let effects = unregister_session_effect(
+    // Closing an inactive session does not pass through `switch_to_agent`, so
+    // explicitly cancel any secure provider login before dropping its state.
+    // `ProviderSecretState::Drop` cancels the reverse response, while this
+    // scoped effect also stops shell-side work that may still be waiting to
+    // issue that reverse request.
+    let mut effects = Vec::new();
+    if let Some(agent) = app.agents.get_mut(&closed_id) {
+        agent.cancel_provider_secret();
+        if let Some((provider, request_seq)) = agent.request_provider_login_cancel() {
+            effects.push(Effect::ProviderLoginCancel {
+                agent_id: closed_id,
+                provider,
+                request_seq,
+            });
+        }
+    }
+    effects.extend(unregister_session_effect(
         app.agents
             .get(&closed_id)
             .and_then(|a| a.session.session_id.clone()),
-    );
+    ));
     remove_agent_and_cleanup(app, closed_id);
     effects
 }

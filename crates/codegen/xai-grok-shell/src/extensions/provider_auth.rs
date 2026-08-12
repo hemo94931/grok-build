@@ -115,7 +115,11 @@ async fn handle_login(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 .map(|_| ())
         }
     };
-    login_result.map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+    login_result.map_err(|error| {
+        let redacted = xai_acp_lib::redact_provider_auth_error(&error.to_string());
+        let message: String = redacted.chars().take(2_000).collect();
+        acp::Error::internal_error().data(message)
+    })?;
     let radius_catalog_refreshed = agent.models_manager.on_auth_changed().await;
 
     to_raw_response(&serde_json::json!({
@@ -179,7 +183,11 @@ async fn handle_logout(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     agent.interactive_auth.cancel_provider(provider, None);
     let was_logged_in = crate::auth::providers::logout(provider)
         .await
-        .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        .map_err(|error| {
+            let redacted = xai_acp_lib::redact_provider_auth_error(&error.to_string());
+            let message: String = redacted.chars().take(2_000).collect();
+            acp::Error::internal_error().data(message)
+        })?;
     agent.models_manager.on_auth_changed().await;
     to_raw_response(&serde_json::json!({
         "ok": true,
@@ -263,7 +271,10 @@ async fn handle_info(agent: &MvpAgent) -> ExtResult {
     for provider in ProviderId::ALL {
         let slot = crate::auth::providers::stored_slot(provider)
             .await
-            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            .map_err(|error| {
+                let redacted = xai_acp_lib::redact_provider_auth_error(&error.to_string());
+                acp::Error::internal_error().data(redacted)
+            })?;
         let model_count = available
             .keys()
             .filter(|model_id| {
@@ -472,6 +483,7 @@ impl AuthInteraction for AcpAuthInteraction {
                 .await
             }
             AuthNotification::Progress { message } | AuthNotification::Info { message, .. } => {
+                let message = xai_acp_lib::redact_provider_auth_error(&message);
                 tracing::info!(provider = %self.provider, %message, "provider auth progress");
                 Ok(())
             }

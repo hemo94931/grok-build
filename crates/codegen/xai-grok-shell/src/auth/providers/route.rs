@@ -375,6 +375,7 @@ impl xai_grok_sampler::BearerResolver for ProviderBearerResolver {
                 None
             }
             Err(error) => {
+                let error = xai_acp_lib::redact_provider_auth_error(&error.to_string());
                 tracing::warn!(provider = %self.provider, %error, "provider bearer reload failed");
                 None
             }

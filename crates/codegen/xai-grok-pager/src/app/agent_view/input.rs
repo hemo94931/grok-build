@@ -53,6 +53,7 @@ impl AgentView {
             || self.show_goal_detail
             || self.btw_focused
             || !self.permission_queue.is_empty()
+            || self.provider_secret.is_some()
             || self.question_view.is_some()
             || self.plan_approval_view.is_some()
             || self.casual_commenting_range.is_some()
@@ -92,7 +93,9 @@ impl AgentView {
     /// Whether no input-demanding overlay — a [`BlockingCard`] or the plan
     /// approval — is awaiting a response.
     pub(crate) fn no_input_overlay_pending(&self) -> bool {
-        self.blocking_card().is_none() && self.plan_approval_view.is_none()
+        self.provider_secret.is_none()
+            && self.blocking_card().is_none()
+            && self.plan_approval_view.is_none()
     }
     /// Whether FocusGained should move focus from Scrollback → Prompt.
     ///
@@ -116,7 +119,8 @@ impl AgentView {
     /// on an empty prompt would exit the overlay instead of reaching `/gboom`
     /// (turn/close), video (seek/close), or image (close).
     pub(super) fn modal_owns_input(&self) -> bool {
-        self.extensions_modal.is_some()
+        self.provider_secret.is_some()
+            || self.extensions_modal.is_some()
             || self.active_modal.is_some()
             || self.gboom.is_some()
             || self.video_viewer.is_some()
@@ -424,6 +428,73 @@ impl AgentView {
         registry: &ActionRegistry,
         prompt_paging: bool,
     ) -> InputOutcome {
+        if let Some(secret) = self.provider_secret.as_mut() {
+            let outcome = secret.handle_event(ev);
+            let finished_request = matches!(
+                outcome,
+                crate::app::provider_auth::SecretInputOutcome::Submitted
+                    | crate::app::provider_auth::SecretInputOutcome::Cancelled
+            )
+            .then(|| {
+                secret
+                    .request
+                    .request_seq
+                    .map(|request_seq| (secret.request.provider.clone(), request_seq))
+            })
+            .flatten();
+            let cancel_request = matches!(
+                outcome,
+                crate::app::provider_auth::SecretInputOutcome::Cancelled
+            )
+            .then_some(finished_request.clone())
+            .flatten();
+            if matches!(
+                outcome,
+                crate::app::provider_auth::SecretInputOutcome::Submitted
+                    | crate::app::provider_auth::SecretInputOutcome::Cancelled
+            ) {
+                self.provider_secret.take();
+            }
+            if let Some((provider, request_seq)) = finished_request.as_ref()
+                && let Some(pending) = self.pending_provider_login.as_mut()
+                && pending.provider == *provider
+                && pending.request_seq == *request_seq
+            {
+                pending.owns_input = false;
+            }
+            if let Some((provider, request_seq)) = cancel_request
+                && self.pending_provider_login.as_ref().is_some_and(|pending| {
+                    pending.provider == provider && pending.request_seq == request_seq
+                })
+            {
+                return InputOutcome::Action(Action::ProviderLoginCancel {
+                    provider,
+                    request_seq,
+                });
+            }
+            return InputOutcome::Changed;
+        }
+        if let Some(pending) = self.pending_provider_login.as_ref()
+            && pending.method == xai_acp_lib::ProviderAuthMethod::ApiKey
+            && pending.owns_input
+            && !pending.cancelled
+        {
+            if let Event::Key(key) = ev
+                && key.kind != KeyEventKind::Release
+                && (key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)))
+            {
+                return InputOutcome::Action(Action::ProviderLoginCancel {
+                    provider: pending.provider.clone(),
+                    request_seq: pending.request_seq,
+                });
+            }
+            // Until the dedicated reverse request arrives, swallow all other
+            // input so API-key typeahead/paste cannot fall into the composer,
+            // history, shortcuts, confirmations, or the input recorder.
+            return InputOutcome::Changed;
+        }
         if self.scrollback_drag_latched() {
             let live_drag_event = matches!(
                 ev,

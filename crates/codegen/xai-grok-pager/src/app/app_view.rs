@@ -2433,6 +2433,43 @@ impl AppView {
             self.last_known_terminal_rows = *rows;
             self.apply_effective_compact();
         }
+
+        // Secret entry owns the complete input stream. Route it before pending
+        // confirmations, dashboard/global shortcuts, scroll handling, tutorial
+        // overlays, voice hooks, prompt persistence, and the input recorder.
+        let secret_owner = match self.active_view {
+            ActiveView::Agent(id) => Some(id),
+            ActiveView::AgentDashboard => self
+                .dashboard
+                .as_ref()
+                .and_then(|dashboard| dashboard.attached_agent),
+            ActiveView::Welcome => None,
+        }
+        .filter(|id| {
+            self.agents.get(id).is_some_and(|agent| {
+                agent.provider_secret.is_some()
+                    || agent
+                        .pending_provider_login
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.method == xai_acp_lib::ProviderAuthMethod::ApiKey
+                                && pending.owns_input
+                                && !pending.cancelled
+                        })
+            })
+        });
+        if let Some(id) = secret_owner {
+            let outcome = match self.agents.get_mut(&id) {
+                Some(agent) => {
+                    let outcome = agent.handle_input(ev, &self.registry);
+                    self.pending_effects.append(&mut agent.pending_effects);
+                    outcome
+                }
+                None => InputOutcome::Unchanged,
+            };
+            return outcome;
+        }
+
         if let Some(key) = key_event
             && let Some(pending) = &self.pending_action
         {
@@ -2777,6 +2814,7 @@ impl AppView {
                     Some(agent) => {
                         let transcript_before = agent.active_subagent.clone();
                         let workflows_before = agent.show_workflows;
+                        let secret_input = agent.provider_secret.is_some();
                         let outcome = if self.screen_mode.is_minimal() {
                             agent.handle_minimal_input(ev, &self.registry)
                         } else if prompt_paging {
@@ -2787,7 +2825,7 @@ impl AppView {
                         let transcript_opened =
                             transcript_before.is_none() && agent.active_subagent.is_some();
                         let workflows_opened = !workflows_before && agent.show_workflows;
-                        if let Event::Key(key) = ev {
+                        if !secret_input && let Event::Key(key) = ev {
                             agent.record_input(key, &outcome);
                         }
                         self.pending_effects.append(&mut agent.pending_effects);
@@ -2906,11 +2944,12 @@ impl AppView {
                         Some(agent) => {
                             let transcript_before = agent.active_subagent.clone();
                             let workflows_before = agent.show_workflows;
+                            let secret_input = agent.provider_secret.is_some();
                             let outcome = agent.handle_input(ev, &self.registry);
                             let transcript_opened =
                                 transcript_before.is_none() && agent.active_subagent.is_some();
                             let workflows_opened = !workflows_before && agent.show_workflows;
-                            if let Event::Key(key) = ev {
+                            if !secret_input && let Event::Key(key) = ev {
                                 agent.record_input(key, &outcome);
                             }
                             self.pending_effects.append(&mut agent.pending_effects);

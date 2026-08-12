@@ -26,6 +26,15 @@ pub(crate) enum RecoveredStore {
     AuthProvider,
 }
 
+/// Secret-free credential provenance captured while the failed provider
+/// request was assembled. Recovery UI must use this snapshot rather than
+/// re-resolving mutable model/store/environment state after the 401.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderAuthRequestProvenance {
+    pub(crate) remedy: crate::auth::providers::ProviderAuthRemedy,
+    pub(crate) model_environment_variable: Option<String>,
+}
+
 /// Recovery decision returned by
 /// `SessionActor::handle_sampling_failure` for the sampler-based
 /// turn loop.
@@ -41,6 +50,7 @@ pub(crate) enum SamplerFailureRecovery {
     RefreshAuthAndResubmit {
         credential: xai_grok_sampling_types::SentCredential,
         store: RecoveredStore,
+        provider_auth: Option<ProviderAuthRequestProvenance>,
     },
 }
 
@@ -60,6 +70,7 @@ pub(crate) enum SamplerTurnOutcome {
     RefreshAuthAndResubmit {
         credential: xai_grok_sampling_types::SentCredential,
         store: RecoveredStore,
+        provider_auth: Option<ProviderAuthRequestProvenance>,
     },
 }
 

@@ -311,6 +311,7 @@
             &RetryState::Failed {
                 error_type: DISK_FULL_ERROR_TYPE.into(),
                 message: DISK_FULL_USER_MESSAGE.into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback,
@@ -370,6 +371,7 @@
             &RetryState::Failed {
                 error_type: "api".into(),
                 message: "status 403: run out of credits".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -401,6 +403,7 @@
                 message:
                     "API error (status 402 Payment Required): Grok Build usage balance exhausted"
                         .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -426,6 +429,7 @@
             &RetryState::Failed {
                 error_type: "api".into(),
                 message: "internal server error".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -483,6 +487,7 @@
                 message: "Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/messages: \
                           no auth context"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -504,17 +509,127 @@
             &RetryState::Failed {
                 error_type: "provider_auth:anthropic".into(),
                 message: "Unauthorized (401)".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback,
             false,
         );
-        let Some(SessionEvent::ProviderReAuthRequired { provider }) =
+        let Some(SessionEvent::ProviderReAuthRequired { provider, .. }) =
             last_session_event(&scrollback)
         else {
             panic!("provider 401 must keep its provider identity");
         };
         assert_eq!(provider, "anthropic");
+    }
+
+    #[test]
+    fn structured_stored_key_failure_preserves_prompt_for_same_method_reauth() {
+        let mut session = make_session(Some("s1"));
+        session.in_flight_prompt = Some(InFlightPrompt {
+            text: "retry after replacement".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(91),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "provider_auth:anthropic".into(),
+                message: "Unauthorized (401)".into(),
+                provider_auth: Some(xai_acp_lib::ProviderAuthRemedy {
+                    provider: "anthropic".into(),
+                    provider_display_name: "Anthropic".into(),
+                    method: xai_acp_lib::ProviderAuthMethod::ApiKey,
+                    source: xai_acp_lib::ProviderAuthSource::StoredApiKey,
+                }),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        assert!(session.in_flight_prompt.is_some());
+        let Some(SessionEvent::ProviderReAuthRequired {
+            remedy: Some(remedy),
+            ..
+        }) = last_session_event(&scrollback)
+        else {
+            panic!("expected structured provider remedy");
+        };
+        assert_eq!(
+            remedy.automatic_login_method(),
+            Some(xai_acp_lib::ProviderAuthMethod::ApiKey)
+        );
+        assert!(
+            last_session_event(&scrollback)
+                .unwrap()
+                .message()
+                .contains("Secure API-key replacement")
+        );
+    }
+
+    #[test]
+    fn environment_and_model_byok_failures_are_guidance_only() {
+        for (source, expected) in [
+            (
+                xai_acp_lib::ProviderAuthSource::Environment {
+                    variable: "ANTHROPIC_API_KEY".into(),
+                },
+                "ANTHROPIC_API_KEY",
+            ),
+            (
+                xai_acp_lib::ProviderAuthSource::Model {
+                    environment_variable: Some("MODEL_PROVIDER_API_KEY".into()),
+                },
+                "MODEL_PROVIDER_API_KEY",
+            ),
+            (
+                xai_acp_lib::ProviderAuthSource::Model {
+                    environment_variable: None,
+                },
+                "model's `api_key`/`env_key`",
+            ),
+        ] {
+            let mut session = make_session(Some("s1"));
+            session.in_flight_prompt = Some(InFlightPrompt {
+                text: "must not auto retry".into(),
+                images: Vec::new(),
+                scrollback_entry: EntryId::new(92),
+                combined_scrollback_entries: Vec::new(),
+                chip_elements: Vec::new(),
+            });
+            let mut scrollback = ScrollbackState::new();
+            apply_retry_state(
+                &RetryState::Failed {
+                    error_type: "provider_auth:anthropic".into(),
+                    message: "Unauthorized (401)".into(),
+                    provider_auth: Some(xai_acp_lib::ProviderAuthRemedy {
+                        provider: "anthropic".into(),
+                        provider_display_name: "Anthropic".into(),
+                        method: xai_acp_lib::ProviderAuthMethod::ApiKey,
+                        source,
+                    }),
+                },
+                &mut session,
+                &mut scrollback,
+                false,
+            );
+            assert!(
+                session.in_flight_prompt.is_none(),
+                "guidance-only sources must not retain an automatic retry prompt"
+            );
+            let event = last_session_event(&scrollback).unwrap();
+            assert!(event.message().contains(expected));
+            let SessionEvent::ProviderReAuthRequired {
+                remedy: Some(remedy),
+                ..
+            } = event
+            else {
+                panic!("expected source-aware provider event");
+            };
+            assert_eq!(remedy.automatic_login_method(), None);
+        }
     }
 
     /// A recoverable auth failure preserves `in_flight_prompt` so the
@@ -534,6 +649,7 @@
             &RetryState::Failed {
                 error_type: "auth".into(),
                 message: "Unauthorized (401) from https://proxy/v1/messages".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -555,6 +671,7 @@
                 error_type: "api".into(),
                 message: "Unauthorized (401) from https://proxy/v1/responses: invalid credentials"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -576,6 +693,7 @@
                 message: "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
                           run `grok logout` then `grok login`"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -595,6 +713,7 @@
             &RetryState::Failed {
                 error_type: "api".into(),
                 message: r#"API error (status 500 Internal Server Error): {"error":"upstream exploded"}"#.into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -624,6 +743,7 @@
                 error_type: "api".into(),
                 message: "API error (status 403 Forbidden): Access to the chat endpoint is denied"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback,
@@ -655,6 +775,7 @@
                 message: "API error (status 500): the prompt is too long for this model's \
                           context window"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -679,6 +800,7 @@
                 message: "API error (status 500): the prompt is too long for this model's \
                           context window"
                     .into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback,
@@ -706,6 +828,7 @@
             &RetryState::Failed {
                 error_type: "context_length".into(),
                 message: "the prompt is too long for this model's context window".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -979,6 +1102,7 @@
             &RetryState::Failed {
                 error_type: "encrypted_content_mismatch".into(),
                 message: "incompatible history".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);
@@ -998,6 +1122,7 @@
             &RetryState::Failed {
                 error_type: "api_400".into(),
                 message: "bad request".into(),
+                provider_auth: None,
             },
             &mut session,
             &mut scrollback, false);

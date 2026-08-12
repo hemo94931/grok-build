@@ -1,5 +1,123 @@
 use super::*;
 
+/// Handle the dedicated provider API-key reverse request.
+///
+/// The secret bytes live only inside `ProviderSecretState` and its ACP response
+/// channel; the ordinary prompt/question/annotation path is never involved.
+pub(crate) fn handle_prompt_secret(
+    ext: xai_acp_lib::AcpArgs<acp::ExtRequest>,
+    app: &mut AppView,
+) -> bool {
+    let mut request: xai_acp_lib::PromptSecretRequest =
+        match serde_json::from_str(ext.request.params.get()) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::error!(%error, "failed to parse provider promptSecret metadata");
+                ext.response_tx
+                    .send(Err(acp::Error::invalid_params()
+                        .data("invalid secure provider API-key prompt metadata")))
+                    .ok();
+                return false;
+            }
+        };
+    if request.provider.trim().is_empty()
+        || request.provider_display_name.trim().is_empty()
+        || request.session_id.trim().is_empty()
+    {
+        ext.response_tx
+            .send(Err(acp::Error::invalid_params().data(
+                "provider, providerDisplayName, and sessionId are required",
+            )))
+            .ok();
+        return false;
+    }
+
+    let Some(id) = interaction_target_agent(app, &request.session_id) else {
+        tracing::info!(
+            session_id = %request.session_id,
+            provider = %request.provider,
+            "provider promptSecret has no local view; cancelling"
+        );
+        send_prompt_secret_cancelled(ext.response_tx);
+        return false;
+    };
+    let is_active = is_matched_agent_active(app, id);
+    if !is_active {
+        tracing::info!(
+            session_id = %request.session_id,
+            provider = %request.provider,
+            "provider promptSecret target is no longer active; cancelling"
+        );
+        send_prompt_secret_cancelled(ext.response_tx);
+        return false;
+    }
+    let Some(agent) = app.agents.get_mut(&id) else {
+        send_prompt_secret_cancelled(ext.response_tx);
+        return false;
+    };
+
+    let Some(pending) = agent.pending_provider_login.as_ref() else {
+        tracing::info!(
+            provider = %request.provider,
+            request_seq = request.request_seq,
+            "provider promptSecret has no matching login request; cancelling"
+        );
+        send_prompt_secret_cancelled(ext.response_tx);
+        return false;
+    };
+    let matches_pending = pending.provider == request.provider
+        && pending.method == xai_acp_lib::ProviderAuthMethod::ApiKey
+        && request
+            .request_seq
+            .is_none_or(|request_seq| request_seq == pending.request_seq);
+    if !matches_pending {
+        tracing::info!(
+            provider = %request.provider,
+            request_seq = request.request_seq,
+            "stale provider promptSecret request; cancelling"
+        );
+        send_prompt_secret_cancelled(ext.response_tx);
+        return false;
+    }
+    if pending.cancelled {
+        agent.pending_provider_login = None;
+        send_prompt_secret_cancelled(ext.response_tx);
+        return true;
+    }
+    // Older shells may omit requestSeq. Once matched to the single active
+    // attempt, normalize the local state to the exact sequence so submit/Esc
+    // can release ownership and cancellation remains request-scoped.
+    request.request_seq = Some(pending.request_seq);
+
+    agent.cancel_provider_secret();
+    // A stale picker/modal must not visually cover the secret state while the
+    // secret state already owns all input.
+    agent.active_modal = None;
+    agent.provider_secret = Some(crate::app::provider_auth::ProviderSecretState::new(
+        request,
+        ext.response_tx,
+    ));
+    agent.last_active_at = Some(std::time::Instant::now());
+    tracing::info!(
+        provider = %agent
+            .provider_secret
+            .as_ref()
+            .map(|state| state.request.provider.as_str())
+            .unwrap_or("unknown"),
+        target_active = is_active,
+        "opened secure provider API-key input"
+    );
+    is_active
+}
+
+fn send_prompt_secret_cancelled(
+    response_tx: tokio::sync::oneshot::Sender<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+) {
+    let raw = serde_json::value::to_raw_value(&xai_acp_lib::PromptSecretResponse::Cancelled)
+        .expect("serialize cancelled provider secret response");
+    response_tx.send(Ok(acp::ExtResponse::new(raw.into()))).ok();
+}
+
 /// Handle `x.ai/ask_user_question` ext-method.
 ///
 /// Parses the typed request, creates a `QuestionViewState` with the

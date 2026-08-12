@@ -3,7 +3,7 @@
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
 
-use super::providers::{normalize_provider, provider_items};
+use super::providers::{normalize_known_provider, provider_items};
 
 pub struct LogoutCommand;
 
@@ -37,9 +37,9 @@ impl SlashCommand for LogoutCommand {
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
-        match normalize_provider(args) {
-            Some("xai") => CommandResult::Action(Action::Logout),
-            Some(provider) => CommandResult::Action(Action::ProviderLogout(provider.to_owned())),
+        match normalize_known_provider(args) {
+            Some(provider) if provider == "xai" => CommandResult::Action(Action::Logout),
+            Some(provider) => CommandResult::Action(Action::ProviderLogout(provider)),
             None => CommandResult::Error(format!("Unknown provider: {}", args.trim())),
         }
     }

@@ -1,6 +1,203 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
+    fn arm_provider_api_key_login(app: &mut AppView, agent_id: AgentId) {
+        app.agents
+            .get_mut(&agent_id)
+            .unwrap()
+            .pending_provider_login = Some(crate::app::provider_auth::PendingProviderLogin {
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: xai_acp_lib::ProviderAuthMethod::ApiKey,
+            request_seq: 9,
+            owns_input: true,
+            cancelled: false,
+        });
+    }
+
+    fn prompt_secret_message(
+        session_id: &str,
+    ) -> (
+        AcpClientMessage,
+        tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+    ) {
+        prompt_secret_message_with_seq(session_id, Some(9))
+    }
+
+    fn prompt_secret_message_with_seq(
+        session_id: &str,
+        request_seq: Option<u64>,
+    ) -> (
+        AcpClientMessage,
+        tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = xai_acp_lib::PromptSecretRequest {
+            provider: "anthropic".into(),
+            provider_display_name: "Anthropic".into(),
+            session_id: session_id.into(),
+            prompt: "Enter Anthropic API key".into(),
+            request_seq,
+        };
+        let raw = serde_json::value::to_raw_value(&request).unwrap();
+        (
+            AcpClientMessage::ExtMethod(xai_acp_lib::AcpArgs {
+                request: acp::ExtRequest::new(xai_acp_lib::PROMPT_SECRET_METHOD, raw.into()),
+                response_tx: tx,
+            }),
+            rx,
+        )
+    }
+
+    #[test]
+    fn prompt_secret_routes_through_dedicated_state_and_preserves_prompt_draft() {
+        let mut app = make_app_with_agent("sess-1");
+        arm_provider_api_key_login(&mut app, AgentId(0));
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .prompt
+            .set_text("ordinary draft");
+        let (message, rx) = prompt_secret_message("sess-1");
+        assert!(handle(message, &mut app));
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        assert!(agent.provider_secret.is_some());
+        assert!(agent.question_view.is_none());
+        let registry = crate::actions::ActionRegistry::defaults();
+        agent.handle_input(
+            &crossterm::event::Event::Paste("sk-dedicated-secret".into()),
+            &registry,
+        );
+        agent.handle_input(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &registry,
+        );
+        assert!(agent.provider_secret.is_none());
+        assert_eq!(agent.prompt.text(), "ordinary draft");
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "accepted");
+        assert_eq!(json["secret"], "sk-dedicated-secret");
+        assert!(json.get("annotations").is_none());
+    }
+
+    #[test]
+    fn pre_cancelled_provider_login_rejects_late_prompt_secret() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .pending_provider_login = Some(crate::app::provider_auth::PendingProviderLogin {
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: xai_acp_lib::ProviderAuthMethod::ApiKey,
+            request_seq: 9,
+            owns_input: true,
+            cancelled: true,
+        });
+        let (message, rx) = prompt_secret_message("sess-1");
+        assert!(handle(message, &mut app));
+        assert!(app.agents[&AgentId(0)].provider_secret.is_none());
+        assert!(app.agents[&AgentId(0)].pending_provider_login.is_none());
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn replacing_or_cancelling_prompt_secret_replies_cancelled() {
+        let mut app = make_app_with_agent("sess-1");
+        arm_provider_api_key_login(&mut app, AgentId(0));
+        let (first, first_rx) = prompt_secret_message("sess-1");
+        handle(first, &mut app);
+        let (second, second_rx) = prompt_secret_message("sess-1");
+        handle(second, &mut app);
+        let first_response = first_rx.blocking_recv().unwrap().unwrap();
+        let first_json: serde_json::Value =
+            serde_json::from_str(first_response.0.get()).unwrap();
+        assert_eq!(first_json["outcome"], "cancelled");
+
+        let registry = crate::actions::ActionRegistry::defaults();
+        app.agents.get_mut(&AgentId(0)).unwrap().handle_input(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &registry,
+        );
+        let second_response = second_rx.blocking_recv().unwrap().unwrap();
+        let second_json: serde_json::Value =
+            serde_json::from_str(second_response.0.get()).unwrap();
+        assert_eq!(second_json["outcome"], "cancelled");
+        assert!(app.agents[&AgentId(0)].provider_secret.is_none());
+    }
+
+    #[test]
+    fn prompt_secret_without_pending_login_cancels_without_opening_input() {
+        let mut app = make_app_with_agent("sess-1");
+        let (message, rx) = prompt_secret_message("sess-1");
+        assert!(!handle(message, &mut app));
+        assert!(app.agents[&AgentId(0)].provider_secret.is_none());
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn missing_reverse_request_sequence_is_normalized_to_the_active_login() {
+        let mut app = make_app_with_agent("sess-1");
+        arm_provider_api_key_login(&mut app, AgentId(0));
+        let (message, rx) = prompt_secret_message_with_seq("sess-1", None);
+        assert!(handle(message, &mut app));
+        let registry = crate::actions::ActionRegistry::defaults();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.provider_secret.as_ref().unwrap().request.request_seq,
+            Some(9)
+        );
+        agent.handle_input(
+            &crossterm::event::Event::Paste("sk-dedicated-secret".into()),
+            &registry,
+        );
+        agent.handle_input(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &registry,
+        );
+        assert!(!agent.pending_provider_login.as_ref().unwrap().owns_input);
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "accepted");
+    }
+
+    #[test]
+    fn prompt_secret_for_unknown_session_cancels_without_fallback() {
+        let mut app = make_app_with_agent("sess-1");
+        let (message, rx) = prompt_secret_message("missing-session");
+        assert!(!handle(message, &mut app));
+        assert!(app.agents[&AgentId(0)].provider_secret.is_none());
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn prompt_secret_racing_with_a_view_switch_cancels_instead_of_parking() {
+        let mut app = make_app_two_agents();
+        switch_active_to(&mut app, AgentId(1));
+        let (message, rx) = prompt_secret_message("sess-1");
+        assert!(!handle(message, &mut app));
+        assert!(app.agents[&AgentId(0)].provider_secret.is_none());
+        let response = rx.blocking_recv().unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+        assert_eq!(json["outcome"], "cancelled");
+    }
+
     #[test]
     fn interaction_resolved_dismisses_matching_permission() {
         // A peer answered a shared permission → this pane retracts its copy.

@@ -366,6 +366,7 @@ fn e2e_compact_auth_failure_holds_prompt_and_resubmits_after_login() {
             &XaiSessionUpdate::RetryState(RetryState::Failed {
                 error_type: "auth".into(),
                 message: "Unauthorized (401): compaction failed".into(),
+                provider_auth: None,
             }),
             &mut agent.session,
             &mut agent.scrollback,
@@ -417,6 +418,839 @@ fn e2e_compact_auth_failure_holds_prompt_and_resubmits_after_login() {
             Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
         )),
         "AuthComplete must resubmit the prompt so compact runs again with valid auth, got: {effects:?}"
+    );
+}
+
+#[test]
+fn bare_provider_login_opens_metadata_driven_method_picker() {
+    use crate::app::provider_auth::{ProviderAuthInfo, ProviderLoginIntent};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id =
+        Some(acp::SessionId::new("provider-picker"));
+    let effects = dispatch(Action::ProviderLogin(ProviderLoginIntent::Menu), &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderAuthInfo {
+            agent_id: AgentId(0),
+            intent: ProviderLoginIntent::Menu,
+        }]
+    ));
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::ProviderAuthInfoComplete {
+            agent_id: AgentId(0),
+            intent: ProviderLoginIntent::Menu,
+            result: Ok(vec![
+                ProviderAuthInfo {
+                    id: "anthropic".into(),
+                    display_name: "Anthropic".into(),
+                    supported_methods: vec![ProviderAuthMethod::OAuth, ProviderAuthMethod::ApiKey],
+                    authenticated: false,
+                    credential_type: None,
+                    model_count: 2,
+                },
+                ProviderAuthInfo {
+                    id: "openai-codex".into(),
+                    display_name: "OpenAI Codex".into(),
+                    supported_methods: vec![ProviderAuthMethod::OAuth],
+                    authenticated: false,
+                    credential_type: None,
+                    model_count: 1,
+                },
+            ]),
+        }),
+        &mut app,
+    );
+    let Some(crate::views::modal::ActiveModal::ArgPicker {
+        command,
+        original_items,
+        ..
+    }) = app.agents[&AgentId(0)].active_modal.as_ref()
+    else {
+        panic!("bare /login must open the method picker");
+    };
+    assert_eq!(command, "login");
+    assert_eq!(original_items.len(), 4);
+    assert_eq!(original_items[0].insert_text, "xai");
+    assert!(
+        original_items
+            .iter()
+            .any(|item| item.insert_text == "anthropic --api-key")
+    );
+    assert!(
+        original_items
+            .iter()
+            .any(|item| item.insert_text == "openai-codex --oauth")
+    );
+}
+
+#[test]
+fn explicit_provider_method_is_validated_from_info_before_login_effect() {
+    use crate::app::provider_auth::{ProviderAuthInfo, ProviderLoginIntent};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id =
+        Some(acp::SessionId::new("provider-method"));
+    let providers = vec![ProviderAuthInfo {
+        id: "openai-codex".into(),
+        display_name: "OpenAI Codex".into(),
+        supported_methods: vec![ProviderAuthMethod::OAuth],
+        authenticated: false,
+        credential_type: None,
+        model_count: 1,
+    }];
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderAuthInfoComplete {
+            agent_id: AgentId(0),
+            intent: ProviderLoginIntent::Provider {
+                provider: "openai-codex".into(),
+                method: Some(ProviderAuthMethod::ApiKey),
+            },
+            result: Ok(providers.clone()),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderAuthInfoComplete {
+            agent_id: AgentId(0),
+            intent: ProviderLoginIntent::Provider {
+                provider: "openai-codex".into(),
+                method: Some(ProviderAuthMethod::OAuth),
+            },
+            result: Ok(providers),
+        }),
+        &mut app,
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ProviderLogin {
+            provider,
+            method: ProviderAuthMethod::OAuth,
+            ..
+        } if provider == "openai-codex"
+    )));
+}
+
+#[test]
+fn stored_provider_failure_waits_for_prompt_stash_then_reopens_same_method() {
+    use crate::app::acp_handler::apply_session_event_for_test;
+    use crate::app::agent::{AgentState, InFlightPrompt};
+    use crate::app::provider_auth::{PendingProviderReauth, ProviderLoginSuccess};
+    use crate::scrollback::EntryId;
+    use xai_acp_lib::{ProviderAuthMethod, ProviderAuthRemedy, ProviderAuthSource};
+    use xai_grok_shell::extensions::notification::{RetryState, SessionUpdate as XaiSessionUpdate};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let remedy = ProviderAuthRemedy {
+        provider: "anthropic".into(),
+        provider_display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        source: ProviderAuthSource::StoredApiKey,
+    };
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-provider-key"));
+        agent.session.current_prompt_id = Some("prompt-key".into());
+        agent.session.in_flight_prompt = Some(InFlightPrompt {
+            text: "retry with replacement key".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(101),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        apply_session_event_for_test(
+            &XaiSessionUpdate::RetryState(RetryState::Failed {
+                error_type: "provider_auth:anthropic".into(),
+                message: "Unauthorized (401)".into(),
+                provider_auth: Some(remedy.clone()),
+            }),
+            &mut agent.session,
+            &mut agent.scrollback,
+        );
+        agent.pending_provider_reauth = Some(PendingProviderReauth {
+            prompt_id: Some("prompt-key".into()),
+            remedy: remedy.clone(),
+        });
+        assert!(agent.reauth_stashed_prompt.is_none());
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".into()),
+            http_status: Some(401),
+            prompt_id: Some("prompt-key".into()),
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id]
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
+        Some("retry with replacement key")
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ProviderLogin {
+            provider,
+            method: ProviderAuthMethod::ApiKey,
+            ..
+        } if provider == "anthropic"
+    )));
+
+    let auth_state_before = std::mem::discriminant(&app.auth_state);
+    let login_method_before = app.login_method_id.clone();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderLoginComplete {
+            agent_id: id,
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: ProviderAuthMethod::ApiKey,
+            request_seq: 1,
+            result: Ok(ProviderLoginSuccess {
+                provider: "anthropic".into(),
+                display_name: "Anthropic".into(),
+                method: ProviderAuthMethod::ApiKey,
+                message: "API key saved for Anthropic.".into(),
+                catalog_refreshed: None,
+            }),
+        }),
+        &mut app,
+    );
+    assert!(app.agents[&id].reauth_stashed_prompt.is_none());
+    assert_eq!(std::mem::discriminant(&app.auth_state), auth_state_before);
+    assert_eq!(app.login_method_id, login_method_before);
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::FetchBilling { .. } | Effect::CheckSubscription { .. }
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+    )));
+}
+
+#[test]
+fn provider_reauth_cancel_or_failure_never_resends_stashed_prompt() {
+    use crate::app::agent::InFlightPrompt;
+    use crate::scrollback::EntryId;
+    use xai_acp_lib::ProviderAuthMethod;
+
+    for error in ["login cancelled", "provider login failed"] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.reauth_stashed_prompt = Some(InFlightPrompt {
+            text: "must not resend".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(105),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        agent.pending_provider_login = Some(crate::app::provider_auth::PendingProviderLogin {
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: ProviderAuthMethod::ApiKey,
+            request_seq: 1,
+            owns_input: false,
+            cancelled: false,
+        });
+        let auth_state_before = std::mem::discriminant(&app.auth_state);
+        let effects = dispatch(
+            Action::TaskComplete(TaskResult::ProviderLoginComplete {
+                agent_id: id,
+                provider: "anthropic".into(),
+                display_name: "Anthropic".into(),
+                method: ProviderAuthMethod::ApiKey,
+                request_seq: 1,
+                result: Err(error.into()),
+            }),
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        assert!(app.agents[&id].reauth_stashed_prompt.is_none());
+        assert_eq!(std::mem::discriminant(&app.auth_state), auth_state_before);
+    }
+}
+
+#[test]
+fn cancelled_provider_login_ignores_a_racing_success() {
+    use crate::app::agent::InFlightPrompt;
+    use crate::app::provider_auth::PendingProviderLogin;
+    use crate::scrollback::EntryId;
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.reauth_stashed_prompt = Some(InFlightPrompt {
+        text: "must not resend after cancel".into(),
+        images: Vec::new(),
+        scrollback_entry: EntryId::new(106),
+        combined_scrollback_entries: Vec::new(),
+        chip_elements: Vec::new(),
+    });
+    agent.pending_provider_login = Some(PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 7,
+        owns_input: false,
+        cancelled: true,
+    });
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderLoginComplete {
+            agent_id: id,
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: ProviderAuthMethod::ApiKey,
+            request_seq: 7,
+            result: Ok(crate::app::provider_auth::ProviderLoginSuccess {
+                provider: "anthropic".into(),
+                display_name: "Anthropic".into(),
+                method: ProviderAuthMethod::ApiKey,
+                message: "API key saved for Anthropic.".into(),
+                catalog_refreshed: None,
+            }),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.agents[&id].reauth_stashed_prompt.is_none());
+    assert!(app.agents[&id].pending_provider_login.is_none());
+}
+
+#[test]
+fn stored_oauth_failure_reopens_oauth_after_prompt_is_stashed() {
+    use crate::app::agent::{AgentState, InFlightPrompt};
+    use crate::app::provider_auth::PendingProviderReauth;
+    use crate::scrollback::EntryId;
+    use crate::scrollback::block::RenderBlock;
+    use xai_acp_lib::{ProviderAuthMethod, ProviderAuthRemedy, ProviderAuthSource};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let remedy = ProviderAuthRemedy {
+        provider: "anthropic".into(),
+        provider_display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::OAuth,
+        source: ProviderAuthSource::StoredOAuth,
+    };
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-provider-oauth"));
+        agent.session.current_prompt_id = Some("prompt-oauth".into());
+        agent.session.in_flight_prompt = Some(InFlightPrompt {
+            text: "retry after OAuth".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(104),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        agent.scrollback.push_block(RenderBlock::session_event(
+            SessionEvent::ProviderReAuthRequired {
+                provider: "anthropic".into(),
+                remedy: Some(remedy.clone()),
+            },
+        ));
+        agent.pending_provider_reauth = Some(PendingProviderReauth {
+            prompt_id: Some("prompt-oauth".into()),
+            remedy,
+        });
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".into()),
+            http_status: Some(401),
+            prompt_id: Some("prompt-oauth".into()),
+        }),
+        &mut app,
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ProviderLogin {
+            method: ProviderAuthMethod::OAuth,
+            ..
+        }
+    )));
+    assert_eq!(
+        app.agents[&id]
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
+        Some("retry after OAuth")
+    );
+}
+
+#[test]
+fn provider_retry_notification_after_prompt_response_still_opens_same_method() {
+    use crate::app::agent::{AgentState, InFlightPrompt};
+    use crate::scrollback::EntryId;
+    use xai_acp_lib::{ProviderAuthMethod, ProviderAuthRemedy, ProviderAuthSource};
+    use xai_grok_shell::extensions::notification::{
+        RetryState, SessionNotification, SessionUpdate as XaiSessionUpdate,
+    };
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-provider-late"));
+        agent.session.current_prompt_id = Some("prompt-late".into());
+        agent.session.in_flight_prompt = Some(InFlightPrompt {
+            text: "stash before remedy arrives".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(103),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".into()),
+            http_status: Some(401),
+            prompt_id: Some("prompt-late".into()),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(
+        app.agents[&id]
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
+        Some("stash before remedy arrives")
+    );
+
+    let payload = SessionNotification {
+        session_id: acp::SessionId::new("sess-provider-late"),
+        update: XaiSessionUpdate::RetryState(RetryState::Failed {
+            error_type: "provider_auth:anthropic".into(),
+            message: "Unauthorized (401)".into(),
+            provider_auth: Some(ProviderAuthRemedy {
+                provider: "anthropic".into(),
+                provider_display_name: "Anthropic".into(),
+                method: ProviderAuthMethod::ApiKey,
+                source: ProviderAuthSource::StoredApiKey,
+            }),
+        }),
+        meta: None,
+    };
+    let raw = serde_json::value::to_raw_value(&payload).unwrap();
+    let notification =
+        acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+    assert!(
+        crate::app::acp_handler::handle_session_notification_for_test(&notification, &mut app,)
+    );
+    assert!(app.pending_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ProviderLogin {
+            provider,
+            method: ProviderAuthMethod::ApiKey,
+            ..
+        } if provider == "anthropic"
+    )));
+    assert!(app.agents[&id].pending_provider_reauth.is_none());
+}
+
+#[test]
+fn replacing_api_key_login_cancels_old_reverse_request_and_sequence() {
+    use crate::app::provider_auth::{PendingProviderLogin, ProviderSecretState};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.pending_provider_login = Some(PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 77,
+        owns_input: true,
+        cancelled: false,
+    });
+    agent.provider_secret = Some(ProviderSecretState::new(
+        xai_acp_lib::PromptSecretRequest {
+            provider: "anthropic".into(),
+            provider_display_name: "Anthropic".into(),
+            session_id: "test-session".into(),
+            prompt: "Enter API key".into(),
+            request_seq: Some(77),
+        },
+        response_tx,
+    ));
+
+    let effects = crate::app::dispatch::provider_auth::start_provider_login(
+        &mut app,
+        id,
+        "openrouter".into(),
+        "OpenRouter".into(),
+        ProviderAuthMethod::ApiKey,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            Effect::ProviderLoginCancel {
+                provider: old_provider,
+                request_seq: 77,
+                ..
+            },
+            Effect::ProviderLogin {
+                provider: new_provider,
+                request_seq: 1,
+                ..
+            }
+        ] if old_provider == "anthropic" && new_provider == "openrouter"
+    ));
+    let response = response_rx.blocking_recv().unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(json["outcome"], "cancelled");
+    let pending = app.agents[&id].pending_provider_login.as_ref().unwrap();
+    assert_eq!(pending.provider, "openrouter");
+    assert_eq!(pending.request_seq, 1);
+    assert!(pending.owns_input);
+}
+
+#[test]
+fn api_key_login_can_be_cancelled_before_reverse_secret_request_arrives() {
+    use crate::app::provider_auth::PendingProviderLogin;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.prompt.set_text("keep this draft");
+    agent.pending_provider_login = Some(PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 77,
+        owns_input: true,
+        cancelled: false,
+    });
+    let _ = app.handle_input(&Event::Paste("sk-typeahead-must-not-leak".into()));
+    let _ = app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.agents[&id].prompt.text(), "keep this draft");
+    assert!(app.agents[&id].input_log.snapshot_entries().is_empty());
+
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    let crate::app::app_view::InputOutcome::Action(action @ Action::ProviderLoginCancel { .. }) =
+        outcome
+    else {
+        panic!("Esc must produce a provider-scoped cancel action");
+    };
+    let effects = dispatch(action, &mut app);
+    assert!(
+        app.agents[&id]
+            .pending_provider_login
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderLoginCancel {
+            agent_id: AgentId(0),
+            provider,
+            request_seq: 77,
+        }] if provider == "anthropic"
+    ));
+}
+
+#[test]
+fn secret_escape_cancels_response_and_request_sequence() {
+    use crate::app::provider_auth::{PendingProviderLogin, ProviderSecretState};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.pending_provider_login = Some(PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 77,
+        owns_input: true,
+        cancelled: false,
+    });
+    agent.provider_secret = Some(ProviderSecretState::new(
+        xai_acp_lib::PromptSecretRequest {
+            provider: "anthropic".into(),
+            provider_display_name: "Anthropic".into(),
+            session_id: "s1".into(),
+            prompt: "Enter API key".into(),
+            request_seq: Some(77),
+        },
+        tx,
+    ));
+
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    let crate::app::app_view::InputOutcome::Action(action) = outcome else {
+        panic!("Esc must cancel both the reverse prompt and provider request");
+    };
+    let effects = dispatch(action, &mut app);
+    assert!(app.agents[&id].provider_secret.is_none());
+    assert!(
+        app.agents[&id]
+            .pending_provider_login
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderLoginCancel {
+            request_seq: 77,
+            ..
+        }]
+    ));
+    let response = rx.blocking_recv().unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(json["outcome"], "cancelled");
+}
+
+#[test]
+fn stale_provider_login_result_cannot_clear_a_newer_attempt() {
+    use crate::app::provider_auth::PendingProviderLogin;
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().pending_provider_login = Some(PendingProviderLogin {
+        provider: "openrouter".into(),
+        display_name: "OpenRouter".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 88,
+        owns_input: true,
+        cancelled: false,
+    });
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderLoginComplete {
+            agent_id: id,
+            provider: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            method: ProviderAuthMethod::ApiKey,
+            request_seq: 77,
+            result: Err("login cancelled".into()),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(
+        app.agents[&id]
+            .pending_provider_login
+            .as_ref()
+            .map(|pending| pending.request_seq),
+        Some(88)
+    );
+}
+
+#[test]
+fn pre_secret_cancel_action_still_cancels_if_reverse_request_wins_the_race() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.agents.get_mut(&id).unwrap().provider_secret =
+        Some(crate::app::provider_auth::ProviderSecretState::new(
+            xai_acp_lib::PromptSecretRequest {
+                provider: "anthropic".into(),
+                provider_display_name: "Anthropic".into(),
+                session_id: "s1".into(),
+                prompt: "Enter API key".into(),
+                request_seq: Some(77),
+            },
+            tx,
+        ));
+
+    let effects = dispatch(
+        Action::ProviderLoginCancel {
+            provider: "anthropic".into(),
+            request_seq: 77,
+        },
+        &mut app,
+    );
+    assert!(app.agents[&id].provider_secret.is_none());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderLoginCancel {
+            agent_id: AgentId(0),
+            provider,
+            request_seq: 77,
+        }] if provider == "anthropic"
+    ));
+    let response = rx.blocking_recv().unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(json["outcome"], "cancelled");
+}
+
+#[test]
+fn secure_provider_input_bypasses_the_input_flight_recorder() {
+    use crate::app::provider_auth::ProviderSecretState;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.agents.get_mut(&id).unwrap().provider_secret = Some(ProviderSecretState::new(
+        xai_acp_lib::PromptSecretRequest {
+            provider: "anthropic".into(),
+            provider_display_name: "Anthropic".into(),
+            session_id: "test-session".into(),
+            prompt: "Enter API key".into(),
+            request_seq: None,
+        },
+        response_tx,
+    ));
+
+    for ch in ['s', 'k', '-', 'x'] {
+        let _ = app.handle_input(&Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+    assert!(app.agents[&id].input_log.snapshot_entries().is_empty());
+    let _ = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(app.agents[&id].input_log.snapshot_entries().is_empty());
+    let response = response_rx.blocking_recv().unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(json["outcome"], "cancelled");
+}
+
+#[test]
+fn switching_views_cancels_secure_provider_input() {
+    use crate::app::provider_auth::{PendingProviderLogin, ProviderSecretState};
+    use xai_acp_lib::ProviderAuthMethod;
+
+    let mut app = test_app_with_agent();
+    let first = AgentId(0);
+    let second = AgentId(1);
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let first_agent = app.agents.get_mut(&first).unwrap();
+    first_agent.pending_provider_login = Some(PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: ProviderAuthMethod::ApiKey,
+        request_seq: 77,
+        owns_input: true,
+        cancelled: false,
+    });
+    first_agent.provider_secret = Some(ProviderSecretState::new(
+        xai_acp_lib::PromptSecretRequest {
+            provider: "anthropic".into(),
+            provider_display_name: "Anthropic".into(),
+            session_id: "test-session".into(),
+            prompt: "Enter API key".into(),
+            request_seq: Some(77),
+        },
+        response_tx,
+    ));
+    let session = make_test_agent_session(&app, second, "second-session");
+    app.agents
+        .insert(second, AgentView::new(session, ScrollbackState::new()));
+
+    switch_to_agent(&mut app, second, SwitchCause::Picker);
+
+    assert!(app.agents[&first].provider_secret.is_none());
+    assert!(
+        app.agents[&first]
+            .pending_provider_login
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+    );
+    assert!(app.pending_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ProviderLoginCancel {
+            agent_id: AgentId(0),
+            request_seq: 77,
+            ..
+        }
+    )));
+    let response = response_rx.blocking_recv().unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(json["outcome"], "cancelled");
+}
+
+#[test]
+fn environment_provider_failure_never_opens_login_or_stashes_retry() {
+    use crate::app::acp_handler::apply_session_event_for_test;
+    use crate::app::agent::{AgentState, InFlightPrompt};
+    use crate::scrollback::EntryId;
+    use xai_acp_lib::{ProviderAuthMethod, ProviderAuthRemedy, ProviderAuthSource};
+    use xai_grok_shell::extensions::notification::{RetryState, SessionUpdate as XaiSessionUpdate};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-provider-env"));
+        agent.session.current_prompt_id = Some("prompt-env".into());
+        agent.session.in_flight_prompt = Some(InFlightPrompt {
+            text: "do not stash".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(102),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        apply_session_event_for_test(
+            &XaiSessionUpdate::RetryState(RetryState::Failed {
+                error_type: "provider_auth:anthropic".into(),
+                message: "Unauthorized (401)".into(),
+                provider_auth: Some(ProviderAuthRemedy {
+                    provider: "anthropic".into(),
+                    provider_display_name: "Anthropic".into(),
+                    method: ProviderAuthMethod::ApiKey,
+                    source: ProviderAuthSource::Environment {
+                        variable: "ANTHROPIC_API_KEY".into(),
+                    },
+                }),
+            }),
+            &mut agent.session,
+            &mut agent.scrollback,
+        );
+        assert!(agent.session.in_flight_prompt.is_none());
+    }
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".into()),
+            http_status: Some(401),
+            prompt_id: Some("prompt-env".into()),
+        }),
+        &mut app,
+    );
+    assert!(app.agents[&id].reauth_stashed_prompt.is_none());
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ProviderLogin { .. }))
     );
 }
 

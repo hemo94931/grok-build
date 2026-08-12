@@ -158,6 +158,23 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
     if matches!(app.active_view, ActiveView::AgentDashboard) {
         return dispatch_exit_dashboard(app);
     }
+    let provider_cancel = if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&id)
+    {
+        agent.cancel_provider_secret();
+        agent
+            .request_provider_login_cancel()
+            .map(|(provider, request_seq)| (id, provider, request_seq))
+    } else {
+        None
+    };
+    if let Some((agent_id, provider, request_seq)) = provider_cancel {
+        app.pending_effects.push(Effect::ProviderLoginCancel {
+            agent_id,
+            provider,
+            request_seq,
+        });
+    }
     // Stamp return target for this visit (clears any prior leftover).
     app.dashboard_return = match app.active_view {
         ActiveView::Agent(id) => Some(DashboardReturn::Agent(id)),

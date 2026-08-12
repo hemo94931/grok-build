@@ -675,6 +675,7 @@ impl ActiveModal {
                 "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
                 "model" | "m" => "Pick model",
                 "theme" | "t" => "Pick theme",
+                "login" => "Choose sign-in method",
                 _ => "Pick option",
             },
             ActiveModal::DocPicker { .. } => "How-to Guides",

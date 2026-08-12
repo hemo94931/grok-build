@@ -131,6 +131,24 @@ pub(super) fn scrollback_has_recent_reauth_prompt(
     })
 }
 
+/// Whether the recent auth prompt can be repaired through an interactive
+/// login flow. Environment and model-scoped BYOK failures are guidance-only:
+/// stashing them for a later provider login could retry a credential that is
+/// still shadowed by the same higher-precedence source.
+pub(super) fn scrollback_has_recent_retryable_reauth_prompt(
+    scrollback: &crate::scrollback::state::ScrollbackState,
+) -> bool {
+    trailing_session_events(scrollback).any(|(_, ev)| match ev {
+        SessionEvent::ReAuthRequired => true,
+        SessionEvent::ProviderReAuthRequired { remedy: None, .. } => true,
+        SessionEvent::ProviderReAuthRequired {
+            remedy: Some(remedy),
+            ..
+        } => remedy.automatic_login_method().is_some(),
+        _ => false,
+    })
+}
+
 /// True if the trailing run of session/system blocks contains a terminal
 /// context-overflow block ([`SessionEvent::ContextTooLarge`] or `CompactionFailed`).
 /// Lets `PromptResponse` suppress the redundant `TurnFailed`, mirroring reauth.

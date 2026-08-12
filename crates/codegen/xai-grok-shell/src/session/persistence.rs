@@ -1935,6 +1935,7 @@ impl SessionPersistence {
             update: XaiSessionUpdate::RetryState(RetryState::Failed {
                 error_type: DISK_FULL_ERROR_TYPE.to_string(),
                 message: DISK_FULL_USER_MESSAGE.to_string(),
+                provider_auth: None,
             }),
             meta: None,
         };

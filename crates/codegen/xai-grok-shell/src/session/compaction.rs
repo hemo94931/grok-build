@@ -365,7 +365,8 @@ impl SessionActor {
         let (sampling_config, client) = match self.prepare_builtin_compaction_sampling().await {
             Ok(value) => value,
             Err(e) => {
-                tracing::warn!(error = %e, "two_pass: failed to prepare sampling client");
+                let error = xai_acp_lib::redact_provider_auth_error(&e.to_string());
+                tracing::warn!(%error, "two_pass: failed to prepare sampling client");
                 return None;
             }
         };
@@ -900,9 +901,11 @@ impl SessionActor {
             )
             .await
         {
+            let e = Self::redact_acp_error(e);
             let span = tracing::Span::current();
             span.record("success", false);
-            span.record("error", e.to_string().as_str());
+            let error = xai_acp_lib::redact_provider_auth_error(&e.to_string());
+            span.record("error", error.as_str());
             return Err(e);
         }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
@@ -1022,9 +1025,38 @@ impl SessionActor {
             SuppressReason::Other
         }
     }
+    fn redact_acp_error(mut err: acp::Error) -> acp::Error {
+        fn redact_json_strings(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(value) => {
+                    *value = xai_acp_lib::redact_provider_auth_error(value);
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        redact_json_strings(value);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for value in values.values_mut() {
+                        redact_json_strings(value);
+                    }
+                }
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => {}
+            }
+        }
+
+        err.message = xai_acp_lib::redact_provider_auth_error(&err.message);
+        if let Some(data) = err.data.as_mut() {
+            redact_json_strings(data);
+        }
+        err
+    }
+
     /// ACP error payload string (plain string or `{message, ...}`).
     fn acp_error_message(err: &acp::Error) -> String {
-        match err.data.as_ref() {
+        let message = match err.data.as_ref() {
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(obj) => obj
                 .get("message")
@@ -1032,7 +1064,8 @@ impl SessionActor {
                 .map(str::to_owned)
                 .unwrap_or_else(|| obj.to_string()),
             None => err.message.clone(),
-        }
+        };
+        xai_acp_lib::redact_provider_auth_error(&message)
     }
     /// Auth/401 compact failure — abort for reauth resubmit; don't sample oversized.
     pub(crate) fn is_auth_compact_error(err: &acp::Error) -> bool {
@@ -1043,16 +1076,34 @@ impl SessionActor {
     }
     /// Terminal auth compact failure: emit RetryState auth (reauth stash) + auth_required.
     /// Separate from `AutoCompactFailed` (user-facing); this aborts the turn.
-    pub(crate) async fn surface_compact_auth_failure(&self, err: acp::Error) -> acp::Error {
+    pub(crate) async fn surface_compact_auth_failure(
+        &self,
+        err: acp::Error,
+        provider_provenance: Option<&crate::session::acp_session::ProviderAuthRequestProvenance>,
+    ) -> acp::Error {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let detailed = Self::acp_error_message(&err);
-        let message = if detailed.to_ascii_lowercase().contains("unauthorized") {
+        let base_message = if detailed.to_ascii_lowercase().contains("unauthorized") {
             detailed
         } else {
             format!(
                 "Unauthorized (401): compaction failed — re-authenticate with /login \
                  and retry. ({detailed})"
             )
+        };
+        // Only attach a provider remedy when the caller owns a request-time
+        // credential snapshot. Paths without one remain generic rather than
+        // re-resolving mutable model/environment state after the failure.
+        let (error_type, message, provider_auth) = match provider_provenance {
+            Some(provenance) => {
+                let remedy = provenance.remedy;
+                (
+                    format!("provider_auth:{}", remedy.provider.as_str()),
+                    format!("{base_message}\n\n{}", remedy.advice()),
+                    Some(Self::provider_auth_wire_remedy(provenance)),
+                )
+            }
+            None => ("auth".to_owned(), base_message, None),
         };
         tracing::warn!(
             session_id = %self.session_info.id.0,
@@ -1068,8 +1119,9 @@ impl SessionActor {
         );
         self.send_xai_notification(XaiSessionUpdate::RetryState(
             crate::extensions::notification::RetryState::Failed {
-                error_type: "auth".to_string(),
+                error_type,
                 message: message.clone(),
+                provider_auth,
             },
         ))
         .await;
@@ -2428,6 +2480,7 @@ impl SessionActor {
                     deterministic,
                     context_overflow,
                 }) => {
+                    let message = xai_acp_lib::redact_provider_auth_error(&message);
                     if cancel.is_cancelled()
                         || message.contains(
                             crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
@@ -3407,9 +3460,11 @@ impl SessionActor {
                 Ok(())
             }
             Err(e) => {
+                let e = Self::redact_acp_error(e);
                 let span = tracing::Span::current();
                 span.record("success", false);
-                span.record("error", e.to_string().as_str());
+                let error = xai_acp_lib::redact_provider_auth_error(&e.to_string());
+                span.record("error", error.as_str());
                 let cancelled = Self::is_compaction_cancelled(&e)
                     || self.compaction.cancel.is_cancelled()
                     || e.data
@@ -3480,12 +3535,22 @@ impl SessionActor {
             "detailed"
         };
         let error_str = error.map(|e| {
-            e.data
+            let raw = e
+                .data
                 .as_ref()
                 .and_then(|d| d.as_str())
-                .unwrap_or("<no error data>")
-                .to_owned()
+                .unwrap_or("<no error data>");
+            xai_acp_lib::redact_provider_auth_error(raw)
         });
+        let attempt_details = attempt_details
+            .into_iter()
+            .map(|mut attempt| {
+                attempt.error = attempt
+                    .error
+                    .map(|error| xai_acp_lib::redact_provider_auth_error(&error));
+                attempt
+            })
+            .collect();
         let artifact = CompactionRequestFile {
             schema_version: 2,
             request_id,
@@ -4165,6 +4230,23 @@ mod inline_auto_compact_flow_tests {
             .await;
     }
     #[test]
+    fn compact_errors_redact_credentials_before_acp_or_artifact_use() {
+        let error = acp::Error::internal_error().data(serde_json::json!({
+            "message": "Unauthorized: Authorization: Bearer plain-secret-value",
+            "nested": { "api_key": "api_key=json-secret-value" },
+            "http_status": 401,
+        }));
+        let error = SessionActor::redact_acp_error(error);
+        let serialized = serde_json::to_string(error.data.as_ref().unwrap()).unwrap();
+        assert!(!serialized.contains("plain-secret-value"));
+        assert!(!serialized.contains("json-secret-value"));
+        assert!(serialized.contains("[REDACTED]"));
+        assert_eq!(error.data.as_ref().unwrap()["http_status"], 401);
+        let message = SessionActor::acp_error_message(&error);
+        assert!(!message.contains("plain-secret-value"));
+    }
+
+    #[test]
     fn is_auth_compact_error_classifies_401_messages() {
         let auth = acp::Error::internal_error()
             .data("compact failed: API error (status 401 Unauthorized)");
@@ -4188,7 +4270,7 @@ mod inline_auto_compact_flow_tests {
                     create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
                 let err = acp::Error::internal_error()
                     .data("compact failed: API error (status 401 Unauthorized)");
-                let out = actor.surface_compact_auth_failure(err).await;
+                let out = actor.surface_compact_auth_failure(err, None).await;
                 assert_eq!(out.code, acp::Error::auth_required().code);
                 let mut saw_retry_auth = false;
                 while let Ok(msg) = persistence_rx.try_recv() {
@@ -4197,6 +4279,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {
@@ -4215,6 +4298,58 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn surface_compact_auth_failure_uses_request_time_provider_source() {
+        use crate::auth::providers::{
+            ProviderAuthRemedy, ProviderCredentialMethod, ProviderSecretSource,
+        };
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::session::acp_session::ProviderAuthRequestProvenance;
+        use crate::session::storage::SessionUpdate;
+        use xai_acp_lib::ProviderAuthSource;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+                let actor =
+                    create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
+                let provenance = ProviderAuthRequestProvenance {
+                    remedy: ProviderAuthRemedy {
+                        provider: crate::auth::providers::ProviderId::Anthropic,
+                        source: ProviderSecretSource::StoredApiKey,
+                        method: ProviderCredentialMethod::ApiKey,
+                    },
+                    model_environment_variable: None,
+                };
+                let err = acp::Error::internal_error()
+                    .data("compact failed: API error (status 401 Unauthorized)");
+                actor
+                    .surface_compact_auth_failure(err, Some(&provenance))
+                    .await;
+
+                let mut saw_provider_retry = false;
+                while let Ok(msg) = persistence_rx.try_recv() {
+                    if let PersistenceMsg::Update(SessionUpdate::Xai(notif)) = msg
+                        && let XaiSessionUpdate::RetryState(
+                            crate::extensions::notification::RetryState::Failed {
+                                error_type,
+                                provider_auth: Some(remedy),
+                                ..
+                            },
+                        ) = &notif.update
+                    {
+                        assert_eq!(error_type, "provider_auth:anthropic");
+                        assert_eq!(remedy.source, ProviderAuthSource::StoredApiKey);
+                        saw_provider_retry = true;
+                    }
+                }
+                assert!(saw_provider_retry, "expected structured provider remedy");
+            })
+            .await;
+    }
+
     /// The per-turn suppression notification is tailored to the failure reason.
     #[tokio::test(flavor = "current_thread")]
     async fn suppression_notification_is_reason_specific() {
@@ -4345,7 +4480,7 @@ mod inline_auto_compact_flow_tests {
                     SUPPRESS_AUTH,
                     "auth compact failure must use SUPPRESS_AUTH (cleared on re-login)"
                 );
-                let surfaced = actor.surface_compact_auth_failure(err).await;
+                let surfaced = actor.surface_compact_auth_failure(err, None).await;
                 assert_eq!(surfaced.code, acp::Error::auth_required().code);
                 let mut saw_retry_auth = false;
                 let mut saw_auto_failed = false;
@@ -4356,6 +4491,7 @@ mod inline_auto_compact_flow_tests {
                                 crate::extensions::notification::RetryState::Failed {
                                     error_type,
                                     message,
+                                    ..
                                 },
                             ) => {
                                 assert_eq!(error_type, "auth");
@@ -4442,6 +4578,7 @@ mod inline_auto_compact_flow_tests {
                             crate::extensions::notification::RetryState::Failed {
                                 error_type,
                                 message,
+                                ..
                             },
                         ) = &notif.update
                     {

@@ -17,6 +17,16 @@ fn format_acp_error_reads_detail_from_wrapped_data() {
     assert_eq!(format_acp_error(&wrapped, false), "model does not support tools");
 }
 #[test]
+fn format_acp_error_redacts_credential_shaped_server_data() {
+    let err = acp::Error::invalid_params().data(
+        "backend echoed api_key=plain-secret-value and github_pat_abcdef123456",
+    );
+    let formatted = format_acp_error(&err, false);
+    assert!(!formatted.contains("plain-secret-value"));
+    assert!(!formatted.contains("github_pat_abcdef123456"));
+    assert!(formatted.contains("[REDACTED]"));
+}
+#[test]
 fn format_acp_error_formats_http_500_dump() {
     let err = acp::Error::internal_error()
         .data(

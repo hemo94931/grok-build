@@ -107,6 +107,7 @@ pub(super) async fn refresh(
             refreshed.set_metadata(GATEWAY_CONFIG_METADATA_KEY, serde_json::to_value(config)?)
         }
         Err(error) => {
+            let error = xai_acp_lib::redact_provider_auth_error(&error.to_string());
             tracing::warn!(%error, "provider auth: Radius model catalog refresh failed");
             if let Some(config) = previous_config {
                 refreshed.set_metadata(GATEWAY_CONFIG_METADATA_KEY, config);
@@ -578,6 +579,7 @@ fn response_error_redacted<T>(
     for secret in redactions.iter().filter(|secret| !secret.is_empty()) {
         body = body.replace(secret, "[REDACTED]");
     }
+    body = xai_acp_lib::redact_provider_auth_error(&body);
     let body = truncate_error_body(&body);
     if body.is_empty() {
         bail!("{operation} failed ({})", response.status)

@@ -2189,7 +2189,7 @@ impl SessionActor {
                             return Err(error);
                         }
                         if Self::is_auth_compact_error(&error) {
-                            return Err(self.surface_compact_auth_failure(error).await);
+                            return Err(self.surface_compact_auth_failure(error, None).await);
                         }
                     }
                 }
@@ -2223,7 +2223,11 @@ impl SessionActor {
                     auth_retry_schedule.reset_on_success();
                     continue;
                 }
-                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit {
+                    credential,
+                    store,
+                    provider_auth,
+                }) => {
                     if auth_retry_schedule.reset_if_incident_spans_suspend() {
                         tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
                         xai_grok_telemetry::unified_log::info(
@@ -2346,7 +2350,9 @@ impl SessionActor {
                                     "suspended_secs": suspended.as_secs(),
                                 })),
                             );
-                            return Err(self.fail_turn_auth_budget_exhausted(msg).await);
+                            return Err(self
+                                .fail_turn_auth_budget_exhausted(msg, provider_auth.as_ref())
+                                .await);
                         }
                     }
                 }

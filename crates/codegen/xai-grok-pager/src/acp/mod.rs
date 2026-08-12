@@ -487,7 +487,7 @@ fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
         "x.ai/hunkTracker": { "mode": hunk_mode },
         "x.ai/bashOutputNoColor": true,
         "x.ai/gitHeadChanged": true,
-        xai_acp_lib::PROMPT_SECRET_CAPABILITY: false,
+        xai_acp_lib::PROMPT_SECRET_CAPABILITY: true,
     })
 }
 
@@ -1126,6 +1126,15 @@ mod tests {
         };
         let meta = build_initialize_meta(&flags);
         assert_eq!(meta["clientType"], "zed");
+    }
+
+    #[test]
+    fn interactive_client_advertises_secure_provider_secret_input() {
+        let meta = client_capabilities_meta(&ConnectFlags::default());
+        assert_eq!(
+            meta[xai_acp_lib::PROMPT_SECRET_CAPABILITY],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

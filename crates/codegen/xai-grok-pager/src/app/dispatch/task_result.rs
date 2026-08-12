@@ -19,7 +19,7 @@ use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
     handle_suggestion_debounce_expired,
 };
-use super::provider_auth::{handle_login_complete, handle_logout_complete};
+use super::provider_auth::{handle_info_complete, handle_login_complete, handle_logout_complete};
 use super::queue::push_and_page_flip;
 use super::rewind::{
     dispatch_rewind_success, handle_rewind_execute_failed, handle_rewind_points_loaded,
@@ -1351,11 +1351,28 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.welcome_prompt_focused = false;
             effects
         }
+        TaskResult::ProviderAuthInfoComplete {
+            agent_id,
+            intent,
+            result,
+        } => handle_info_complete(app, agent_id, intent, result),
+        TaskResult::ProviderLoginCancelComplete { .. } => vec![],
         TaskResult::ProviderLoginComplete {
             agent_id,
             provider,
+            display_name,
+            method,
+            request_seq,
             result,
-        } => handle_login_complete(app, agent_id, provider, result),
+        } => handle_login_complete(
+            app,
+            agent_id,
+            provider,
+            display_name,
+            method,
+            request_seq,
+            result,
+        ),
         TaskResult::ProviderLogoutComplete {
             agent_id,
             provider,

@@ -194,6 +194,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     }
     let mut plugins_changed_needs_skills_refetch = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
+    let mut late_provider_reauth: Option<(acp::SessionId, xai_acp_lib::ProviderAuthRemedy)> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
@@ -207,12 +208,57 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         | XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
         | XaiSessionUpdate::MemorySessionSaved { .. }) => {
+            let provider_reauth_update = if !meta.is_replay && !agent.attached_as_viewer {
+                match update {
+                    XaiSessionUpdate::RetryState(
+                        xai_grok_shell::extensions::notification::RetryState::Failed {
+                            provider_auth,
+                            ..
+                        },
+                    ) => Some(provider_auth.as_ref().and_then(|remedy| {
+                        remedy.automatic_login_method().map(|_| {
+                            crate::app::provider_auth::PendingProviderReauth {
+                                prompt_id: meta
+                                    .prompt_id
+                                    .clone()
+                                    .or_else(|| agent.session.current_prompt_id.clone()),
+                                remedy: remedy.clone(),
+                            }
+                        })
+                    })),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let changed = apply_session_event(
                 update,
                 &mut agent.session,
                 &mut agent.scrollback,
                 is_api_key_auth,
             );
+            if let Some(pending) = provider_reauth_update {
+                agent.pending_provider_reauth = pending;
+                if agent.reauth_stashed_prompt.is_some()
+                    && let Some(pending) = agent.pending_provider_reauth.take()
+                    && let Some(session_id) = agent.session.session_id.clone()
+                {
+                    late_provider_reauth = Some((session_id, pending.remedy));
+                } else if matches!(
+                    update,
+                    XaiSessionUpdate::RetryState(
+                        xai_grok_shell::extensions::notification::RetryState::Failed {
+                            provider_auth: Some(remedy),
+                            ..
+                        }
+                    ) if remedy.automatic_login_method().is_none()
+                ) {
+                    // PromptResponse may have won the delivery race and used
+                    // its generic 401 fallback to stash. A later structured
+                    // environment/model remedy makes that stash ineligible.
+                    agent.reauth_stashed_prompt = None;
+                }
+            }
             if let XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } = update {
                 refresh_context_used(agent, *tokens_after);
                 agent.todo.update_todos(Vec::new());
@@ -1157,6 +1203,33 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             agent.last_seen_event_id = Some(id);
         }
     }
+    if let Some((session_id, remedy)) = late_provider_reauth {
+        if let Some(method) = remedy.automatic_login_method() {
+            let request_seq = app.next_auth_request_seq;
+            app.next_auth_request_seq += 1;
+            let provider = remedy.provider;
+            let display_name = remedy.provider_display_name;
+            if let Some(agent) = app.agents.get_mut(&parent_id) {
+                agent.pending_provider_login =
+                    Some(crate::app::provider_auth::PendingProviderLogin {
+                        provider: provider.clone(),
+                        display_name: display_name.clone(),
+                        method,
+                        request_seq,
+                        owns_input: method == xai_acp_lib::ProviderAuthMethod::ApiKey,
+                        cancelled: false,
+                    });
+            }
+            app.pending_effects.push(Effect::ProviderLogin {
+                agent_id: parent_id,
+                session_id,
+                provider,
+                display_name,
+                method,
+                request_seq,
+            });
+        }
+    }
     if let Some(outcome) = terminal_outcome {
         return super::super::turn_completion::apply_terminal_outcome(
             outcome, app, parent_id, is_active,
@@ -1441,6 +1514,7 @@ pub(super) fn apply_retry_state(
         RetryState::Failed {
             error_type,
             message,
+            provider_auth,
         } => {
             session.set_retry_activity(None);
             let wire = crate::app::error_display::WireErrorType::parse(Some(error_type.as_str()));
@@ -1450,11 +1524,20 @@ pub(super) fn apply_retry_state(
             is_credit_limit = super::super::dispatch::is_credit_limit_error(None, message);
             if is_credit_limit {
                 session.credit_limit_blocked = true;
+            } else if let Some(remedy) = provider_auth {
+                is_reauth = remedy.automatic_login_method().is_some();
+                scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::ProviderReAuthRequired {
+                        provider: remedy.provider.clone(),
+                        remedy: Some(remedy.clone()),
+                    },
+                ));
             } else if let Some(provider) = error_type.strip_prefix("provider_auth:") {
                 is_reauth = true;
                 scrollback.push_block(RenderBlock::session_event(
                     SessionEvent::ProviderReAuthRequired {
                         provider: provider.to_owned(),
+                        remedy: None,
                     },
                 ));
             } else if is_reauthable_failure(Some(error_type.as_str()), message) {

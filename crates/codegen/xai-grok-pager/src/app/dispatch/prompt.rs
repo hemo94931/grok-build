@@ -3,6 +3,7 @@
 use super::auth::{
     scrollback_has_recent_context_too_large, scrollback_has_recent_disk_full,
     scrollback_has_recent_reauth_prompt, scrollback_has_recent_request_failed,
+    scrollback_has_recent_retryable_reauth_prompt,
 };
 use super::billing::is_credit_limit_error;
 use super::ctx::with_active_agent;
@@ -1239,9 +1240,18 @@ pub(super) fn handle_prompt_response(
         // "Turn failed" block + error toast so only the prompt shows.
         // "(401)" matches both the raw "Unauthorized (401)" dump and the
         // banner-formatted "Request failed (401) — …" text.
-        let reauth_prompted = scrollback_has_recent_reauth_prompt(&agent.scrollback)
-            || (http_status == Some(401)
-                && result.as_ref().err().is_some_and(|e| e.contains("(401)")));
+        let structured_reauth_prompted = scrollback_has_recent_reauth_prompt(&agent.scrollback);
+        let response_auth_401 = http_status == Some(401)
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("(401)"));
+        let reauth_prompted = structured_reauth_prompted || response_auth_401;
+        let retryable_reauth_prompted = if structured_reauth_prompted {
+            scrollback_has_recent_retryable_reauth_prompt(&agent.scrollback)
+        } else {
+            reauth_prompted
+        };
         let request_failed_shown = scrollback_has_recent_request_failed(&agent.scrollback);
         // A dedicated prompt/modal/banner replaces the generic TurnFailed
         // marker and error toast (rate limit, free-usage paywall, model
@@ -1280,7 +1290,7 @@ pub(super) fn handle_prompt_response(
         }
         // Stash for AuthComplete after 401. Prefer in_flight; fall back to
         // compact_held (cleared for cancel-rewind during auto-compact). Skip if both None.
-        if reauth_prompted {
+        if retryable_reauth_prompted {
             let held = agent
                 .session
                 .in_flight_prompt
@@ -1455,7 +1465,8 @@ pub(super) fn handle_prompt_response(
         }
 
         if let Err(ref err) = result {
-            tracing::error!(agent = ?agent_id, error = %err, "Prompt failed");
+            let error = crate::app::effects::sanitize_provider_auth_error(err);
+            tracing::error!(agent = ?agent_id, %error, "Prompt failed");
         }
 
         // Predicted-next-prompt (tab autocomplete): wipe any stale suggestion
@@ -1463,6 +1474,15 @@ pub(super) fn handle_prompt_response(
         // credit-limit early returns below, which skip the fetch gate
         // entirely — a prior ghost would otherwise survive those paths.
         agent.prompt.prompt_suggestion.clear();
+
+        let automatic_provider_reauth = agent
+            .pending_provider_reauth
+            .as_ref()
+            .filter(|pending| {
+                pending.prompt_id.as_deref().is_none()
+                    || pending.prompt_id.as_deref() == response_pid.as_deref()
+            })
+            .cloned();
 
         // Cancelled turns resume queue processing one item at a time
         // through the same drain path as normal completions.
@@ -1516,6 +1536,45 @@ pub(super) fn handle_prompt_response(
             let auth_method = app.login_method_id.as_ref().map(|id| id.0.to_string());
             super::billing::open_free_usage_upsell(agent, auth_method);
             if let Some(p) = pending_adoption {
+                agent.discard_pending_adoption_updates(&p.prompt_id);
+            }
+            return vec![];
+        }
+
+        // Stored provider credentials have a deterministic repair method. Wait
+        // until this PromptResponse has stashed the failed prompt, then open the
+        // matching flow directly. Environment/model BYOK never enters this arm.
+        if let Some(pending) = automatic_provider_reauth
+            && let Some(method) = pending.remedy.automatic_login_method()
+            && let Some(session_id) = agent.session.session_id.clone()
+        {
+            agent.pending_provider_reauth = None;
+            if let Some(ref p) = pending_adoption {
+                agent.discard_pending_adoption_updates(&p.prompt_id);
+            }
+            let request_seq = app.next_auth_request_seq;
+            app.next_auth_request_seq += 1;
+            let provider = pending.remedy.provider;
+            let display_name = pending.remedy.provider_display_name;
+            agent.pending_provider_login = Some(crate::app::provider_auth::PendingProviderLogin {
+                provider: provider.clone(),
+                display_name: display_name.clone(),
+                method,
+                request_seq,
+                owns_input: method == xai_acp_lib::ProviderAuthMethod::ApiKey,
+                cancelled: false,
+            });
+            return vec![Effect::ProviderLogin {
+                agent_id,
+                session_id,
+                provider,
+                display_name,
+                method,
+                request_seq,
+            }];
+        }
+        if reauth_prompted {
+            if let Some(ref p) = pending_adoption {
                 agent.discard_pending_adoption_updates(&p.prompt_id);
             }
             return vec![];
@@ -1627,7 +1686,8 @@ pub(super) fn handle_compact_complete(
                 ));
             }
             Err(err) => {
-                tracing::error!(agent = ?agent_id, error = %err, "Compaction failed");
+                let error = crate::app::effects::sanitize_provider_auth_error(&err);
+                tracing::error!(agent = ?agent_id, %error, "Compaction failed");
                 agent.scrollback.push_block(RenderBlock::session_event(
                     SessionEvent::CompactionFailed {
                         error: String::new(),

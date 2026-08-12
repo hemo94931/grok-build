@@ -243,6 +243,7 @@ async fn login_api_key_and_store_with_store(
     if !descriptor.supports_method(ProviderCredentialMethod::ApiKey) {
         anyhow::bail!("{} does not support API-key login", descriptor.display_name);
     }
+    let signal = interaction.signal();
     let key = interaction
         .prompt(AuthPrompt::Secret {
             message: format!("Enter API key for {}:", descriptor.display_name),
@@ -256,7 +257,17 @@ async fn login_api_key_and_store_with_store(
         anyhow::bail!("API key cannot be empty");
     }
     let credential = ProviderApiKeyCredential::new(key.to_owned());
-    store.put(provider, credential.clone()).await?;
+    if signal.is_cancelled() {
+        anyhow::bail!("login cancelled");
+    }
+    // Cancellation owns the race until the credential-store commit begins.
+    // In particular, a cancel that arrives with (or immediately after) the
+    // reverse secret response must not persist the returned key.
+    tokio::select! {
+        biased;
+        _ = signal.cancelled() => anyhow::bail!("login cancelled"),
+        result = store.put(provider, credential.clone()) => result?,
+    }
     Ok(credential)
 }
 
@@ -326,6 +337,10 @@ mod tests {
         value: Option<&'static str>,
     }
 
+    struct CancelledAfterSecretInteraction {
+        signal: CancellationToken,
+    }
+
     #[async_trait(?Send)]
     impl AuthInteraction for ApiKeyInteraction {
         fn signal(&self) -> CancellationToken {
@@ -342,6 +357,25 @@ mod tests {
                 Some(value) => Ok(AuthPromptResponse::Secret(AuthSecret::new(value))),
                 None => anyhow::bail!("login cancelled"),
             }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AuthInteraction for CancelledAfterSecretInteraction {
+        fn signal(&self) -> CancellationToken {
+            self.signal.clone()
+        }
+
+        async fn notify(&self, _notification: AuthNotification) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn prompt(&self, prompt: AuthPrompt) -> anyhow::Result<AuthPromptResponse> {
+            assert!(matches!(prompt, AuthPrompt::Secret { .. }));
+            self.signal.cancel();
+            Ok(AuthPromptResponse::Secret(AuthSecret::new(
+                "sk-cancelled-race",
+            )))
         }
     }
 
@@ -391,6 +425,23 @@ mod tests {
         );
         assert!(matches!(
             cancelled_store.get(ProviderId::Anthropic).unwrap(),
+            ProviderSlotState::Missing
+        ));
+
+        let raced_store = ProviderStore::with_paths(
+            tmp.path().join("cancelled-after-secret-providers.json"),
+            tmp.path().join("cancelled-after-secret-auth.json"),
+        );
+        let interaction = CancelledAfterSecretInteraction {
+            signal: CancellationToken::new(),
+        };
+        let error =
+            login_api_key_and_store_with_store(ProviderId::Anthropic, &interaction, &raced_store)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(matches!(
+            raced_store.get(ProviderId::Anthropic).unwrap(),
             ProviderSlotState::Missing
         ));
     }

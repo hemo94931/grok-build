@@ -134,6 +134,24 @@ pub(super) fn reseed_tip_for_new_session(app: &mut AppView) {
 /// every return-to-welcome transition so a previously-expanded announcement
 /// can't leak into the freshly-shown screen.
 pub(super) fn show_welcome(app: &mut AppView) {
+    let provider_cancel = if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&id)
+    {
+        agent.cancel_provider_secret();
+        agent
+            .request_provider_login_cancel()
+            .map(|(provider, request_seq)| (id, provider, request_seq))
+    } else {
+        None
+    };
+    if let Some((agent_id, provider, request_seq)) = provider_cancel {
+        app.pending_effects
+            .push(crate::app::actions::Effect::ProviderLoginCancel {
+                agent_id,
+                provider,
+                request_seq,
+            });
+    }
     app.active_view = ActiveView::Welcome;
     app.welcome_announcement = WelcomeAnnouncementState::default();
     // Drop stale welcome workspace one-shot / ACK so a later create/load
@@ -249,6 +267,24 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, cause: SwitchC
         ActiveView::Agent(id) => Some(id),
         _ => None,
     };
+    let provider_cancel = if let Some(previous) = previous_top_level
+        && let Some(agent) = app.agents.get_mut(&previous)
+    {
+        agent.cancel_provider_secret();
+        agent
+            .request_provider_login_cancel()
+            .map(|(provider, request_seq)| (previous, provider, request_seq))
+    } else {
+        None
+    };
+    if let Some((agent_id, provider, request_seq)) = provider_cancel {
+        app.pending_effects
+            .push(crate::app::actions::Effect::ProviderLoginCancel {
+                agent_id,
+                provider,
+                request_seq,
+            });
+    }
     app.active_view = ActiveView::Agent(target);
     // Re-anchor the global permission-mode mirror to the now-active agent so the
     // cycle's `sync_active_auto_flag` (which derives from the global) can't copy a

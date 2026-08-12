@@ -905,6 +905,9 @@ pub struct AgentView {
     /// auto-resubmit the prompt after a successful mid-session re-auth so
     /// the user doesn't have to retype it.
     pub reauth_stashed_prompt: Option<crate::app::agent::InFlightPrompt>,
+    /// Structured provider re-auth remedy waiting for the matching failed
+    /// prompt response to finish stashing before an automatic login starts.
+    pub(crate) pending_provider_reauth: Option<crate::app::provider_auth::PendingProviderReauth>,
     /// Currently active modal dialog (blocks all other input).
     pub active_modal: Option<ActiveModal>,
     /// Hit areas for modal buttons (from last render).
@@ -1310,6 +1313,13 @@ pub struct AgentView {
     pub(crate) hit_sb_copy: HitArea,
     /// Hit area for scrollback selection box view button.
     pub(crate) hit_sb_view: HitArea,
+    /// Provider login sent to the shell but not yet completed. API-key login
+    /// uses this metadata-only state to make Esc cancellation race-safe before
+    /// the dedicated reverse secret request arrives.
+    pub(crate) pending_provider_login: Option<crate::app::provider_auth::PendingProviderLogin>,
+    /// Dedicated provider API-key input. This state owns its ACP response
+    /// channel and never enters the ordinary prompt/question/action pipeline.
+    pub(crate) provider_secret: Option<crate::app::provider_auth::ProviderSecretState>,
     /// Active question view (from `AskUserQuestion` tool). When `Some`, the
     /// prompt area shows a structured question UI and input is modal.
     pub(crate) question_view: Option<QuestionViewState>,

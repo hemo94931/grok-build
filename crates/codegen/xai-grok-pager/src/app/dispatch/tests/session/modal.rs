@@ -151,6 +151,37 @@ fn close_inactive_agent_drops_it() {
 }
 
 #[test]
+fn close_inactive_agent_cancels_pending_api_key_login() {
+    let mut app = three_agent_app();
+    app.agents
+        .get_mut(&AgentId(2))
+        .unwrap()
+        .pending_provider_login = Some(crate::app::provider_auth::PendingProviderLogin {
+        provider: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        method: xai_acp_lib::ProviderAuthMethod::ApiKey,
+        request_seq: 41,
+        owns_input: true,
+        cancelled: false,
+    });
+
+    let effects = dispatch_sessions_confirm_close(&mut app, AgentId(2));
+
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ProviderLoginCancel {
+                agent_id,
+                provider,
+                request_seq: 41,
+            } if *agent_id == AgentId(2) && provider == "anthropic"
+        )),
+        "closing must stop shell-side secret work, got {effects:?}"
+    );
+    assert!(!app.agents.contains_key(&AgentId(2)));
+}
+
+#[test]
 fn close_agent_releases_retained_memory() {
     use crate::memory_release::test_support;
     test_support::install_counting_hook();

@@ -24,7 +24,8 @@ pub use self::{
     },
     provider_auth::{
         PROMPT_SECRET_CAPABILITY, PROMPT_SECRET_METHOD, PromptSecretRequest, PromptSecretResponse,
-        RedactedSecret,
+        ProviderAuthMethod, ProviderAuthRemedy, ProviderAuthSource, RedactedSecret,
+        RedactedSecretBuffer, redact_provider_auth_error,
     },
 };
 

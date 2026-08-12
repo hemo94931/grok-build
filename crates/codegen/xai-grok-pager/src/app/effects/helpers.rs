@@ -131,15 +131,20 @@ pub(super) async fn fetch_plugin_cta_mcps(
 /// (status headline + sanitized detail).
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-        let detail = err.data.as_ref().and_then(error_detail_from_data);
-        return sanitize_user_error(
-            &format_rate_limited_user_message(detail.as_deref(), is_api_key_auth),
-        );
+        let detail = err
+            .data
+            .as_ref()
+            .and_then(error_detail_from_data)
+            .map(|detail| xai_acp_lib::redact_provider_auth_error(&detail));
+        return sanitize_user_error(&format_rate_limited_user_message(
+            detail.as_deref(),
+            is_api_key_auth,
+        ));
     }
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
         && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
-        return sanitize_user_error(&msg);
+        return sanitize_user_error(&xai_acp_lib::redact_provider_auth_error(&msg));
     }
     let raw = err
         .data
@@ -147,12 +152,13 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
         .and_then(error_detail_from_data)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| err.to_string());
+    let raw = xai_acp_lib::redact_provider_auth_error(&raw);
     crate::app::error_display::format_request_failure(
-            http_status_from_error(err),
-            None,
-            &raw,
-        )
-        .message()
+        http_status_from_error(err),
+        None,
+        &raw,
+    )
+    .message()
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -278,6 +284,13 @@ pub(crate) fn sanitize_user_error(raw: &str) -> String {
         result = format!("{truncated}...");
     }
     result
+}
+
+/// Redact credential-shaped material before provider-auth errors are truncated
+/// or copied into scrollback. The shell's API-key flow is blind-store-only and
+/// should never echo a key, but this keeps a malformed/older peer fail-safe.
+pub(crate) fn sanitize_provider_auth_error(raw: &str) -> String {
+    sanitize_user_error(&xai_acp_lib::redact_provider_auth_error(raw))
 }
 /// Additive session creation flags passed from CLI → AppView → effects.
 ///
@@ -905,11 +918,39 @@ pub(super) fn session_picker_entry_to_roster(
         },
     }
 }
+pub(super) async fn fetch_provider_auth_info(
+    tx: &AcpAgentTx,
+    agent_id: AgentId,
+    intent: crate::app::provider_auth::ProviderLoginIntent,
+) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/providerAuth/info",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize provider info params")
+            .into(),
+    );
+    let result = match acp_send(req, tx).await {
+        Ok(response) => serde_json::from_str::<crate::app::provider_auth::ProviderAuthInfoResponse>(
+            response.0.get(),
+        )
+        .map(|response| response.providers)
+        .map_err(|_| "couldn't read provider login options".to_owned()),
+        Err(error) => Err(sanitize_provider_auth_error(&error.to_string())),
+    };
+    TaskResult::ProviderAuthInfoComplete {
+        agent_id,
+        intent,
+        result,
+    }
+}
+
 pub(super) async fn send_provider_login(
     tx: &AcpAgentTx,
     agent_id: AgentId,
     session_id: acp::SessionId,
     provider: String,
+    display_name: String,
+    method: xai_acp_lib::ProviderAuthMethod,
     request_seq: u64,
 ) -> TaskResult {
     let req = acp::ExtRequest::new(
@@ -917,20 +958,56 @@ pub(super) async fn send_provider_login(
         serde_json::value::to_raw_value(&serde_json::json!({
             "provider": provider,
             "sessionId": session_id.0,
+            "method": method.as_str(),
             "requestSeq": request_seq,
         }))
         .expect("serialize provider login params")
         .into(),
     );
-    let result = acp_send(req, tx)
-        .await
-        .map(|_| ())
-        .map_err(|error| sanitize_user_error(&error.to_string()));
+    let result = match acp_send(req, tx).await {
+        Ok(response) => serde_json::from_str::<crate::app::provider_auth::ProviderLoginSuccess>(
+            response.0.get(),
+        )
+        .map_err(|_| "provider login returned an invalid response".to_owned())
+        .and_then(|success| {
+            if success.provider != provider || success.method != method {
+                Err("provider login returned mismatched metadata".to_owned())
+            } else {
+                Ok(success)
+            }
+        }),
+        Err(error) => Err(sanitize_provider_auth_error(&error.to_string())),
+    };
     TaskResult::ProviderLoginComplete {
         agent_id,
         provider,
+        display_name,
+        method,
+        request_seq,
         result,
     }
+}
+
+pub(super) async fn send_provider_login_cancel(
+    tx: &AcpAgentTx,
+    agent_id: AgentId,
+    provider: String,
+    request_seq: u64,
+) -> TaskResult {
+    let request = acp::ExtRequest::new(
+        "x.ai/providerAuth/cancel",
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "provider": provider,
+            "requestSeq": request_seq,
+        }))
+        .expect("serialize provider login cancel params")
+        .into(),
+    );
+    if let Err(error) = acp_send(request, tx).await {
+        let error = sanitize_provider_auth_error(&error.to_string());
+        tracing::debug!(%error, %provider, request_seq, "provider login cancel request failed");
+    }
+    TaskResult::ProviderLoginCancelComplete { agent_id }
 }
 
 pub(super) async fn send_provider_logout(
@@ -945,6 +1022,7 @@ pub(super) async fn send_provider_logout(
             .into(),
     );
     if let Err(error) = acp_send(cancel, tx).await {
+        let error = sanitize_provider_auth_error(&error.to_string());
         tracing::debug!(%error, %provider, "provider auth cancel failed before logout");
     }
     let req = acp::ExtRequest::new(
@@ -962,7 +1040,7 @@ pub(super) async fn send_provider_logout(
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
             }),
-        Err(error) => Err(sanitize_user_error(&error.to_string())),
+        Err(error) => Err(sanitize_provider_auth_error(&error.to_string())),
     };
     TaskResult::ProviderLogoutComplete {
         agent_id,

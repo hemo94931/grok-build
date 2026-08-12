@@ -46,7 +46,7 @@ pub mod personas;
 pub mod plan;
 pub mod plugin;
 pub mod privacy;
-mod providers;
+pub(crate) mod providers;
 pub mod queue;
 pub mod recap;
 pub mod release_notes;
@@ -230,13 +230,24 @@ mod tests {
         let mut ctx = make_ctx(&models);
         assert!(matches!(
             login::LoginCommand.run(&mut ctx, "anthropic"),
-            CommandResult::Action(Action::ProviderLogin(provider)) if provider == "anthropic"
+            CommandResult::Action(Action::ProviderLogin(
+                crate::app::provider_auth::ProviderLoginIntent::Provider {
+                    provider,
+                    method: None,
+                }
+            )) if provider == "anthropic"
         ));
         assert!(matches!(
             logout::LogoutCommand.run(&mut ctx, "xai"),
             CommandResult::Action(Action::Logout)
         ));
-        assert!(login::LoginCommand.args_required());
+        assert!(!login::LoginCommand.args_required());
+        assert!(matches!(
+            login::LoginCommand.run(&mut ctx, ""),
+            CommandResult::Action(Action::ProviderLogin(
+                crate::app::provider_auth::ProviderLoginIntent::Menu
+            ))
+        ));
     }
     #[test]
     fn loop_command_declares_scheduler_tool_requirement() {

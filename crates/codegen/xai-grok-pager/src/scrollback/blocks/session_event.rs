@@ -102,9 +102,12 @@ pub enum SessionEvent {
     /// points the user at `/login` to re-authenticate, replacing the raw
     /// "Retry failed: Unauthorized (401) …" dump.
     ReAuthRequired,
-    /// A non-xAI provider rejected its credential. The provider name keeps the
-    /// recovery command scoped so xAI login and billing state remain untouched.
-    ProviderReAuthRequired { provider: String },
+    /// A non-xAI provider rejected its credential. Structured source/method
+    /// metadata drives safe recovery without parsing the human error message.
+    ProviderReAuthRequired {
+        provider: String,
+        remedy: Option<xai_acp_lib::ProviderAuthRemedy>,
+    },
     /// Terminal context overflow — ideally unreachable, since auto-compaction should
     /// shrink the conversation first; a safeguard for when it didn't (estimate drift
     /// vs the server's max_prompt_length, or compaction suppressed/failed). One actionable
@@ -153,6 +156,46 @@ pub enum SessionEvent {
         /// `true` for the automatic return-from-away recap, `false` for `/recap`.
         auto: bool,
     },
+}
+
+fn provider_reauth_message(
+    provider: &str,
+    remedy: Option<&xai_acp_lib::ProviderAuthRemedy>,
+) -> String {
+    use xai_acp_lib::ProviderAuthSource;
+
+    let Some(remedy) = remedy else {
+        return format!(
+            "{provider} rejected its credentials. Run /login {provider} to \
+             re-authenticate, then resend your message."
+        );
+    };
+    let name = remedy.provider_display_name.trim();
+    match &remedy.source {
+        ProviderAuthSource::StoredOAuth => format!(
+            "{name} rejected its stored OAuth credential. Re-authentication is opening now."
+        ),
+        ProviderAuthSource::StoredApiKey => format!(
+            "{name} rejected its stored API key. Secure API-key replacement is opening now."
+        ),
+        ProviderAuthSource::Environment { variable } => format!(
+            "{name} rejected the credential from `{variable}`. Update that environment variable, \
+             or run /login {} --api-key to store a credential that overrides it.",
+            remedy.provider
+        ),
+        ProviderAuthSource::Model {
+            environment_variable: Some(variable),
+        } => format!(
+            "{name} rejected the model-scoped credential from `{variable}`. Update that environment \
+             variable or the model's `env_key`; a stored provider key would remain shadowed."
+        ),
+        ProviderAuthSource::Model {
+            environment_variable: None,
+        } => format!(
+            "{name} rejected a model-scoped API key. Update the model's `api_key`/`env_key`; \
+             a stored provider key would remain shadowed."
+        ),
+    }
 }
 
 impl SessionEvent {
@@ -242,10 +285,9 @@ impl SessionEvent {
                  your message."
                     .to_string()
             }
-            SessionEvent::ProviderReAuthRequired { provider } => format!(
-                "{provider} rejected its credentials. Run /login {provider} to \
-                 re-authenticate, then resend your message."
-            ),
+            SessionEvent::ProviderReAuthRequired { provider, remedy } => {
+                provider_reauth_message(provider, remedy.as_ref())
+            }
             SessionEvent::ContextTooLarge => {
                 "This conversation is too large for the model's context window. \
                  Use /new to start a new session."

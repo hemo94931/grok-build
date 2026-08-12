@@ -16,7 +16,8 @@ pub(super) use helpers::{
 };
 pub(crate) use helpers::{
     EffectMeta, RestoreProgressMsg, SessionFlags, is_disk_full_error,
-    persist_permission_mode_and_notify, persist_setting, sanitize_user_error,
+    persist_permission_mode_and_notify, persist_setting, sanitize_provider_auth_error,
+    sanitize_user_error,
 };
 #[cfg(feature = "local-workspace")]
 pub(crate) use helpers::reject_non_fs_only_advertised_tools;
@@ -89,15 +90,40 @@ pub(crate) fn execute(
                     TaskResult::LogoutComplete
                 });
         }
-        Effect::ProviderLogin {
+        Effect::ProviderAuthInfo { agent_id, intent } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { fetch_provider_auth_info(&tx, agent_id, intent).await });
+        }
+        Effect::ProviderLoginCancel {
             agent_id,
-            session_id,
             provider,
             request_seq,
         } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {
-                send_provider_login(&tx, agent_id, session_id, provider, request_seq).await
+                send_provider_login_cancel(&tx, agent_id, provider, request_seq).await
+            });
+        }
+        Effect::ProviderLogin {
+            agent_id,
+            session_id,
+            provider,
+            display_name,
+            method,
+            request_seq,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                send_provider_login(
+                    &tx,
+                    agent_id,
+                    session_id,
+                    provider,
+                    display_name,
+                    method,
+                    request_seq,
+                )
+                .await
             });
         }
         Effect::ProviderLogout {

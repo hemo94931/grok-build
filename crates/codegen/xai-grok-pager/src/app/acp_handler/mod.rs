@@ -76,6 +76,13 @@ use workflow_ingest::ingest_workflow_update;
 
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;
+#[cfg(test)]
+pub(crate) fn handle_session_notification_for_test(
+    notif: &acp::ExtNotification,
+    app: &mut AppView,
+) -> bool {
+    session_notification::handle_session_notification(notif, app)
+}
 pub(crate) use session_notification::drop_unexpected_replay;
 use session_notification::{
     advance_reconnect_cursor, confirm_context_used, detect_plan_mode_change,
@@ -93,7 +100,7 @@ use background::{
 };
 use follow_ups::handle_follow_ups;
 pub(crate) use interactions::handle_ask_user_question;
-use interactions::handle_exit_plan_mode;
+use interactions::{handle_exit_plan_mode, handle_prompt_secret};
 use mcp::{
     handle_mcp_init_progress, handle_mcp_server_status, handle_mcp_servers_updated,
     handle_mcp_tools_changed, push_server_status_enabled,
@@ -805,6 +812,7 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
 /// immediately (for unknown methods).
 fn handle_ext_method(ext: xai_acp_lib::AcpArgs<acp::ExtRequest>, app: &mut AppView) -> bool {
     match ext.request.method.as_ref() {
+        xai_acp_lib::PROMPT_SECRET_METHOD => handle_prompt_secret(ext, app),
         "x.ai/ask_user_question" => handle_ask_user_question(ext, app),
         "x.ai/exit_plan_mode" => handle_exit_plan_mode(ext, app),
         unknown => {

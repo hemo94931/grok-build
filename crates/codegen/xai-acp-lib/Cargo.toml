@@ -9,6 +9,7 @@ agent-client-protocol = { workspace = true, features = ["unstable"] }
 async-trait = { workspace = true }
 derive_more = { workspace = true }
 futures = { workspace = true }
+regex.workspace = true
 serde.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }

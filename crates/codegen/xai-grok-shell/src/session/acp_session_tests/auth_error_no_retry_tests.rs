@@ -134,6 +134,61 @@ fn auth_manager_with_valid_token(key: &str) -> (tempfile::TempDir, Arc<AuthManag
     (dir, am)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn provider_failure_uses_request_time_source_after_live_model_changes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await);
+            assert!(
+                actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .is_some_and(|config| !config.model.starts_with("anthropic/")),
+                "fixture must model a live route different from the failed request"
+            );
+            let provenance = SamplingRequestProvenance {
+                model_id: "anthropic/claude-test".to_owned(),
+                base_url: "https://api.anthropic.com".to_owned(),
+                provider_auth: Some(ProviderAuthRequestProvenance {
+                    remedy: crate::auth::providers::provider_auth_remedy(
+                        crate::auth::ProviderId::Anthropic,
+                        crate::auth::providers::ProviderSecretSource::StoredApiKey,
+                    ),
+                    model_environment_variable: None,
+                }),
+            };
+
+            let result = actor
+                .handle_sampling_failure_for_request(auth_error(), None, Some(provenance))
+                .await;
+            assert!(result.is_err());
+
+            let provider_auth = std::iter::from_fn(|| gateway_rx.try_recv().ok()).find_map(|msg| {
+                let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg else {
+                    return None;
+                };
+                let value: serde_json::Value = serde_json::from_str(args.params.get()).ok()?;
+                (value["update"]["type"] == "failed").then(|| {
+                    value["update"]
+                        .get("provider_auth")
+                        .or_else(|| value["update"].get("providerAuth"))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+            });
+            let provider_auth = provider_auth.expect("terminal provider remedy notification");
+            assert_eq!(provider_auth["provider"], "anthropic");
+            assert_eq!(provider_auth["method"], "api_key");
+            assert_eq!(provider_auth["source"]["type"], "stored_api_key");
+        })
+        .await;
+}
+
 /// Sub-case 1: no auth_manager -> falls through, no emit.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(attribution_emit_count)]

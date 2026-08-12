@@ -1205,6 +1205,10 @@ pub enum RetryState {
         error_type: String,
         /// Human-readable error message
         message: String,
+        /// Structured provider credential remedy. Secret-free and absent for
+        /// xAI or non-auth failures; clients must not infer this from `message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_auth: Option<xai_acp_lib::ProviderAuthRemedy>,
     },
 }
 

@@ -25,7 +25,9 @@ use super::cta::{
     CTA_MCP_ABSENT_MAX_ATTEMPTS, CTA_MCP_POLL_MAX_ATTEMPTS, cta_impression_plugin_name,
     cta_install_error_category, cta_install_relative_path, plugin_cta_phase_for,
 };
-use super::ctx::{find_agent_by_session_id, get_active_agent, get_active_agent_mut};
+use super::ctx::{
+    find_agent_by_session_id, get_active_agent, get_active_agent_mut, switch_to_agent,
+};
 use super::dashboard::{
     apply_pending_dispatch_config, dispatch_dashboard_attach, dispatch_dashboard_begin_rename,
     dispatch_dashboard_commit_rename, dispatch_dashboard_confirm_worktree,
