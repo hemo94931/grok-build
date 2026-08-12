@@ -4525,81 +4525,12 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
-    /// Model-switch compact 401 must surface reauth (same path as pre-sampling).
+    /// Model switches only arm the exact-request pre-provider compaction gate.
+    /// The actual request, error classification, suppression, and re-auth handoff
+    /// happen later in `process_conversation_turn`, after the final prompt/tools
+    /// envelope has been frozen.
     #[tokio::test(flavor = "current_thread")]
-    async fn e2e_model_switch_compact_401_surfaces_reauth() {
-        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
-        use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_AUTH};
-        use crate::session::storage::SessionUpdate;
-        use std::sync::atomic::Ordering::Relaxed;
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-                let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
-                let actor = Arc::new(
-                    create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
-                );
-                let base_url = spawn_deterministic_401_server().await;
-                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-                cfg.base_url = base_url;
-                actor.chat_state_handle.update_sampling_config(cfg);
-                actor.chat_state_handle.replace_conversation(vec![
-                    ConversationItem::system("sys"),
-                    ConversationItem::user("hello"),
-                    ConversationItem::assistant("hi"),
-                    ConversationItem::user("compact me"),
-                ]);
-                actor.chat_state_handle.record_token_usage(214_000);
-                actor.compaction.previous_model.set(Some(PreviousModelInfo {
-                    model_slug: "old-big-model".to_string(),
-                    context_window: 400_000,
-                }));
-                let err = actor
-                    .maybe_compact_on_model_switch()
-                    .await
-                    .expect_err("model-switch 401 compact must abort for reauth");
-                assert_eq!(err.code, acp::Error::auth_required().code);
-                assert!(
-                    SessionActor::is_auth_compact_error(&err)
-                        || err.message.to_ascii_lowercase().contains("unauthorized")
-                        || format!("{err:?}").contains("401"),
-                    "surfaced error should be reauthable auth: {err:?}"
-                );
-                assert_eq!(
-                    actor.compaction.auto_compact_suppressed.load(Relaxed),
-                    SUPPRESS_AUTH,
-                    "auth compact failure must use SUPPRESS_AUTH"
-                );
-                let mut saw_retry_auth = false;
-                while let Ok(msg) = persistence_rx.try_recv() {
-                    if let PersistenceMsg::Update(SessionUpdate::Xai(notif)) = msg
-                        && let XaiSessionUpdate::RetryState(
-                            crate::extensions::notification::RetryState::Failed {
-                                error_type,
-                                message,
-                                ..
-                            },
-                        ) = &notif.update
-                    {
-                        assert_eq!(error_type, "auth");
-                        assert!(
-                            message.contains("Unauthorized") || message.contains("401"),
-                            "message={message}"
-                        );
-                        saw_retry_auth = true;
-                    }
-                }
-                assert!(
-                    saw_retry_auth,
-                    "expected RetryState::Failed auth so pager can stash + reauth"
-                );
-            })
-            .await;
-    }
-    /// Non-auth model-switch compact failures stay log-only (turn continues).
-    #[tokio::test(flavor = "current_thread")]
-    async fn e2e_model_switch_compact_non_auth_failure_does_not_abort() {
+    async fn model_switch_arms_deferred_exact_request_compaction() {
         use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_NONE};
         use std::sync::atomic::Ordering::Relaxed;
         let local = tokio::task::LocalSet::new();
@@ -4610,15 +4541,6 @@ mod inline_auto_compact_flow_tests {
                 let actor = Arc::new(
                     create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
                 );
-                let base_url = spawn_deterministic_400_server().await;
-                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-                cfg.base_url = base_url;
-                actor.chat_state_handle.update_sampling_config(cfg);
-                actor.chat_state_handle.replace_conversation(vec![
-                    ConversationItem::system("sys"),
-                    ConversationItem::user("hello"),
-                ]);
-                actor.chat_state_handle.record_token_usage(214_000);
                 actor.compaction.previous_model.set(Some(PreviousModelInfo {
                     model_slug: "old-big-model".to_string(),
                     context_window: 400_000,
@@ -4626,18 +4548,22 @@ mod inline_auto_compact_flow_tests {
                 actor
                     .maybe_compact_on_model_switch()
                     .await
-                    .expect("non-auth model-switch compact failure must not abort the turn");
-                assert_ne!(
+                    .expect("model-switch detection only arms deferred compaction");
+                assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
-                    SUPPRESS_NONE,
-                    "schema/other compact failure must suppress after attempt"
+                    SUPPRESS_NONE
+                );
+                assert!(
+                    actor.compaction.force_compact.load(Relaxed),
+                    "a shrinking model switch must arm exact-request compaction"
                 );
             })
             .await;
     }
-    /// After clearing auth suppress, a shrink switch can re-evaluate and compact.
+    /// Clearing auth suppression lets a later shrinking model switch arm the
+    /// deferred gate again; it must not perform network I/O from this early seam.
     #[tokio::test(flavor = "current_thread")]
-    async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
+    async fn clear_auth_suppress_rearms_deferred_model_switch_compaction() {
         use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_AUTH, SUPPRESS_NONE};
         use std::sync::atomic::Ordering::Relaxed;
         let local = tokio::task::LocalSet::new();
@@ -4667,6 +4593,8 @@ mod inline_auto_compact_flow_tests {
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
                     SUPPRESS_AUTH
                 );
+                assert!(!actor.compaction.force_compact.load(Relaxed));
+
                 actor.clear_auth_compact_suppression();
                 assert_eq!(
                     actor.compaction.auto_compact_suppressed.load(Relaxed),
@@ -4676,23 +4604,13 @@ mod inline_auto_compact_flow_tests {
                     model_slug: "old-big-model".to_string(),
                     context_window: 400_000,
                 }));
-                let base_url = spawn_deterministic_400_server().await;
-                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-                cfg.base_url = base_url;
-                actor.chat_state_handle.update_sampling_config(cfg);
-                actor.chat_state_handle.replace_conversation(vec![
-                    ConversationItem::system("sys"),
-                    ConversationItem::user("hello"),
-                ]);
-                actor.chat_state_handle.record_token_usage(214_000);
                 actor
                     .maybe_compact_on_model_switch()
                     .await
-                    .expect("post-clear switch compact re-eval must not abort on non-auth");
-                assert_ne!(
-                    actor.compaction.auto_compact_suppressed.load(Relaxed),
-                    SUPPRESS_NONE,
-                    "post-clear switch must re-evaluate and attempt compact"
+                    .expect("post-clear model switch only arms deferred compaction");
+                assert!(
+                    actor.compaction.force_compact.load(Relaxed),
+                    "credential recovery must allow the switch to re-arm compaction"
                 );
             })
             .await;
