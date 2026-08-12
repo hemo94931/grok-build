@@ -852,7 +852,7 @@ mod tests {
         let stored = stored_or_environment_secret_with(
             ProviderId::Deepseek,
             ProviderSlotState::Known(ProviderStoredCredential::ApiKey(
-                super::ProviderApiKeyCredential::new("stored-key"),
+                crate::auth::providers::ProviderApiKeyCredential::new("stored-key"),
             )),
             |_| panic!("stored DeepSeek key must own the provider"),
         )
