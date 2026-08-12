@@ -155,6 +155,57 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_catalog_matches_pi_0841_contract() {
+        let models = provider_models(ProviderId::Deepseek, None);
+        assert_eq!(models.len(), 2);
+        for ((model, id), name) in models
+            .iter()
+            .zip(["deepseek-v4-flash", "deepseek-v4-pro"])
+            .zip(["DeepSeek V4 Flash", "DeepSeek V4 Pro"])
+        {
+            assert_eq!(model.id, id);
+            assert_eq!(model.name, name);
+            assert_eq!(model.api_backend(), Some(ApiBackend::ChatCompletions));
+            assert_eq!(model.base_url, "https://api.deepseek.com");
+            assert!(model.reasoning);
+            assert_eq!(model.context_window, 1_000_000);
+            assert_eq!(model.max_tokens, 384_000);
+            assert_eq!(
+                model
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                vec![ReasoningEffort::High, ReasoningEffort::Max]
+            );
+            assert_eq!(
+                model.thinking_level_map,
+                BTreeMap::from([
+                    ("minimal".to_owned(), None),
+                    ("low".to_owned(), None),
+                    ("medium".to_owned(), None),
+                    ("high".to_owned(), Some("high".to_owned())),
+                    ("max".to_owned(), Some("max".to_owned())),
+                ])
+            );
+            assert_eq!(model.compat.supports_store, Some(false));
+            assert_eq!(model.compat.supports_developer_role, Some(false));
+            assert_eq!(model.compat.supports_reasoning_effort, Some(true));
+            assert_eq!(
+                model.compat.max_tokens_field.as_deref(),
+                Some("max_completion_tokens")
+            );
+            assert_eq!(
+                model
+                    .compat
+                    .requires_reasoning_content_on_assistant_messages,
+                Some(true)
+            );
+            assert_eq!(model.compat.thinking_format.as_deref(), Some("deepseek"));
+        }
+    }
+
+    #[test]
     fn copilot_catalog_honors_server_model_filter() {
         let mut credential = ProviderCredential::permanent("secret");
         credential.set_metadata("availableModelIds", serde_json::json!(["gpt-4.1"]));
@@ -313,14 +364,16 @@ mod tests {
             "../../../../../../scripts/openrouter_compat_manifest.json"
         ))
         .expect("OpenRouter sync manifest");
-        assert_eq!(static_models().len(), 358, "catalog member set changed");
+        assert_eq!(static_models().len(), 360, "catalog member set changed");
         assert_eq!(manifest["source"]["version"], "0.84.1");
         assert_eq!(
             manifest["source"]["generatedAt"],
             "2026-08-07T05:53:06.539Z"
         );
-        assert_eq!(manifest["counts"]["catalogMembers"], 358);
+        assert_eq!(manifest["counts"]["catalogMembers"], 360);
         assert_eq!(manifest["counts"]["catalogOpenRouterMembers"], 303);
+        assert_eq!(manifest["counts"]["catalogDeepSeekMembers"], 2);
+        assert_eq!(manifest["counts"]["generatedDeepSeekWireFacts"], 2);
         assert_eq!(
             facts.len(),
             manifest["counts"]["generatedWireFacts"]
@@ -329,7 +382,10 @@ mod tests {
         );
 
         for fact in facts {
-            assert_eq!(fact.provider, ProviderId::Openrouter);
+            assert!(matches!(
+                fact.provider,
+                ProviderId::Openrouter | ProviderId::Deepseek
+            ));
             let catalog = static_models()
                 .iter()
                 .find(|model| model.provider == fact.provider && model.id == fact.id)

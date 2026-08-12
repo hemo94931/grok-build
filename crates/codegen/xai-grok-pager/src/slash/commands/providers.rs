@@ -43,6 +43,12 @@ fn default_provider_items() -> Vec<ArgItem> {
             "Kimi Coding models",
         ),
         ("Radius", "Radius radius", "radius", "Radius models"),
+        (
+            "DeepSeek",
+            "DeepSeek deepseek",
+            "deepseek",
+            "DeepSeek models",
+        ),
     ]
     .into_iter()
     .map(|(display, match_text, insert_text, description)| ArgItem {
@@ -108,7 +114,10 @@ mod tests {
             Some("openai-codex")
         );
         assert_eq!(normalize_known_provider("x.ai").as_deref(), Some("xai"));
-        assert_eq!(normalize_known_provider("deepseek"), None);
+        assert_eq!(
+            normalize_known_provider("deepseek").as_deref(),
+            Some("deepseek")
+        );
         assert_eq!(normalize_known_provider("bad/value"), None);
     }
 }

@@ -204,6 +204,16 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             wire_dialect: ProviderWireDialect::PiMessages,
             env_keys: &["RADIUS_API_KEY"],
         },
+        ProviderId::Deepseek => ProviderDescriptor {
+            id,
+            display_name: "DeepSeek",
+            login_flow: ProviderLoginFlow::None,
+            api_key_login: true,
+            base_url: "https://api.deepseek.com",
+            api_backend: ApiBackend::ChatCompletions,
+            wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
+            env_keys: &["DEEPSEEK_API_KEY"],
+        },
     }
 }
 
@@ -510,7 +520,8 @@ fn oauth_scheme(provider: ProviderId) -> AuthScheme {
         | ProviderId::GithubCopilot
         | ProviderId::Openrouter
         | ProviderId::KimiCoding
-        | ProviderId::Radius => AuthScheme::Bearer,
+        | ProviderId::Radius
+        | ProviderId::Deepseek => AuthScheme::Bearer,
     }
 }
 
@@ -659,7 +670,7 @@ fn provider_headers(
             headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
             headers.insert("user-agent".to_owned(), "KimiCLI/1.5".to_owned());
         }
-        ProviderId::Openrouter | ProviderId::Radius => {}
+        ProviderId::Openrouter | ProviderId::Radius | ProviderId::Deepseek => {}
     }
     Ok(headers)
 }
@@ -827,6 +838,56 @@ mod tests {
                     .contains(&"XAI_API_KEY")
             );
         }
+    }
+
+    #[test]
+    fn deepseek_secret_precedence_and_scheme_are_provider_scoped() {
+        let model = model_provider_secret(ProviderId::Deepseek, Some("model-key".to_owned()))
+            .unwrap()
+            .expect("model BYOK");
+        assert_eq!(model.0.token, "model-key");
+        assert_eq!(model.0.source, ProviderSecretSource::Model);
+        assert_eq!(model.0.auth_scheme, AuthScheme::Bearer);
+
+        let stored = stored_or_environment_secret_with(
+            ProviderId::Deepseek,
+            ProviderSlotState::Known(ProviderStoredCredential::ApiKey(
+                super::ProviderApiKeyCredential::new("stored-key"),
+            )),
+            |_| panic!("stored DeepSeek key must own the provider"),
+        )
+        .unwrap();
+        assert_eq!(stored.0.token, "stored-key");
+        assert_eq!(stored.0.source, ProviderSecretSource::StoredApiKey);
+        assert_eq!(stored.0.auth_scheme, AuthScheme::Bearer);
+
+        let environment = stored_or_environment_secret_with(
+            ProviderId::Deepseek,
+            ProviderSlotState::Missing,
+            |provider| {
+                secret(
+                    provider,
+                    "env-key".to_owned(),
+                    ProviderSecretSource::Environment("DEEPSEEK_API_KEY"),
+                )
+                .map(Some)
+            },
+        )
+        .unwrap();
+        assert_eq!(environment.0.token, "env-key");
+        assert_eq!(
+            environment.0.source,
+            ProviderSecretSource::Environment("DEEPSEEK_API_KEY")
+        );
+        assert_eq!(environment.0.auth_scheme, AuthScheme::Bearer);
+
+        let missing = stored_or_environment_secret_with(
+            ProviderId::Deepseek,
+            ProviderSlotState::Missing,
+            |_| Ok(None),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("DEEPSEEK_API_KEY"));
     }
 
     #[test]

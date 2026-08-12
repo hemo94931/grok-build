@@ -494,6 +494,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deepseek_stream_golden_preserves_reasoning_text_tool_and_finish_order() {
+        let reasoning = make_chunk(vec![ChatChunkDelta {
+            role: Some(Role::Assistant),
+            content: None,
+            reasoning_content: Some("plan".into()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }]);
+        let text = text_chunk("answer");
+        let tool = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("call_deepseek".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("lookup".into()),
+                    arguments: Some("{\"q\":\"x\"}".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning),
+            Ok(text),
+            Ok(tool),
+            Ok(final_chunk(FinishReason::ToolCalls)),
+        ];
+        let events = collect(stream_chat_completions(
+            stream::iter(chunks).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        assert!(matches!(events[0], SamplingEvent::StreamStarted { .. }));
+        assert!(matches!(events[1], SamplingEvent::FirstToken { .. }));
+        assert!(matches!(
+            &events[2],
+            SamplingEvent::ChannelToken { channel: SamplingChannel::Reasoning, text, chunk_index: 1, .. }
+                if text == "plan"
+        ));
+        assert!(matches!(
+            &events[3],
+            SamplingEvent::ChannelToken { channel: SamplingChannel::Text, text, chunk_index: 2, .. }
+                if text == "answer"
+        ));
+        assert!(matches!(
+            &events[4],
+            SamplingEvent::ToolCallDelta { tool_index: 0, id: Some(id), name: Some(name), arguments_delta: Some(arguments), .. }
+                if id == "call_deepseek" && name == "lookup" && arguments == "{\"q\":\"x\"}"
+        ));
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+                assert_eq!(response.assistant().unwrap().content.as_ref(), "answer");
+                assert_eq!(response.tool_calls()[0].name, "lookup");
+                let reasoning = response.reasoning_items().next().unwrap();
+                let rs::SummaryPart::SummaryText(summary) = &reasoning.summary[0];
+                assert_eq!(summary.text, "plan");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
         let chunk1 = make_chunk(vec![ChatChunkDelta {

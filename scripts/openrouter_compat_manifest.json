@@ -4,15 +4,18 @@
     "package": "@earendil-works/pi-ai",
     "version": "0.84.1",
     "dataFile": "@earendil-works/pi-ai/dist/providers/data/openrouter.json",
+    "deepSeekDataFile": "@earendil-works/pi-ai/dist/providers/data/deepseek.json",
     "generatedAt": "2026-08-07T05:53:06.539Z",
     "api": "openai-completions"
   },
   "counts": {
-    "catalogMembers": 358,
+    "catalogMembers": 360,
     "catalogOpenRouterMembers": 303,
     "sourceOpenRouterMembers": 335,
     "matchingOpenRouterMembers": 297,
-    "generatedWireFacts": 297,
+    "generatedWireFacts": 299,
+    "catalogDeepSeekMembers": 2,
+    "generatedDeepSeekWireFacts": 2,
     "catalogOnlyOpenRouterMembers": 6,
     "sourceOnlyOpenRouterMembers": 38
   },

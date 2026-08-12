@@ -6,6 +6,7 @@
 mod anthropic;
 mod catalog;
 mod cli;
+mod deepseek;
 mod flow;
 mod github_copilot;
 mod kimi_coding;
@@ -58,16 +59,18 @@ pub(crate) enum ProviderId {
     Openrouter,
     KimiCoding,
     Radius,
+    Deepseek,
 }
 
 impl ProviderId {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Anthropic,
         Self::OpenaiCodex,
         Self::GithubCopilot,
         Self::Openrouter,
         Self::KimiCoding,
         Self::Radius,
+        Self::Deepseek,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -78,6 +81,7 @@ impl ProviderId {
             Self::Openrouter => "openrouter",
             Self::KimiCoding => "kimi-coding",
             Self::Radius => "radius",
+            Self::Deepseek => "deepseek",
         }
     }
 
@@ -89,6 +93,7 @@ impl ProviderId {
             Self::Openrouter => "OpenRouter",
             Self::KimiCoding => "Kimi Coding",
             Self::Radius => "Radius",
+            Self::Deepseek => "DeepSeek",
         }
     }
 
@@ -102,6 +107,7 @@ impl ProviderId {
             Self::Openrouter => xai_grok_sampler::KnownProvider::Openrouter,
             Self::KimiCoding => xai_grok_sampler::KnownProvider::KimiCoding,
             Self::Radius => xai_grok_sampler::KnownProvider::Radius,
+            Self::Deepseek => xai_grok_sampler::KnownProvider::Deepseek,
         }
     }
 }
@@ -172,6 +178,7 @@ pub(crate) async fn login(
         ProviderId::Openrouter => openrouter::login(interaction, mode).await,
         ProviderId::KimiCoding => kimi_coding::login(interaction, mode).await,
         ProviderId::Radius => radius::login(interaction, mode).await,
+        ProviderId::Deepseek => deepseek::login(interaction, mode).await,
     }
 }
 
@@ -187,6 +194,7 @@ async fn refresh(
         ProviderId::Openrouter => openrouter::refresh(credential, signal).await,
         ProviderId::KimiCoding => kimi_coding::refresh(credential, signal).await,
         ProviderId::Radius => radius::refresh(credential, signal).await,
+        ProviderId::Deepseek => deepseek::refresh(credential, signal).await,
     }
 }
 
@@ -455,12 +463,43 @@ mod tests {
                 format!("\"{provider}\"")
             );
         }
+        assert_eq!(
+            "deepseek".parse::<ProviderId>().unwrap(),
+            ProviderId::Deepseek
+        );
+        assert_eq!(ProviderId::Deepseek.display_name(), "DeepSeek");
+    }
+
+    #[test]
+    fn deepseek_is_api_key_only_and_routes_to_sampler_identity() {
+        let descriptor = provider_descriptor(ProviderId::Deepseek);
+        assert_eq!(descriptor.base_url, "https://api.deepseek.com");
+        assert_eq!(
+            descriptor.api_backend,
+            xai_grok_sampler::ApiBackend::ChatCompletions
+        );
+        assert_eq!(
+            descriptor.wire_dialect,
+            ProviderWireDialect::OpenaiChatCompletions
+        );
+        assert_eq!(descriptor.env_keys, &["DEEPSEEK_API_KEY"]);
+        assert_eq!(descriptor.oauth_transports(), Vec::new());
+        assert!(descriptor.supports_method(ProviderCredentialMethod::ApiKey));
+        assert!(!descriptor.supports_method(ProviderCredentialMethod::OAuth));
+        assert_eq!(
+            sampler_route_hint("deepseek/deepseek-v4-flash", "deepseek-v4-flash"),
+            xai_grok_sampler::ProviderRouteHint::Known(xai_grok_sampler::KnownProvider::Deepseek)
+        );
+        assert!(validate_oauth_login_request(ProviderId::Deepseek, None).is_err());
+        let remedy = provider_auth_remedy(ProviderId::Deepseek, ProviderSecretSource::StoredApiKey);
+        assert_eq!(remedy.method, ProviderCredentialMethod::ApiKey);
+        assert!(remedy.advice().contains("--api-key"));
     }
 
     #[test]
     fn provider_login_options_project_authoritative_method_matrix() {
         let options = provider_login_options();
-        assert_eq!(options.len(), 11);
+        assert_eq!(options.len(), 12);
 
         let methods = |provider| {
             options
@@ -489,7 +528,11 @@ mod tests {
             methods(ProviderId::OpenaiCodex),
             vec![ProviderCredentialMethod::OAuth]
         );
-        assert_eq!(cli_login_options().len(), 12);
+        assert_eq!(
+            methods(ProviderId::Deepseek),
+            vec![ProviderCredentialMethod::ApiKey]
+        );
+        assert_eq!(cli_login_options().len(), 13);
     }
 
     #[test]

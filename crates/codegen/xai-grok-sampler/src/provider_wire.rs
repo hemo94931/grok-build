@@ -22,6 +22,7 @@ pub enum KnownProvider {
     Openrouter,
     KimiCoding,
     Radius,
+    Deepseek,
 }
 
 impl KnownProvider {
@@ -33,6 +34,7 @@ impl KnownProvider {
             Self::Openrouter => "openrouter",
             Self::KimiCoding => "kimi-coding",
             Self::Radius => "radius",
+            Self::Deepseek => "deepseek",
         }
     }
 }
@@ -58,6 +60,7 @@ enum ProviderKind {
     Openrouter,
     KimiCoding,
     Radius,
+    Deepseek,
     CustomThirdParty,
 }
 
@@ -70,6 +73,7 @@ impl From<KnownProvider> for ProviderKind {
             KnownProvider::Openrouter => Self::Openrouter,
             KnownProvider::KimiCoding => Self::KimiCoding,
             KnownProvider::Radius => Self::Radius,
+            KnownProvider::Deepseek => Self::Deepseek,
         }
     }
 }
@@ -83,6 +87,7 @@ impl ProviderKind {
             "openrouter" => Some(Self::Openrouter),
             "kimi-coding" => Some(Self::KimiCoding),
             "radius" => Some(Self::Radius),
+            "deepseek" => Some(Self::Deepseek),
             _ => None,
         }
     }
@@ -95,6 +100,7 @@ impl ProviderKind {
             Self::Openrouter => Some("openrouter"),
             Self::KimiCoding => Some("kimi-coding"),
             Self::Radius => Some("radius"),
+            Self::Deepseek => Some("deepseek"),
             Self::CustomThirdParty => None,
         }
     }
@@ -115,6 +121,7 @@ impl ProviderKind {
             Self::Openrouter => host == "openrouter.ai" || host.ends_with(".openrouter.ai"),
             Self::KimiCoding => host == "api.kimi.com" || host.ends_with(".kimi.com"),
             Self::Radius => host == "radius.pi.dev" || host.ends_with(".radius.pi.dev"),
+            Self::Deepseek => host == "api.deepseek.com" || host.ends_with(".api.deepseek.com"),
             Self::CustomThirdParty => false,
         }
     }
@@ -274,7 +281,7 @@ impl ProviderWireRoute {
                 matches!(name.as_str(), "http-referer" | "x-title")
             }
             ProviderKind::KimiCoding => name == "anthropic-version",
-            ProviderKind::Radius => false,
+            ProviderKind::Radius | ProviderKind::Deepseek => false,
             ProviderKind::CustomThirdParty => !is_xai_private_header(&name),
         }
     }
@@ -821,6 +828,142 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("reasoning").is_none());
+    }
+
+    fn deepseek_route(model: &str) -> ProviderWireRoute {
+        ProviderWireRoute::from_config_with_hint(
+            &format!("deepseek/{model}"),
+            "https://api.deepseek.com",
+            ProviderRouteHint::Known(KnownProvider::Deepseek),
+        )
+        .expect("DeepSeek route")
+    }
+
+    #[test]
+    fn deepseek_request_golden_maps_thinking_tokens_and_history() {
+        for (effort, expected_thinking, expected_effort) in [
+            (None, "disabled", None),
+            (Some("none"), "disabled", None),
+            (Some("high"), "enabled", Some("high")),
+            (Some("max"), "enabled", Some("max")),
+        ] {
+            let route = deepseek_route("deepseek-v4-flash");
+            let mut body = serde_json::json!({
+                "model": "deepseek/deepseek-v4-flash",
+                "max_tokens": 384000,
+                "store": true,
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "real reasoning"},
+                    {"role": "assistant", "content": "plain answer"},
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "result"}
+                ]
+            });
+            if let Some(effort) = effort {
+                body.as_object_mut().unwrap().insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(effort.to_owned()),
+                );
+            }
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+
+            assert_eq!(body["model"], "deepseek-v4-flash");
+            assert_eq!(body["max_completion_tokens"], 384000);
+            assert!(body.get("max_tokens").is_none());
+            assert!(body.get("store").is_none());
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": expected_thinking})
+            );
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(body["messages"][2]["reasoning_content"], "real reasoning");
+            assert_eq!(body["messages"][3]["reasoning_content"], "");
+            assert_eq!(body["messages"][4]["reasoning_content"], "");
+            assert!(body["messages"][0].get("reasoning_content").is_none());
+            assert!(body["messages"][1].get("reasoning_content").is_none());
+            assert!(body["messages"][5].get("reasoning_content").is_none());
+        }
+    }
+
+    #[test]
+    fn custom_deepseek_base_url_gets_body_compat_but_not_known_headers() {
+        let route = ProviderWireRoute::from_config_with_hint(
+            "custom-model",
+            "https://EDGE.api.deepseek.com/custom/v1/",
+            ProviderRouteHint::CustomThirdParty,
+        )
+        .unwrap();
+        assert_eq!(route.kind(), ProviderKind::CustomThirdParty);
+        assert!(!route.is_known_provider());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer custom"));
+        headers.insert("anthropic-version", HeaderValue::from_static("custom"));
+        headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
+        route.sanitize_headers(&mut headers);
+        assert!(headers.contains_key("authorization"));
+        assert!(headers.contains_key("anthropic-version"));
+        assert!(!headers.contains_key("x-grok-conv-id"));
+
+        for (effort, expected_type, expected_effort) in [
+            (None, "disabled", None),
+            (Some("none"), "disabled", None),
+            (Some("low"), "disabled", None),
+            (Some("high"), "enabled", Some("high")),
+            (Some("max"), "enabled", Some("max")),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "custom-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "assistant", "content": "prior"}]
+            });
+            if let Some(effort) = effort {
+                body.as_object_mut().unwrap().insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(effort.to_owned()),
+                );
+            }
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            assert_eq!(body["thinking"]["type"], expected_type);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert_eq!(body["messages"][0]["reasoning_content"], "");
+        }
+    }
+
+    #[test]
+    fn known_deepseek_header_allowlist_drops_private_and_foreign_headers() {
+        let route = deepseek_route("deepseek-v4-pro");
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("authorization", "Bearer safe"),
+            ("content-type", "application/json"),
+            ("traceparent", "00-test"),
+            ("anthropic-version", "foreign"),
+            ("x-title", "foreign"),
+            ("x-grok-conv-id", "private"),
+            ("x-xai-token-auth", "private"),
+            ("x-grok-doom-loop-check", "private"),
+            ("x-compaction-at", "private"),
+        ] {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        route.sanitize_headers(&mut headers);
+        assert_eq!(headers.len(), 3);
+        assert!(headers.contains_key("authorization"));
+        assert!(headers.contains_key("content-type"));
+        assert!(headers.contains_key("traceparent"));
     }
 
     #[test]

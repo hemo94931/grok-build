@@ -2773,5 +2773,45 @@
       "supportsDeveloperRole": false,
       "thinkingFormat": "openrouter"
     }
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-v4-flash",
+    "reasoning": true,
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": null,
+      "medium": null,
+      "high": "high",
+      "max": "max"
+    },
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "requiresReasoningContentOnAssistantMessages": true,
+      "thinkingFormat": "deepseek",
+      "supportsReasoningEffort": true,
+      "maxTokensField": "max_completion_tokens"
+    }
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-v4-pro",
+    "reasoning": true,
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": null,
+      "medium": null,
+      "high": "high",
+      "max": "max"
+    },
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "requiresReasoningContentOnAssistantMessages": true,
+      "thinkingFormat": "deepseek",
+      "supportsReasoningEffort": true,
+      "maxTokensField": "max_completion_tokens"
+    }
   }
 ]

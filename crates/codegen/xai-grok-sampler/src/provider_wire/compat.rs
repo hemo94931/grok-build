@@ -162,6 +162,7 @@ fn host_matches(host: &str, expected: &str) -> bool {
 fn provider_defaults(provider: Option<&str>, upstream_model: &str) -> ProviderCompatFields {
     match provider {
         Some("openrouter") => openrouter_fields(upstream_model),
+        Some("deepseek") => deepseek_fields(),
         _ => ProviderCompatFields::default(),
     }
 }
@@ -169,16 +170,7 @@ fn provider_defaults(provider: Option<&str>, upstream_model: &str) -> ProviderCo
 fn profile_defaults(profile: Option<BaseUrlProfile>, upstream_model: &str) -> ProviderCompatFields {
     match profile {
         Some(BaseUrlProfile::Openrouter) => openrouter_fields(upstream_model),
-        Some(BaseUrlProfile::Deepseek) => ProviderCompatFields {
-            supports_store: Some(false),
-            supports_developer_role: Some(false),
-            supports_reasoning_effort: Some(true),
-            max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
-            requires_reasoning_content_on_assistant_messages: Some(true),
-            thinking_format: Some(ThinkingFormat::Deepseek),
-            zai_tool_stream: Some(false),
-            ..Default::default()
-        },
+        Some(BaseUrlProfile::Deepseek) => deepseek_fields(),
         Some(BaseUrlProfile::Zai) => ProviderCompatFields {
             supports_store: Some(false),
             supports_developer_role: Some(false),
@@ -190,6 +182,19 @@ fn profile_defaults(profile: Option<BaseUrlProfile>, upstream_model: &str) -> Pr
             ..Default::default()
         },
         None => ProviderCompatFields::default(),
+    }
+}
+
+fn deepseek_fields() -> ProviderCompatFields {
+    ProviderCompatFields {
+        supports_store: Some(false),
+        supports_developer_role: Some(false),
+        supports_reasoning_effort: Some(true),
+        max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+        requires_reasoning_content_on_assistant_messages: Some(true),
+        thinking_format: Some(ThinkingFormat::Deepseek),
+        zai_tool_stream: Some(false),
+        ..Default::default()
     }
 }
 
@@ -269,6 +274,19 @@ pub(crate) fn apply_chat_completions_compat(
         object.remove("store");
     }
 
+    if facts
+        .compat
+        .requires_reasoning_content_on_assistant_messages
+        && (facts.reasoning || facts.compat.thinking_format == ThinkingFormat::Deepseek)
+    {
+        fill_missing_assistant_reasoning_content(object);
+    }
+
+    if facts.compat.thinking_format == ThinkingFormat::Deepseek {
+        apply_deepseek_thinking(object, facts);
+        return;
+    }
+
     if facts.compat.thinking_format != ThinkingFormat::Openrouter {
         return;
     }
@@ -308,6 +326,51 @@ pub(crate) fn apply_chat_completions_compat(
             {
                 message.insert("role".to_owned(), Value::String("developer".to_owned()));
             }
+        }
+    }
+}
+
+fn apply_deepseek_thinking(
+    object: &mut Map<String, Value>,
+    facts: &ResolvedProviderModelWireFacts,
+) {
+    let requested_effort = object
+        .remove("reasoning_effort")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    object.remove("reasoning");
+
+    let mapped_effort = requested_effort
+        .as_deref()
+        .filter(|value| *value != "none")
+        .and_then(|level| match facts.thinking_level_map.get(level) {
+            Some(mapped) => mapped.clone(),
+            None if matches!(level, "high" | "max") => Some(level.to_owned()),
+            None => None,
+        });
+    // A recognized custom DeepSeek endpoint has no generated model fact, but
+    // explicit high/max still selects thinking. Known catalog models retain
+    // the generated `reasoning` guard.
+    let enabled = mapped_effort.is_some();
+    object.insert(
+        "thinking".to_owned(),
+        serde_json::json!({"type": if enabled { "enabled" } else { "disabled" }}),
+    );
+    if let Some(effort) = mapped_effort {
+        object.insert("reasoning_effort".to_owned(), Value::String(effort));
+    }
+}
+
+fn fill_missing_assistant_reasoning_content(object: &mut Map<String, Value>) {
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && let Some(message) = message.as_object_mut()
+        {
+            message
+                .entry("reasoning_content".to_owned())
+                .or_insert_with(|| Value::String(String::new()));
         }
     }
 }

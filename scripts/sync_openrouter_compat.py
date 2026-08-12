@@ -18,7 +18,9 @@ from typing import Any
 PI_AI_VERSION = "0.84.1"
 SOURCE_GENERATED_AT = "2026-08-07T05:53:06.539Z"
 SOURCE_PACKAGE_PATH = "@earendil-works/pi-ai/dist/providers/data/openrouter.json"
+DEEPSEEK_SOURCE_PACKAGE_PATH = "@earendil-works/pi-ai/dist/providers/data/deepseek.json"
 SOURCE_API_KEY = "openai-completions"
+DEEPSEEK_MODEL_IDS = ("deepseek-v4-flash", "deepseek-v4-pro")
 
 SUPPORTED_COMPAT_KEYS = {
     "supportsStore",
@@ -121,6 +123,79 @@ def validate_source_model(model_id: str, model: dict[str, Any]) -> None:
             )
 
 
+def build_deepseek_models(source_path: Path) -> list[dict[str, Any]]:
+    deepseek_path = source_path.with_name("deepseek.json")
+    if not deepseek_path.is_file():
+        raise FileNotFoundError(f"missing pinned DeepSeek data next to OpenRouter source: {deepseek_path}")
+    raw = load_json(deepseek_path)
+    source_models = raw.get(SOURCE_API_KEY) if isinstance(raw, dict) else None
+    if not isinstance(source_models, dict):
+        raise ValueError(f"DeepSeek source must contain object key {SOURCE_API_KEY!r}")
+    if tuple(source_models) != DEEPSEEK_MODEL_IDS:
+        raise ValueError(
+            f"expected exact DeepSeek model set/order {DEEPSEEK_MODEL_IDS}, "
+            f"found {tuple(source_models)}"
+        )
+
+    models: list[dict[str, Any]] = []
+    expected_common = {
+        "provider": "deepseek",
+        "api": "openai-completions",
+        "baseUrl": "https://api.deepseek.com",
+        "reasoning": True,
+        "contextWindow": 1_000_000,
+        "maxTokens": 384_000,
+    }
+    expected_map = {
+        "minimal": None,
+        "low": None,
+        "medium": None,
+        "high": "high",
+        "max": "max",
+    }
+    for model_id in DEEPSEEK_MODEL_IDS:
+        source = source_models[model_id]
+        if not isinstance(source, dict):
+            raise ValueError(f"{model_id}: DeepSeek source model must be an object")
+        validate_source_model(model_id, source)
+        for key, expected in expected_common.items():
+            if source.get(key) != expected:
+                raise ValueError(f"{model_id}: expected {key}={expected!r}, found {source.get(key)!r}")
+        if source.get("id") != model_id:
+            raise ValueError(f"{model_id}: source id mismatch")
+        if source.get("thinkingLevelMap") != expected_map:
+            raise ValueError(f"{model_id}: thinkingLevelMap drifted")
+        compat = source.get("compat", {})
+        expected_compat = {
+            "supportsStore": False,
+            "supportsDeveloperRole": False,
+            "requiresReasoningContentOnAssistantMessages": True,
+            "thinkingFormat": "deepseek",
+        }
+        if compat != expected_compat:
+            raise ValueError(f"{model_id}: compat drifted: {compat!r}")
+        models.append(
+            {
+                "provider": source["provider"],
+                "id": source["id"],
+                "name": source["name"],
+                "api": source["api"],
+                "baseUrl": source["baseUrl"],
+                "reasoning": source["reasoning"],
+                "contextWindow": source["contextWindow"],
+                "maxTokens": source["maxTokens"],
+                "reasoningEfforts": ["high", "max"],
+                "thinkingLevelMap": dict(source["thinkingLevelMap"]),
+                "compat": {
+                    **compat,
+                    "supportsReasoningEffort": True,
+                    "maxTokensField": "max_completion_tokens",
+                },
+            }
+        )
+    return models
+
+
 def supported_efforts(model: dict[str, Any]) -> list[str]:
     if not model.get("reasoning", False):
         return ["none"]
@@ -143,7 +218,31 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
     catalog = load_json(catalog_path)
     if not isinstance(catalog, list):
         raise ValueError("shell provider catalog must be a JSON array")
+    deepseek_models = build_deepseek_models(source_path)
+    deepseek_ids = {entry["id"] for entry in deepseek_models}
     original_members = [(entry.get("provider"), entry.get("id")) for entry in catalog]
+    existing_deepseek = [
+        entry for entry in catalog if entry.get("provider") == "deepseek"
+    ]
+    if existing_deepseek:
+        existing_members = [
+            (entry.get("provider"), entry.get("id")) for entry in existing_deepseek
+        ]
+        expected_deepseek_members = [
+            ("deepseek", model_id) for model_id in DEEPSEEK_MODEL_IDS
+        ]
+        if existing_members != expected_deepseek_members:
+            raise AssertionError("DeepSeek catalog member set/order drifted")
+        if catalog[-len(existing_deepseek):] != existing_deepseek:
+            raise AssertionError("DeepSeek models must remain append-only at catalog tail")
+        catalog[-len(existing_deepseek):] = deepseek_models
+    else:
+        catalog.extend(deepseek_models)
+    expected_members = original_members or []
+    if not existing_deepseek:
+        expected_members = original_members + [
+            ("deepseek", model_id) for model_id in DEEPSEEK_MODEL_IDS
+        ]
 
     raw_source = load_json(source_path)
     source_models = raw_source.get(SOURCE_API_KEY)
@@ -184,8 +283,19 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             fact["compat"] = compat
         facts.append(fact)
 
-    if [(entry.get("provider"), entry.get("id")) for entry in catalog] != original_members:
-        raise AssertionError("sync changed the provider catalog member set or ordering")
+    facts.extend(
+        {
+            "provider": entry["provider"],
+            "id": entry["id"],
+            "reasoning": entry["reasoning"],
+            "thinkingLevelMap": entry["thinkingLevelMap"],
+            "compat": entry["compat"],
+        }
+        for entry in deepseek_models
+    )
+
+    if [(entry.get("provider"), entry.get("id")) for entry in catalog] != expected_members:
+        raise AssertionError("sync changed existing catalog members or non-append ordering")
 
     manifest = {
         "schemaVersion": 1,
@@ -193,6 +303,7 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             "package": "@earendil-works/pi-ai",
             "version": PI_AI_VERSION,
             "dataFile": SOURCE_PACKAGE_PATH,
+            "deepSeekDataFile": DEEPSEEK_SOURCE_PACKAGE_PATH,
             "generatedAt": SOURCE_GENERATED_AT,
             "api": SOURCE_API_KEY,
         },
@@ -202,6 +313,8 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             "sourceOpenRouterMembers": len(source_models),
             "matchingOpenRouterMembers": len(matching_ids),
             "generatedWireFacts": len(facts),
+            "catalogDeepSeekMembers": len(deepseek_models),
+            "generatedDeepSeekWireFacts": len(deepseek_models),
             "catalogOnlyOpenRouterMembers": len(catalog_ids - source_ids),
             "sourceOnlyOpenRouterMembers": len(source_ids - catalog_ids),
         },
