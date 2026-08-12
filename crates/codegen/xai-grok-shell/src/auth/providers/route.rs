@@ -214,6 +214,26 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
             wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
             env_keys: &["DEEPSEEK_API_KEY"],
         },
+        ProviderId::Zai => ProviderDescriptor {
+            id,
+            display_name: "Z.AI",
+            login_flow: ProviderLoginFlow::None,
+            api_key_login: true,
+            base_url: "https://api.z.ai/api/coding/paas/v4",
+            api_backend: ApiBackend::ChatCompletions,
+            wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
+            env_keys: &["ZAI_API_KEY"],
+        },
+        ProviderId::ZaiCodingCn => ProviderDescriptor {
+            id,
+            display_name: "Z.AI Coding CN",
+            login_flow: ProviderLoginFlow::None,
+            api_key_login: true,
+            base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+            api_backend: ApiBackend::ChatCompletions,
+            wire_dialect: ProviderWireDialect::OpenaiChatCompletions,
+            env_keys: &["ZAI_CODING_CN_API_KEY"],
+        },
     }
 }
 
@@ -521,7 +541,9 @@ fn oauth_scheme(provider: ProviderId) -> AuthScheme {
         | ProviderId::Openrouter
         | ProviderId::KimiCoding
         | ProviderId::Radius
-        | ProviderId::Deepseek => AuthScheme::Bearer,
+        | ProviderId::Deepseek
+        | ProviderId::Zai
+        | ProviderId::ZaiCodingCn => AuthScheme::Bearer,
     }
 }
 
@@ -670,7 +692,11 @@ fn provider_headers(
             headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
             headers.insert("user-agent".to_owned(), "KimiCLI/1.5".to_owned());
         }
-        ProviderId::Openrouter | ProviderId::Radius | ProviderId::Deepseek => {}
+        ProviderId::Openrouter
+        | ProviderId::Radius
+        | ProviderId::Deepseek
+        | ProviderId::Zai
+        | ProviderId::ZaiCodingCn => {}
     }
     Ok(headers)
 }

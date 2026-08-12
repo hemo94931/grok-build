@@ -19,8 +19,26 @@ PI_AI_VERSION = "0.84.1"
 SOURCE_GENERATED_AT = "2026-08-07T05:53:06.539Z"
 SOURCE_PACKAGE_PATH = "@earendil-works/pi-ai/dist/providers/data/openrouter.json"
 DEEPSEEK_SOURCE_PACKAGE_PATH = "@earendil-works/pi-ai/dist/providers/data/deepseek.json"
+ZAI_SOURCE_PACKAGE_PATH = "@earendil-works/pi-ai/dist/providers/data/zai.json"
+ZAI_CODING_CN_SOURCE_PACKAGE_PATH = (
+    "@earendil-works/pi-ai/dist/providers/data/zai-coding-cn.json"
+)
 SOURCE_API_KEY = "openai-completions"
 DEEPSEEK_MODEL_IDS = ("deepseek-v4-flash", "deepseek-v4-pro")
+ZAI_MODEL_SPECS = (
+    ("glm-4.7", "GLM-4.7", 204_800),
+    ("glm-5-turbo", "GLM-5-Turbo", 200_000),
+    ("glm-5.2", "GLM-5.2", 1_000_000),
+    ("glm-5.2-highspeed", "GLM-5.2 Highspeed", 1_000_000),
+)
+ZAI_REGIONS = (
+    ("zai", "zai.json", "https://api.z.ai/api/coding/paas/v4"),
+    (
+        "zai-coding-cn",
+        "zai-coding-cn.json",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    ),
+)
 
 SUPPORTED_COMPAT_KEYS = {
     "supportsStore",
@@ -196,6 +214,85 @@ def build_deepseek_models(source_path: Path) -> list[dict[str, Any]]:
     return models
 
 
+def build_zai_models(source_path: Path) -> list[dict[str, Any]]:
+    expected_ids = tuple(model_id for model_id, _, _ in ZAI_MODEL_SPECS)
+    expected_common_compat = {
+        "supportsStore": False,
+        "supportsDeveloperRole": False,
+        "maxTokensField": "max_tokens",
+        "thinkingFormat": "zai",
+        "zaiToolStream": True,
+    }
+    expected_glm52_map = {
+        "minimal": None,
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "max": "max",
+    }
+    models: list[dict[str, Any]] = []
+    # Z.AI's four model definitions are a single shared source contract. Each
+    # regional pi-ai file is validated against it before the shared definition
+    # is expanded into provider-specific catalog rows and sampler facts.
+    for provider, filename, base_url in ZAI_REGIONS:
+        region_path = source_path.with_name(filename)
+        if not region_path.is_file():
+            raise FileNotFoundError(f"missing pinned Z.AI data next to OpenRouter source: {region_path}")
+        raw = load_json(region_path)
+        source_models = raw.get(SOURCE_API_KEY) if isinstance(raw, dict) else None
+        if not isinstance(source_models, dict):
+            raise ValueError(f"{filename} must contain object key {SOURCE_API_KEY!r}")
+        if tuple(source_models) != expected_ids:
+            raise ValueError(
+                f"expected exact shared Z.AI model set/order {expected_ids}, "
+                f"found {tuple(source_models)} in {filename}"
+            )
+        for model_id, name, context_window in ZAI_MODEL_SPECS:
+            source = source_models[model_id]
+            if not isinstance(source, dict):
+                raise ValueError(f"{filename}:{model_id}: source model must be an object")
+            validate_source_model(model_id, source)
+            expected = {
+                "provider": provider,
+                "id": model_id,
+                "name": name,
+                "api": "openai-completions",
+                "baseUrl": base_url,
+                "reasoning": True,
+                "contextWindow": context_window,
+                "maxTokens": 131_072,
+            }
+            for key, value in expected.items():
+                if source.get(key) != value:
+                    raise ValueError(
+                        f"{filename}:{model_id}: expected {key}={value!r}, "
+                        f"found {source.get(key)!r}"
+                    )
+            supports_effort = model_id == "glm-5.2"
+            expected_compat = {
+                **expected_common_compat,
+                "supportsReasoningEffort": supports_effort,
+            }
+            if source.get("compat") != expected_compat:
+                raise ValueError(f"{filename}:{model_id}: compat drifted: {source.get('compat')!r}")
+            expected_map = expected_glm52_map if supports_effort else None
+            if source.get("thinkingLevelMap") != expected_map:
+                raise ValueError(f"{filename}:{model_id}: thinkingLevelMap drifted")
+            model = {
+                **expected,
+                "reasoningEfforts": (
+                    ["low", "medium", "high", "max"]
+                    if supports_effort
+                    else ["minimal", "low", "medium", "high"]
+                ),
+                "compat": expected_compat,
+            }
+            if expected_map is not None:
+                model["thinkingLevelMap"] = dict(expected_map)
+            models.append(model)
+    return models
+
+
 def supported_efforts(model: dict[str, Any]) -> list[str]:
     if not model.get("reasoning", False):
         return ["none"]
@@ -219,30 +316,33 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
     if not isinstance(catalog, list):
         raise ValueError("shell provider catalog must be a JSON array")
     deepseek_models = build_deepseek_models(source_path)
-    deepseek_ids = {entry["id"] for entry in deepseek_models}
+    zai_models = build_zai_models(source_path)
     original_members = [(entry.get("provider"), entry.get("id")) for entry in catalog]
-    existing_deepseek = [
-        entry for entry in catalog if entry.get("provider") == "deepseek"
+    generated_models = deepseek_models + zai_models
+    generated_providers = {"deepseek", "zai", "zai-coding-cn"}
+    existing_generated = [
+        entry for entry in catalog if entry.get("provider") in generated_providers
     ]
-    if existing_deepseek:
+    expected_generated_members = [
+        (entry["provider"], entry["id"]) for entry in generated_models
+    ]
+    if existing_generated:
         existing_members = [
-            (entry.get("provider"), entry.get("id")) for entry in existing_deepseek
+            (entry.get("provider"), entry.get("id")) for entry in existing_generated
         ]
-        expected_deepseek_members = [
-            ("deepseek", model_id) for model_id in DEEPSEEK_MODEL_IDS
-        ]
-        if existing_members != expected_deepseek_members:
-            raise AssertionError("DeepSeek catalog member set/order drifted")
-        if catalog[-len(existing_deepseek):] != existing_deepseek:
-            raise AssertionError("DeepSeek models must remain append-only at catalog tail")
-        catalog[-len(existing_deepseek):] = deepseek_models
+        if existing_members not in (
+            [("deepseek", model_id) for model_id in DEEPSEEK_MODEL_IDS],
+            expected_generated_members,
+        ):
+            raise AssertionError("generated provider catalog member set/order drifted")
+        if catalog[-len(existing_generated):] != existing_generated:
+            raise AssertionError("generated provider models must remain append-only at catalog tail")
+        catalog[-len(existing_generated):] = generated_models
     else:
-        catalog.extend(deepseek_models)
-    expected_members = original_members or []
-    if not existing_deepseek:
-        expected_members = original_members + [
-            ("deepseek", model_id) for model_id in DEEPSEEK_MODEL_IDS
-        ]
+        catalog.extend(generated_models)
+    expected_members = [
+        member for member in original_members if member[0] not in generated_providers
+    ] + expected_generated_members
 
     raw_source = load_json(source_path)
     source_models = raw_source.get(SOURCE_API_KEY)
@@ -288,10 +388,14 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             "provider": entry["provider"],
             "id": entry["id"],
             "reasoning": entry["reasoning"],
-            "thinkingLevelMap": entry["thinkingLevelMap"],
+            **(
+                {"thinkingLevelMap": entry["thinkingLevelMap"]}
+                if "thinkingLevelMap" in entry
+                else {}
+            ),
             "compat": entry["compat"],
         }
-        for entry in deepseek_models
+        for entry in generated_models
     )
 
     if [(entry.get("provider"), entry.get("id")) for entry in catalog] != expected_members:
@@ -304,6 +408,8 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             "version": PI_AI_VERSION,
             "dataFile": SOURCE_PACKAGE_PATH,
             "deepSeekDataFile": DEEPSEEK_SOURCE_PACKAGE_PATH,
+            "zaiDataFile": ZAI_SOURCE_PACKAGE_PATH,
+            "zaiCodingCnDataFile": ZAI_CODING_CN_SOURCE_PACKAGE_PATH,
             "generatedAt": SOURCE_GENERATED_AT,
             "api": SOURCE_API_KEY,
         },
@@ -315,6 +421,8 @@ def build_outputs(source_path: Path) -> tuple[str, str, str]:
             "generatedWireFacts": len(facts),
             "catalogDeepSeekMembers": len(deepseek_models),
             "generatedDeepSeekWireFacts": len(deepseek_models),
+            "catalogZaiMembers": len(zai_models),
+            "generatedZaiWireFacts": len(zai_models),
             "catalogOnlyOpenRouterMembers": len(catalog_ids - source_ids),
             "sourceOnlyOpenRouterMembers": len(source_ids - catalog_ids),
         },

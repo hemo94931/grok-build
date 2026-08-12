@@ -5,17 +5,21 @@
     "version": "0.84.1",
     "dataFile": "@earendil-works/pi-ai/dist/providers/data/openrouter.json",
     "deepSeekDataFile": "@earendil-works/pi-ai/dist/providers/data/deepseek.json",
+    "zaiDataFile": "@earendil-works/pi-ai/dist/providers/data/zai.json",
+    "zaiCodingCnDataFile": "@earendil-works/pi-ai/dist/providers/data/zai-coding-cn.json",
     "generatedAt": "2026-08-07T05:53:06.539Z",
     "api": "openai-completions"
   },
   "counts": {
-    "catalogMembers": 360,
+    "catalogMembers": 368,
     "catalogOpenRouterMembers": 303,
     "sourceOpenRouterMembers": 335,
     "matchingOpenRouterMembers": 297,
-    "generatedWireFacts": 299,
+    "generatedWireFacts": 307,
     "catalogDeepSeekMembers": 2,
     "generatedDeepSeekWireFacts": 2,
+    "catalogZaiMembers": 8,
+    "generatedZaiWireFacts": 8,
     "catalogOnlyOpenRouterMembers": 6,
     "sourceOnlyOpenRouterMembers": 38
   },

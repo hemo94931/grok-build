@@ -49,6 +49,13 @@ fn default_provider_items() -> Vec<ArgItem> {
             "deepseek",
             "DeepSeek models",
         ),
+        ("Z.AI", "Z.AI zai", "zai", "Z.AI models"),
+        (
+            "Z.AI Coding CN",
+            "Z.AI Coding CN zai-coding-cn",
+            "zai-coding-cn",
+            "Z.AI Coding CN models",
+        ),
     ]
     .into_iter()
     .map(|(display, match_text, insert_text, description)| ArgItem {
@@ -117,6 +124,11 @@ mod tests {
         assert_eq!(
             normalize_known_provider("deepseek").as_deref(),
             Some("deepseek")
+        );
+        assert_eq!(normalize_known_provider("Z.AI").as_deref(), Some("zai"));
+        assert_eq!(
+            normalize_known_provider("Z.AI Coding CN").as_deref(),
+            Some("zai-coding-cn")
         );
         assert_eq!(normalize_known_provider("bad/value"), None);
     }

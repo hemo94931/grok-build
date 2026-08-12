@@ -2813,5 +2813,123 @@
       "supportsReasoningEffort": true,
       "maxTokensField": "max_completion_tokens"
     }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-4.7",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5-turbo",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5.2",
+    "reasoning": true,
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": "high",
+      "medium": "high",
+      "high": "high",
+      "max": "max"
+    },
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": true
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5.2-highspeed",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-4.7",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5-turbo",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5.2",
+    "reasoning": true,
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": "high",
+      "medium": "high",
+      "high": "high",
+      "max": "max"
+    },
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": true
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5.2-highspeed",
+    "reasoning": true,
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
   }
 ]

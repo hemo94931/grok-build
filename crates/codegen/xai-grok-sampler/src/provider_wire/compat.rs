@@ -163,6 +163,7 @@ fn provider_defaults(provider: Option<&str>, upstream_model: &str) -> ProviderCo
     match provider {
         Some("openrouter") => openrouter_fields(upstream_model),
         Some("deepseek") => deepseek_fields(),
+        Some("zai" | "zai-coding-cn") => zai_fields(false),
         _ => ProviderCompatFields::default(),
     }
 }
@@ -171,17 +172,21 @@ fn profile_defaults(profile: Option<BaseUrlProfile>, upstream_model: &str) -> Pr
     match profile {
         Some(BaseUrlProfile::Openrouter) => openrouter_fields(upstream_model),
         Some(BaseUrlProfile::Deepseek) => deepseek_fields(),
-        Some(BaseUrlProfile::Zai) => ProviderCompatFields {
-            supports_store: Some(false),
-            supports_developer_role: Some(false),
-            supports_reasoning_effort: Some(false),
-            max_tokens_field: Some(MaxTokensField::MaxTokens),
-            requires_reasoning_content_on_assistant_messages: Some(false),
-            thinking_format: Some(ThinkingFormat::Zai),
-            zai_tool_stream: Some(false),
-            ..Default::default()
-        },
+        Some(BaseUrlProfile::Zai) => zai_fields(true),
         None => ProviderCompatFields::default(),
+    }
+}
+
+fn zai_fields(tool_stream: bool) -> ProviderCompatFields {
+    ProviderCompatFields {
+        supports_store: Some(false),
+        supports_developer_role: Some(false),
+        supports_reasoning_effort: Some(false),
+        max_tokens_field: Some(MaxTokensField::MaxTokens),
+        requires_reasoning_content_on_assistant_messages: Some(false),
+        thinking_format: Some(ThinkingFormat::Zai),
+        zai_tool_stream: Some(tool_stream),
+        ..Default::default()
     }
 }
 
@@ -287,6 +292,11 @@ pub(crate) fn apply_chat_completions_compat(
         return;
     }
 
+    if facts.compat.thinking_format == ThinkingFormat::Zai {
+        apply_zai_thinking(object, facts);
+        return;
+    }
+
     if facts.compat.thinking_format != ThinkingFormat::Openrouter {
         return;
     }
@@ -357,6 +367,32 @@ fn apply_deepseek_thinking(
     );
     if let Some(effort) = mapped_effort {
         object.insert("reasoning_effort".to_owned(), Value::String(effort));
+    }
+}
+
+fn apply_zai_thinking(object: &mut Map<String, Value>, facts: &ResolvedProviderModelWireFacts) {
+    let requested_effort = object
+        .remove("reasoning_effort")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    object.remove("reasoning");
+
+    let enabled = requested_effort
+        .as_deref()
+        .is_some_and(|value| value != "none");
+    object.insert(
+        "thinking".to_owned(),
+        if enabled {
+            serde_json::json!({"type": "enabled", "clear_thinking": false})
+        } else {
+            serde_json::json!({"type": "disabled"})
+        },
+    );
+    if enabled
+        && facts.compat.supports_reasoning_effort
+        && let Some(level) = requested_effort.as_deref()
+        && let Some(Some(mapped)) = facts.thinking_level_map.get(level)
+    {
+        object.insert("reasoning_effort".to_owned(), Value::String(mapped.clone()));
     }
 }
 

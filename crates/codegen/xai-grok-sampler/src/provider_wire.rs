@@ -23,6 +23,8 @@ pub enum KnownProvider {
     KimiCoding,
     Radius,
     Deepseek,
+    Zai,
+    ZaiCodingCn,
 }
 
 impl KnownProvider {
@@ -35,6 +37,8 @@ impl KnownProvider {
             Self::KimiCoding => "kimi-coding",
             Self::Radius => "radius",
             Self::Deepseek => "deepseek",
+            Self::Zai => "zai",
+            Self::ZaiCodingCn => "zai-coding-cn",
         }
     }
 }
@@ -61,6 +65,8 @@ enum ProviderKind {
     KimiCoding,
     Radius,
     Deepseek,
+    Zai,
+    ZaiCodingCn,
     CustomThirdParty,
 }
 
@@ -74,6 +80,8 @@ impl From<KnownProvider> for ProviderKind {
             KnownProvider::KimiCoding => Self::KimiCoding,
             KnownProvider::Radius => Self::Radius,
             KnownProvider::Deepseek => Self::Deepseek,
+            KnownProvider::Zai => Self::Zai,
+            KnownProvider::ZaiCodingCn => Self::ZaiCodingCn,
         }
     }
 }
@@ -88,6 +96,8 @@ impl ProviderKind {
             "kimi-coding" => Some(Self::KimiCoding),
             "radius" => Some(Self::Radius),
             "deepseek" => Some(Self::Deepseek),
+            "zai" => Some(Self::Zai),
+            "zai-coding-cn" => Some(Self::ZaiCodingCn),
             _ => None,
         }
     }
@@ -101,6 +111,8 @@ impl ProviderKind {
             Self::KimiCoding => Some("kimi-coding"),
             Self::Radius => Some("radius"),
             Self::Deepseek => Some("deepseek"),
+            Self::Zai => Some("zai"),
+            Self::ZaiCodingCn => Some("zai-coding-cn"),
             Self::CustomThirdParty => None,
         }
     }
@@ -122,6 +134,8 @@ impl ProviderKind {
             Self::KimiCoding => host == "api.kimi.com" || host.ends_with(".kimi.com"),
             Self::Radius => host == "radius.pi.dev" || host.ends_with(".radius.pi.dev"),
             Self::Deepseek => host == "api.deepseek.com" || host.ends_with(".api.deepseek.com"),
+            Self::Zai => host == "api.z.ai" || host.ends_with(".api.z.ai"),
+            Self::ZaiCodingCn => host == "open.bigmodel.cn" || host.ends_with(".open.bigmodel.cn"),
             Self::CustomThirdParty => false,
         }
     }
@@ -281,7 +295,10 @@ impl ProviderWireRoute {
                 matches!(name.as_str(), "http-referer" | "x-title")
             }
             ProviderKind::KimiCoding => name == "anthropic-version",
-            ProviderKind::Radius | ProviderKind::Deepseek => false,
+            ProviderKind::Radius
+            | ProviderKind::Deepseek
+            | ProviderKind::Zai
+            | ProviderKind::ZaiCodingCn => false,
             ProviderKind::CustomThirdParty => !is_xai_private_header(&name),
         }
     }
@@ -383,6 +400,17 @@ impl ProviderWireRoute {
         }
         if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
             tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("x_search"));
+        }
+        if *backend == ApiBackend::ChatCompletions && self.facts.compat.zai_tool_stream {
+            let has_tools = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty());
+            if has_tools {
+                object.insert("tool_stream".to_owned(), Value::Bool(true));
+            } else {
+                object.remove("tool_stream");
+            }
         }
     }
 
@@ -964,6 +992,157 @@ mod tests {
         assert!(headers.contains_key("authorization"));
         assert!(headers.contains_key("content-type"));
         assert!(headers.contains_key("traceparent"));
+    }
+
+    fn zai_route(
+        provider: KnownProvider,
+        namespace: &str,
+        base_url: &str,
+        model: &str,
+    ) -> ProviderWireRoute {
+        ProviderWireRoute::from_config_with_hint(
+            &format!("{namespace}/{model}"),
+            base_url,
+            ProviderRouteHint::Known(provider),
+        )
+        .expect("Z.AI route")
+    }
+
+    #[test]
+    fn zai_known_and_custom_routes_keep_header_identity_separate() {
+        for (provider, namespace, base_url, expected_kind) in [
+            (
+                KnownProvider::Zai,
+                "zai",
+                "https://api.z.ai/api/coding/paas/v4",
+                ProviderKind::Zai,
+            ),
+            (
+                KnownProvider::ZaiCodingCn,
+                "zai-coding-cn",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                ProviderKind::ZaiCodingCn,
+            ),
+        ] {
+            let route = zai_route(provider, namespace, base_url, "glm-4.7");
+            assert_eq!(route.kind(), expected_kind);
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", HeaderValue::from_static("Bearer known"));
+            headers.insert("anthropic-version", HeaderValue::from_static("foreign"));
+            headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
+            route.sanitize_headers(&mut headers);
+            assert_eq!(headers.len(), 1);
+            assert!(headers.contains_key("authorization"));
+
+            let custom = ProviderWireRoute::from_config_with_hint(
+                "custom-model",
+                base_url,
+                ProviderRouteHint::CustomThirdParty,
+            )
+            .unwrap();
+            assert_eq!(custom.kind(), ProviderKind::CustomThirdParty);
+            let mut custom_headers = HeaderMap::new();
+            custom_headers.insert("authorization", HeaderValue::from_static("Bearer custom"));
+            custom_headers.insert("anthropic-version", HeaderValue::from_static("custom"));
+            custom_headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
+            custom.sanitize_headers(&mut custom_headers);
+            assert!(custom_headers.contains_key("authorization"));
+            assert!(custom_headers.contains_key("anthropic-version"));
+            assert!(!custom_headers.contains_key("x-grok-conv-id"));
+        }
+    }
+
+    #[test]
+    fn zai_body_goldens_cover_absent_and_explicit_none_thinking_effort_history_and_tools() {
+        // `None` is the serializer's absent Option case; `Some("none")` is
+        // explicit `ReasoningEffort::None`. Both must produce the same disabled
+        // wire shape before the remaining enabled-effort cases are exercised.
+        for (model, effort, expected_effort) in [
+            ("glm-4.7", None, None),
+            ("glm-4.7", Some("none"), None),
+            ("glm-4.7", Some("minimal"), None),
+            ("glm-4.7", Some("high"), None),
+            ("glm-5.2", Some("low"), Some("high")),
+            ("glm-5.2", Some("medium"), Some("high")),
+            ("glm-5.2", Some("high"), Some("high")),
+            ("glm-5.2", Some("max"), Some("max")),
+        ] {
+            let route = zai_route(
+                KnownProvider::Zai,
+                "zai",
+                "https://api.z.ai/api/coding/paas/v4",
+                model,
+            );
+            let mut body = serde_json::json!({
+                "model": format!("zai/{model}"),
+                "max_tokens": 131072,
+                "store": true,
+                "messages": [
+                    {"role": "assistant", "content": "prior", "reasoning_content": "real reasoning"},
+                    {"role": "assistant", "content": "plain"}
+                ]
+            });
+            if let Some(effort) = effort {
+                body.as_object_mut().unwrap().insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(effort.to_owned()),
+                );
+            }
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            assert_eq!(body["model"], model);
+            assert_eq!(body["max_tokens"], 131072);
+            assert!(body.get("max_completion_tokens").is_none());
+            assert!(body.get("store").is_none());
+            let enabled = effort.is_some_and(|value| value != "none");
+            assert_eq!(
+                body["thinking"]["type"],
+                if enabled { "enabled" } else { "disabled" }
+            );
+            assert_eq!(
+                body["thinking"].get("clear_thinking"),
+                enabled.then_some(&Value::Bool(false))
+            );
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(body["messages"][0]["reasoning_content"], "real reasoning");
+            assert!(body["messages"][1].get("reasoning_content").is_none());
+        }
+
+        for tools in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([{"type":"x_search"}])),
+            Some(
+                serde_json::json!([{"type":"function","function":{"name":"read","parameters":{}}}]),
+            ),
+            Some(
+                serde_json::json!([{"type":"x_search"},{"type":"function","function":{"name":"read","parameters":{}}}]),
+            ),
+        ] {
+            let route = zai_route(
+                KnownProvider::ZaiCodingCn,
+                "zai-coding-cn",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "glm-5-turbo",
+            );
+            let mut body = serde_json::json!({"model":"zai-coding-cn/glm-5-turbo","messages":[]});
+            if let Some(tools) = tools {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("tools".to_owned(), tools);
+            }
+            route.sanitize_body(&mut body, &ApiBackend::ChatCompletions);
+            let has_tools = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty());
+            assert_eq!(
+                body.get("tool_stream").and_then(Value::as_bool),
+                has_tools.then_some(true)
+            );
+        }
     }
 
     #[test]

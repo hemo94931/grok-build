@@ -206,6 +206,112 @@ mod tests {
     }
 
     #[test]
+    fn zai_region_catalogs_share_models_but_keep_region_identity() {
+        let global = provider_models(ProviderId::Zai, None);
+        let cn = provider_models(ProviderId::ZaiCodingCn, None);
+        assert_eq!(global.len(), 4);
+        assert_eq!(cn.len(), 4);
+        let expected = [
+            ("glm-4.7", "GLM-4.7", 204_800_u64),
+            ("glm-5-turbo", "GLM-5-Turbo", 200_000),
+            ("glm-5.2", "GLM-5.2", 1_000_000),
+            ("glm-5.2-highspeed", "GLM-5.2 Highspeed", 1_000_000),
+        ];
+        for (models, provider, base_url) in [
+            (
+                &global,
+                ProviderId::Zai,
+                "https://api.z.ai/api/coding/paas/v4",
+            ),
+            (
+                &cn,
+                ProviderId::ZaiCodingCn,
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+            ),
+        ] {
+            for (model, (id, name, context)) in models.iter().zip(expected) {
+                assert_eq!(model.provider, provider);
+                assert_eq!(model.id, id);
+                assert_eq!(model.name, name);
+                assert_eq!(model.base_url, base_url);
+                assert_eq!(model.api_backend(), Some(ApiBackend::ChatCompletions));
+                assert!(model.reasoning);
+                assert_eq!(model.context_window, context);
+                assert_eq!(model.max_tokens, 131_072);
+                assert_eq!(model.compat.supports_store, Some(false));
+                assert_eq!(model.compat.supports_developer_role, Some(false));
+                assert_eq!(model.compat.max_tokens_field.as_deref(), Some("max_tokens"));
+                assert_eq!(model.compat.thinking_format.as_deref(), Some("zai"));
+                assert_eq!(model.compat.zai_tool_stream, Some(true));
+                let menu = model
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>();
+                if id == "glm-5.2" {
+                    assert_eq!(model.compat.supports_reasoning_effort, Some(true));
+                    assert_eq!(
+                        menu,
+                        vec![
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Max
+                        ]
+                    );
+                    assert_eq!(
+                        model.thinking_level_map,
+                        BTreeMap::from([
+                            ("minimal".to_owned(), None),
+                            ("low".to_owned(), Some("high".to_owned())),
+                            ("medium".to_owned(), Some("high".to_owned())),
+                            ("high".to_owned(), Some("high".to_owned())),
+                            ("max".to_owned(), Some("max".to_owned())),
+                        ])
+                    );
+                } else {
+                    assert_eq!(model.compat.supports_reasoning_effort, Some(false));
+                    assert_eq!(
+                        menu,
+                        vec![
+                            ReasoningEffort::Minimal,
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High
+                        ]
+                    );
+                    assert!(model.thinking_level_map.is_empty());
+                }
+            }
+        }
+        assert_eq!(
+            global
+                .iter()
+                .map(|model| (
+                    &model.id,
+                    &model.name,
+                    model.context_window,
+                    model.max_tokens,
+                    &model.reasoning_efforts,
+                    &model.thinking_level_map,
+                    &model.compat
+                ))
+                .collect::<Vec<_>>(),
+            cn.iter()
+                .map(|model| (
+                    &model.id,
+                    &model.name,
+                    model.context_window,
+                    model.max_tokens,
+                    &model.reasoning_efforts,
+                    &model.thinking_level_map,
+                    &model.compat
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn copilot_catalog_honors_server_model_filter() {
         let mut credential = ProviderCredential::permanent("secret");
         credential.set_metadata("availableModelIds", serde_json::json!(["gpt-4.1"]));
@@ -332,9 +438,29 @@ mod tests {
         compat: ProviderCatalogCompat,
     }
 
-    fn expected_effort_menu(reasoning: bool, map: &ThinkingLevelMap) -> Vec<ReasoningEffort> {
-        if !reasoning {
+    fn expected_effort_menu(fact: &GeneratedWireFact) -> Vec<ReasoningEffort> {
+        if !fact.reasoning {
             return vec![ReasoningEffort::None];
+        }
+        if fact.provider == ProviderId::Deepseek {
+            return vec![ReasoningEffort::High, ReasoningEffort::Max];
+        }
+        if matches!(fact.provider, ProviderId::Zai | ProviderId::ZaiCodingCn) {
+            return if fact.compat.supports_reasoning_effort == Some(true) {
+                vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ]
+            } else {
+                vec![
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]
+            };
         }
         [
             ("off", ReasoningEffort::None),
@@ -346,7 +472,7 @@ mod tests {
             ("max", ReasoningEffort::Max),
         ]
         .into_iter()
-        .filter_map(|(level, effort)| match map.get(level) {
+        .filter_map(|(level, effort)| match fact.thinking_level_map.get(level) {
             Some(None) => None,
             None if matches!(level, "xhigh" | "max") => None,
             _ => Some(effort),
@@ -364,16 +490,18 @@ mod tests {
             "../../../../../../scripts/openrouter_compat_manifest.json"
         ))
         .expect("OpenRouter sync manifest");
-        assert_eq!(static_models().len(), 360, "catalog member set changed");
+        assert_eq!(static_models().len(), 368, "catalog member set changed");
         assert_eq!(manifest["source"]["version"], "0.84.1");
         assert_eq!(
             manifest["source"]["generatedAt"],
             "2026-08-07T05:53:06.539Z"
         );
-        assert_eq!(manifest["counts"]["catalogMembers"], 360);
+        assert_eq!(manifest["counts"]["catalogMembers"], 368);
         assert_eq!(manifest["counts"]["catalogOpenRouterMembers"], 303);
         assert_eq!(manifest["counts"]["catalogDeepSeekMembers"], 2);
         assert_eq!(manifest["counts"]["generatedDeepSeekWireFacts"], 2);
+        assert_eq!(manifest["counts"]["catalogZaiMembers"], 8);
+        assert_eq!(manifest["counts"]["generatedZaiWireFacts"], 8);
         assert_eq!(
             facts.len(),
             manifest["counts"]["generatedWireFacts"]
@@ -384,7 +512,10 @@ mod tests {
         for fact in facts {
             assert!(matches!(
                 fact.provider,
-                ProviderId::Openrouter | ProviderId::Deepseek
+                ProviderId::Openrouter
+                    | ProviderId::Deepseek
+                    | ProviderId::Zai
+                    | ProviderId::ZaiCodingCn
             ));
             let catalog = static_models()
                 .iter()
@@ -405,7 +536,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 menu,
-                expected_effort_menu(fact.reasoning, &fact.thinking_level_map),
+                expected_effort_menu(&fact),
                 "{} reasoning effort menu",
                 fact.id
             );

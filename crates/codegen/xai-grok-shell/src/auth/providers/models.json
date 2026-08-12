@@ -6969,5 +6969,211 @@
       "supportsReasoningEffort": true,
       "maxTokensField": "max_completion_tokens"
     }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-4.7",
+    "name": "GLM-4.7",
+    "api": "openai-completions",
+    "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 204800,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5-turbo",
+    "name": "GLM-5-Turbo",
+    "api": "openai-completions",
+    "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 200000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5.2",
+    "name": "GLM-5.2",
+    "api": "openai-completions",
+    "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 1000000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "max"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": true
+    },
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": "high",
+      "medium": "high",
+      "high": "high",
+      "max": "max"
+    }
+  },
+  {
+    "provider": "zai",
+    "id": "glm-5.2-highspeed",
+    "name": "GLM-5.2 Highspeed",
+    "api": "openai-completions",
+    "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 1000000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-4.7",
+    "name": "GLM-4.7",
+    "api": "openai-completions",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 204800,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5-turbo",
+    "name": "GLM-5-Turbo",
+    "api": "openai-completions",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 200000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5.2",
+    "name": "GLM-5.2",
+    "api": "openai-completions",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 1000000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "max"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": true
+    },
+    "thinkingLevelMap": {
+      "minimal": null,
+      "low": "high",
+      "medium": "high",
+      "high": "high",
+      "max": "max"
+    }
+  },
+  {
+    "provider": "zai-coding-cn",
+    "id": "glm-5.2-highspeed",
+    "name": "GLM-5.2 Highspeed",
+    "api": "openai-completions",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "reasoning": true,
+    "contextWindow": 1000000,
+    "maxTokens": 131072,
+    "reasoningEfforts": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "maxTokensField": "max_tokens",
+      "thinkingFormat": "zai",
+      "zaiToolStream": true,
+      "supportsReasoningEffort": false
+    }
   }
 ]

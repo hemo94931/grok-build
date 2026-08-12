@@ -15,6 +15,7 @@ mod openrouter;
 mod radius;
 mod route;
 mod store;
+mod zai;
 
 use std::fmt;
 use std::str::FromStr;
@@ -60,10 +61,12 @@ pub(crate) enum ProviderId {
     KimiCoding,
     Radius,
     Deepseek,
+    Zai,
+    ZaiCodingCn,
 }
 
 impl ProviderId {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Anthropic,
         Self::OpenaiCodex,
         Self::GithubCopilot,
@@ -71,6 +74,8 @@ impl ProviderId {
         Self::KimiCoding,
         Self::Radius,
         Self::Deepseek,
+        Self::Zai,
+        Self::ZaiCodingCn,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -82,6 +87,8 @@ impl ProviderId {
             Self::KimiCoding => "kimi-coding",
             Self::Radius => "radius",
             Self::Deepseek => "deepseek",
+            Self::Zai => "zai",
+            Self::ZaiCodingCn => "zai-coding-cn",
         }
     }
 
@@ -94,6 +101,8 @@ impl ProviderId {
             Self::KimiCoding => "Kimi Coding",
             Self::Radius => "Radius",
             Self::Deepseek => "DeepSeek",
+            Self::Zai => "Z.AI",
+            Self::ZaiCodingCn => "Z.AI Coding CN",
         }
     }
 
@@ -108,6 +117,8 @@ impl ProviderId {
             Self::KimiCoding => xai_grok_sampler::KnownProvider::KimiCoding,
             Self::Radius => xai_grok_sampler::KnownProvider::Radius,
             Self::Deepseek => xai_grok_sampler::KnownProvider::Deepseek,
+            Self::Zai => xai_grok_sampler::KnownProvider::Zai,
+            Self::ZaiCodingCn => xai_grok_sampler::KnownProvider::ZaiCodingCn,
         }
     }
 }
@@ -179,6 +190,7 @@ pub(crate) async fn login(
         ProviderId::KimiCoding => kimi_coding::login(interaction, mode).await,
         ProviderId::Radius => radius::login(interaction, mode).await,
         ProviderId::Deepseek => deepseek::login(interaction, mode).await,
+        ProviderId::Zai | ProviderId::ZaiCodingCn => zai::login(interaction, mode).await,
     }
 }
 
@@ -195,6 +207,7 @@ async fn refresh(
         ProviderId::KimiCoding => kimi_coding::refresh(credential, signal).await,
         ProviderId::Radius => radius::refresh(credential, signal).await,
         ProviderId::Deepseek => deepseek::refresh(credential, signal).await,
+        ProviderId::Zai | ProviderId::ZaiCodingCn => zai::refresh(credential, signal).await,
     }
 }
 
@@ -468,6 +481,13 @@ mod tests {
             ProviderId::Deepseek
         );
         assert_eq!(ProviderId::Deepseek.display_name(), "DeepSeek");
+        assert_eq!("zai".parse::<ProviderId>().unwrap(), ProviderId::Zai);
+        assert_eq!(
+            "zai-coding-cn".parse::<ProviderId>().unwrap(),
+            ProviderId::ZaiCodingCn
+        );
+        assert_eq!(ProviderId::Zai.display_name(), "Z.AI");
+        assert_eq!(ProviderId::ZaiCodingCn.display_name(), "Z.AI Coding CN");
     }
 
     #[test]
@@ -497,9 +517,49 @@ mod tests {
     }
 
     #[test]
+    fn zai_variants_are_api_key_only_bearer_chat_providers() {
+        for (provider, base_url, env_key, known) in [
+            (
+                ProviderId::Zai,
+                "https://api.z.ai/api/coding/paas/v4",
+                "ZAI_API_KEY",
+                xai_grok_sampler::KnownProvider::Zai,
+            ),
+            (
+                ProviderId::ZaiCodingCn,
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "ZAI_CODING_CN_API_KEY",
+                xai_grok_sampler::KnownProvider::ZaiCodingCn,
+            ),
+        ] {
+            let descriptor = provider_descriptor(provider);
+            assert_eq!(descriptor.base_url, base_url);
+            assert_eq!(
+                descriptor.api_backend,
+                xai_grok_sampler::ApiBackend::ChatCompletions
+            );
+            assert_eq!(
+                descriptor.wire_dialect,
+                ProviderWireDialect::OpenaiChatCompletions
+            );
+            assert_eq!(descriptor.env_keys, &[env_key]);
+            assert_eq!(descriptor.oauth_transports(), Vec::new());
+            assert!(descriptor.supports_method(ProviderCredentialMethod::ApiKey));
+            assert!(!descriptor.supports_method(ProviderCredentialMethod::OAuth));
+            assert!(validate_oauth_login_request(provider, None).is_err());
+            assert_eq!(
+                sampler_route_hint(&format!("{provider}/glm-4.7"), "glm-4.7"),
+                xai_grok_sampler::ProviderRouteHint::Known(known)
+            );
+            let secret = ProviderSecret::from_api_key(provider, "key".to_owned()).unwrap();
+            assert_eq!(secret.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+        }
+    }
+
+    #[test]
     fn provider_login_options_project_authoritative_method_matrix() {
         let options = provider_login_options();
-        assert_eq!(options.len(), 12);
+        assert_eq!(options.len(), 14);
 
         let methods = |provider| {
             options
@@ -528,11 +588,14 @@ mod tests {
             methods(ProviderId::OpenaiCodex),
             vec![ProviderCredentialMethod::OAuth]
         );
-        assert_eq!(
-            methods(ProviderId::Deepseek),
-            vec![ProviderCredentialMethod::ApiKey]
-        );
-        assert_eq!(cli_login_options().len(), 13);
+        for provider in [
+            ProviderId::Deepseek,
+            ProviderId::Zai,
+            ProviderId::ZaiCodingCn,
+        ] {
+            assert_eq!(methods(provider), vec![ProviderCredentialMethod::ApiKey]);
+        }
+        assert_eq!(cli_login_options().len(), 15);
     }
 
     #[test]
