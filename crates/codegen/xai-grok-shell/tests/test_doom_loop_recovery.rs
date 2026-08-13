@@ -12,7 +12,7 @@
 mod common;
 
 use common::{create_test_client, test_sampler_config};
-use xai_grok_sampler::RetryPolicy;
+use xai_grok_sampler::{ProviderRouteHint, RetryPolicy};
 use xai_grok_sampling_types::doom_loop::{DoomLoopSignalKind, SAMPLE_CHECK_EVENT_DATA_CUMULATIVE};
 use xai_grok_shell::sampling::{
     ApiBackend, Client, ConversationItem, ConversationRequest, RequestId, SamplerActor,
@@ -32,7 +32,7 @@ const MODEL: &str = "test-model";
 fn doom_loop_client(base_url: &str) -> Client {
     let mut config = test_sampler_config(base_url, ApiBackend::Responses, &[]);
     config.doom_loop_recovery = Some(Default::default());
-    Client::new(config).unwrap()
+    Client::new_with_route(config, ProviderRouteHint::FirstPartyXai).unwrap()
 }
 
 /// A sampler actor (the rung that owns retry/recovery) with the given
@@ -49,7 +49,7 @@ fn spawn_actor(base_url: &str, doom_loop_enabled: bool) -> SamplerHandle {
         ..RetryPolicy::default()
     };
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-    SamplerActor::spawn(config, retry, event_tx)
+    SamplerActor::spawn_with_route(config, ProviderRouteHint::FirstPartyXai, retry, event_tx)
 }
 
 fn user_request(text: &str) -> ConversationRequest {

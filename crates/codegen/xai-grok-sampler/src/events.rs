@@ -225,12 +225,12 @@ impl SamplingErrorKind {
 impl From<&SamplingError> for SamplingErrorInfo {
     fn from(err: &SamplingError) -> Self {
         let is_retryable = err.is_retryable();
-        let message = err.to_string();
+        let message = xai_grok_sampling_types::redact_credential_shaped_text(&err.to_string());
 
         let (kind, status_code, retry_after_secs, model_metadata) = match err {
             SamplingError::Auth { .. } => (SamplingErrorKind::Auth, None, None, None),
             SamplingError::InvalidConfiguration(_) => (SamplingErrorKind::Api, None, None, None),
-            SamplingError::Http(_) => (SamplingErrorKind::Http, None, None, None),
+            SamplingError::Http { .. } => (SamplingErrorKind::Http, None, None, None),
             SamplingError::Serialization(_) => (SamplingErrorKind::Serialization, None, None, None),
             SamplingError::Api {
                 status,
@@ -300,6 +300,32 @@ impl From<&SamplingError> for SamplingErrorInfo {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+
+    #[test]
+    fn sampling_error_info_redacts_provider_secret_sentinels() {
+        for secret in [
+            "sentinel-prefix-raw-value-sentinel-suffix",
+            "sk-ant-oat-sentinel-prefix-middle-sentinel-suffix",
+            "xy",
+        ] {
+            let error = SamplingError::StreamError {
+                error_type: "provider_error".to_owned(),
+                message: format!("authorization: Bearer {secret}; api_key={secret}"),
+            };
+            let info = SamplingErrorInfo::from(&error);
+            for fragment in [
+                secret,
+                &secret[..secret.len().min(8)],
+                &secret[secret.len().saturating_sub(secret.len().min(8))..],
+            ] {
+                assert!(
+                    !info.message.contains(fragment),
+                    "error info leaked {fragment:?}: {}",
+                    info.message
+                );
+            }
+        }
+    }
 
     #[test]
     fn from_sampling_error_carries_should_retry_header() {

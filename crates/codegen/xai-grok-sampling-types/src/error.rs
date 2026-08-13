@@ -143,7 +143,7 @@ impl SentCredential {
 /// can never drift from what Display actually emits.
 const SERIALIZATION_DISPLAY_PREFIX: &str = "serialization error: ";
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SamplingError {
     #[error("{message}")]
     Auth {
@@ -153,8 +153,12 @@ pub enum SamplingError {
     },
     #[error("invalid client configuration: {0}")]
     InvalidConfiguration(&'static str),
-    #[error("request error: {0}")]
-    Http(reqwest::Error),
+    #[error("request error ({kind})")]
+    Http {
+        kind: HttpErrorKind,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("{prefix}{0}", prefix = SERIALIZATION_DISPLAY_PREFIX)]
     Serialization(serde_json::Error),
     #[error("API error (status {status}): {message}")]
@@ -195,6 +199,70 @@ pub enum SamplingError {
         triggers: Vec<String>,
         aborted_at_chunk: Option<u64>,
     },
+}
+
+impl fmt::Debug for SamplingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SamplingError");
+        match self {
+            Self::Auth { credential, .. } => {
+                debug.field("kind", &"Auth").field("credential", credential)
+            }
+            Self::InvalidConfiguration(_) => debug.field("kind", &"InvalidConfiguration"),
+            Self::Http { kind, .. } => debug.field("kind", &"Http").field("http_kind", kind),
+            Self::Serialization(_) => debug.field("kind", &"Serialization"),
+            Self::Api {
+                status,
+                retry_after_secs,
+                should_retry,
+                ..
+            } => debug
+                .field("kind", &"Api")
+                .field("status", status)
+                .field("retry_after_secs", retry_after_secs)
+                .field("should_retry", should_retry),
+            Self::EventStreamError(_) => debug.field("kind", &"EventStreamError"),
+            Self::StreamError { .. } => debug.field("kind", &"StreamError"),
+            Self::IdleTimeout { elapsed_secs } => debug
+                .field("kind", &"IdleTimeout")
+                .field("elapsed_secs", elapsed_secs),
+            Self::EmptyResponse { context } => debug
+                .field("kind", &"EmptyResponse")
+                .field("reason", &context.reason),
+            Self::MaxTokensTruncation => debug.field("kind", &"MaxTokensTruncation"),
+            Self::DoomLoopDetected {
+                triggers,
+                aborted_at_chunk,
+            } => debug
+                .field("kind", &"DoomLoopDetected")
+                .field("trigger_count", &triggers.len())
+                .field("aborted_at_chunk", aborted_at_chunk),
+        }
+        .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpErrorKind {
+    Timeout,
+    Connect,
+    Status,
+    Request,
+    Body,
+    Transport,
+}
+
+impl fmt::Display for HttpErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Status => "status",
+            Self::Request => "request",
+            Self::Body => "body",
+            Self::Transport => "transport",
+        })
+    }
 }
 
 impl SamplingError {
@@ -274,7 +342,7 @@ impl SamplingError {
     /// reason.
     pub fn is_likely_body_rejected(&self) -> bool {
         match self {
-            SamplingError::Http(err) => {
+            SamplingError::Http { source: err, .. } => {
                 // `is_request()` covers broken-pipe / connection-reset during
                 // body upload.  `is_body()` covers stream-write failures.
                 // Exclude timeouts and connect errors — those are unrelated.
@@ -317,7 +385,7 @@ impl SamplingError {
         match self {
             SamplingError::Auth { .. } => false,
             SamplingError::InvalidConfiguration(_) => false,
-            SamplingError::Http(err) => is_retryable_reqwest(err),
+            SamplingError::Http { source: err, .. } => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
             SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
@@ -402,8 +470,21 @@ impl SamplingError {
 }
 
 impl From<reqwest::Error> for SamplingError {
-    fn from(value: reqwest::Error) -> Self {
-        Self::Http(value)
+    fn from(source: reqwest::Error) -> Self {
+        let kind = if source.is_timeout() {
+            HttpErrorKind::Timeout
+        } else if source.is_connect() {
+            HttpErrorKind::Connect
+        } else if source.is_status() {
+            HttpErrorKind::Status
+        } else if source.is_request() {
+            HttpErrorKind::Request
+        } else if source.is_body() {
+            HttpErrorKind::Body
+        } else {
+            HttpErrorKind::Transport
+        };
+        Self::Http { kind, source }
     }
 }
 
@@ -542,11 +623,36 @@ pub fn parse_error_bytes(bytes: &[u8]) -> String {
 /// (including Cloudflare HTML) maps to a status-based string — no body
 /// content matching.
 pub fn user_facing_api_error_message(status: StatusCode, bytes: &[u8]) -> String {
-    structured_error_message(bytes).unwrap_or_else(|| status_user_message(status))
+    user_facing_api_error_message_with_credentials(status, bytes, std::iter::empty())
+}
+
+/// Request-scoped HTTP error rendering for every exact secret carried by the
+/// request, including credentials configured in URL query parameters.
+pub fn user_facing_api_error_message_with_credentials<'a>(
+    status: StatusCode,
+    bytes: &[u8],
+    credentials: impl IntoIterator<Item = &'a str>,
+) -> String {
+    crate::redact_known_credentials(
+        &structured_error_message(bytes).unwrap_or_else(|| status_user_message(status)),
+        credentials,
+    )
 }
 
 pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
+    try_parse_stream_error_with_credentials(data, std::iter::empty())
+}
+
+/// Request-scoped SSE error parsing for every exact secret carried by the
+/// request. Raw event data never reaches tracing before this replacement.
+pub fn try_parse_stream_error_with_credentials<'a>(
+    data: &str,
+    credentials: impl IntoIterator<Item = &'a str>,
+) -> Option<SamplingError> {
     let (error_type, message) = try_parse_error(data)?;
+    let credentials = credentials.into_iter().collect::<Vec<_>>();
+    let error_type = crate::redact_known_credentials(&error_type, credentials.iter().copied());
+    let message = crate::redact_known_credentials(&message, credentials.iter().copied());
     tracing::warn!(error_type, message, "Server-side stream error");
     Some(SamplingError::StreamError {
         error_type,
@@ -920,6 +1026,52 @@ mod tests {
     }
 
     #[test]
+    fn upstream_errors_redact_raw_prefix_suffix_and_short_credentials() {
+        for secret in [
+            "sentinel-prefix-raw-value-sentinel-suffix",
+            "sk-ant-oat-sentinel-prefix-middle-sentinel-suffix",
+            "xy",
+        ] {
+            let body = serde_json::json!({
+                "error": {
+                    "type": "provider_error",
+                    "message": format!("authorization: Bearer {secret}; api_key={secret}")
+                }
+            })
+            .to_string();
+            let shown = user_facing_api_error_message_with_credentials(
+                StatusCode::BAD_REQUEST,
+                body.as_bytes(),
+                [secret],
+            );
+            for fragment in [
+                secret,
+                &secret[..secret.len().min(8)],
+                &secret[secret.len().saturating_sub(secret.len().min(8))..],
+            ] {
+                assert!(
+                    !shown.contains(fragment),
+                    "HTTP error leaked {fragment:?}: {shown}"
+                );
+            }
+
+            let stream =
+                try_parse_stream_error_with_credentials(&body, [secret]).expect("stream error");
+            let rendered = stream.to_string();
+            for fragment in [
+                secret,
+                &secret[..secret.len().min(8)],
+                &secret[secret.len().saturating_sub(secret.len().min(8))..],
+            ] {
+                assert!(
+                    !rendered.contains(fragment),
+                    "stream error leaked {fragment:?}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn user_facing_keeps_json_error_message() {
         let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
@@ -1263,6 +1415,74 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_error_display_omits_url_userinfo_and_query_values() {
+        let secret = "sentinel-prefix-raw-value-sentinel-suffix";
+        let error = reqwest::get(format!(
+            "http://user:{secret}@127.0.0.1:0/v1?token={secret}"
+        ))
+        .await
+        .expect_err("port zero request must fail");
+        let error = SamplingError::from(error);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for (surface, rendered) in [("Display", &display), ("Debug", &debug)] {
+            for forbidden in [secret, "user:", "token=", "127.0.0.1"] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "HTTP error {surface} leaked {forbidden:?}: {rendered}"
+                );
+            }
+        }
+        assert!(display.starts_with("request error ("));
+        assert!(debug.contains("http_kind"));
+    }
+
+    #[test]
+    fn sampling_error_debug_is_structural_for_string_bearing_variants() {
+        let sentinel = "sentinel-model-endpoint-env-header-secret";
+        let errors = [
+            SamplingError::auth_unknown(sentinel),
+            SamplingError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                message: sentinel.to_owned(),
+                model_metadata: Some(ResponseModelMetadata {
+                    models_etag: Some(sentinel.to_owned()),
+                    ..Default::default()
+                }),
+                retry_after_secs: None,
+                should_retry: None,
+            },
+            SamplingError::EventStreamError(sentinel.to_owned()),
+            SamplingError::StreamError {
+                error_type: sentinel.to_owned(),
+                message: sentinel.to_owned(),
+            },
+            SamplingError::EmptyResponse {
+                context: EmptyResponseContext {
+                    reason: EmptyReason::NoVisibleContent,
+                    had_reasoning: false,
+                    content_len: 0,
+                    tool_call_count: 0,
+                    finish_reason: Some(sentinel.to_owned()),
+                    completion_tokens: None,
+                    reasoning_tokens: None,
+                    prompt_tokens: None,
+                    model: sentinel.to_owned(),
+                    first_choice_seen: false,
+                },
+            },
+            SamplingError::DoomLoopDetected {
+                triggers: vec![sentinel.to_owned()],
+                aborted_at_chunk: None,
+            },
+        ];
+        for error in errors {
+            let debug = format!("{error:?}");
+            assert!(!debug.contains(sentinel), "Debug leaked: {debug}");
         }
     }
 

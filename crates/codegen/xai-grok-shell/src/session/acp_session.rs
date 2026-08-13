@@ -1641,6 +1641,9 @@ mod prompt_mode_transition_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/prompt_queue_actor_tests.rs"]
 mod prompt_queue_actor_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/provider_aux_fail_closed_tests.rs"]
+mod provider_aux_fail_closed_tests;
 /// Regression coverage for the per-turn `record_token_usage` path.
 #[cfg(test)]
 #[path = "acp_session_tests/record_response_token_usage_tests.rs"]

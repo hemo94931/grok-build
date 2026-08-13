@@ -295,28 +295,14 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
             )
         }
 
-        SamplingError::Http(e) => {
-            let mut details = Vec::new();
-            if e.is_timeout() {
-                details.push("timeout".to_string());
-            }
-            if e.is_connect() {
-                details.push("connection failed".to_string());
-            }
-            if let Some(status) = e.status() {
-                details.push(format!("status {}", status));
-            }
-            if let Some(url) = e.url() {
-                details.push(format!("url: {}", url));
-            }
-            let detail_str = if details.is_empty() {
-                e.to_string()
-            } else {
-                format!("{} ({})", e, details.join(", "))
-            };
+        SamplingError::Http { kind, source } => {
+            let status = source
+                .status()
+                .map(|status| format!(" with status {}", status.as_u16()))
+                .unwrap_or_default();
             format!(
-                "{}HTTP request failed: {}. This may be a network issue or the API endpoint may be unavailable.",
-                retry_prefix, detail_str
+                "{}HTTP request failed ({kind}{status}). This may be a network issue or the API endpoint may be unavailable.",
+                retry_prefix
             )
         }
         SamplingError::Serialization(e) => {
@@ -373,10 +359,9 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
         }
         SamplingError::EmptyResponse { context } => {
             format!(
-                "{}Empty response from model ({}): model={}, had_reasoning={}, finish_reason={}, completion_tokens={}",
+                "{}Empty response from model ({}): had_reasoning={}, finish_reason={}, completion_tokens={}",
                 retry_prefix,
                 context.reason,
-                context.model,
                 context.had_reasoning,
                 context.finish_reason_str(),
                 context.completion_tokens.unwrap_or(0),
@@ -416,11 +401,14 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             credential: *credential,
         },
         SamplingError::InvalidConfiguration(msg) => SamplingError::InvalidConfiguration(msg),
-        SamplingError::Http(e) => {
-            // reqwest::Error is not Clone; preserve the rendered message
-            // as an EventStreamError (the closest retryable transport
-            // variant) so callers see an equivalent description.
-            SamplingError::EventStreamError(e.to_string())
+        SamplingError::Http { kind, source } => {
+            // reqwest::Error is not Clone. Preserve only categorical transport
+            // facts; raw displays can contain URL userinfo or query secrets.
+            let status = source
+                .status()
+                .map(|status| format!(" with status {}", status.as_u16()))
+                .unwrap_or_default();
+            SamplingError::EventStreamError(format!("HTTP request failed ({kind}{status})"))
         }
         SamplingError::Serialization(e) => {
             // serde_json::Error is not Clone; its Display already carries the

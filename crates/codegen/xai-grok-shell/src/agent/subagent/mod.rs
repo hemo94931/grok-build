@@ -627,9 +627,10 @@ pub(crate) fn present_child_completion(
 ///   3. Inherit the parent session's actual live sampling config (from
 ///      `ChatStateHandle`).
 ///
-/// Both explicit pins apply regardless of which model the parent is on. If a
-/// pin references an unknown model it is ignored (with a `tracing::warn!`)
-/// and resolution falls through to the next priority.
+/// Both explicit pins apply regardless of which model the parent is on. An
+/// unknown unnamespaced pin is ignored (with a `tracing::warn!`) and falls
+/// through to the next priority. A recognized provider namespace that is
+/// absent from the catalog fails closed and never inherits the parent route.
 ///
 /// NOTE: the persona/role/runtime override (`effective_runtime.model`) is
 /// applied by the caller (`run_shell_child`) BEFORE this function
@@ -643,7 +644,8 @@ async fn resolve_subagent_sampling_config(
     agent_name: &str,
     agent_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+) -> Result<(xai_grok_sampler::SamplerConfig, acp::ModelId), &'static str> {
+    const PROVIDER_MODEL_UNAVAILABLE: &str = "Provider subagent model is not available in the model catalogue; refusing to inherit the parent route.";
     let (parent_config, parent_mid) = read_parent_sampling_config(ctx).await;
     let try_pin = |model_id: &str, source: &'static str, unknown_msg: &'static str| {
         match resolve_model_override_to_config(model_id, ctx) {
@@ -655,10 +657,17 @@ async fn resolve_subagent_sampling_config(
                     &canonical_id,
                     &parent_config,
                 );
-                Some((config, canonical_id))
+                Some(Ok((config, canonical_id)))
             }
             None => {
-                tracing::warn!(agent = agent_name, model_id, "{unknown_msg}");
+                if crate::auth::providers::parse_namespaced_model_id(model_id).is_some() {
+                    tracing::warn!(
+                        agent = agent_name,
+                        "Provider subagent model is absent from the catalog; failing closed"
+                    );
+                    return Some(Err(PROVIDER_MODEL_UNAVAILABLE));
+                }
+                tracing::warn!(agent = agent_name, "{unknown_msg}");
                 None
             }
         }
@@ -688,7 +697,7 @@ async fn resolve_subagent_sampling_config(
         &parent_mid,
         &parent_config,
     );
-    (parent_config, parent_mid)
+    Ok((parent_config, parent_mid))
 }
 /// Resolve a subagent's effective sampling config + model id, honoring the
 /// model-resolution precedence (Key Decision #16).
@@ -698,8 +707,9 @@ async fn resolve_subagent_sampling_config(
 /// [`resolve_subagent_sampling_config`] (where the user `[subagents.models]`
 /// pin and `AgentDefinition.model` apply). So a goal/persona override WINS
 /// over a user per-agent pin. An override that does not resolve to a known
-/// model warns and falls through to the pin path; `None` (inherit) hands
-/// precedence back to the pin path entirely (pin > agent-def > inherit).
+/// unnamespaced model warns and falls through to the pin path; a recognized
+/// provider namespace fails closed. `None` (inherit) hands precedence back to
+/// the pin path entirely (pin > agent-def > inherit).
 ///
 /// Extracted from `run_shell_child` so the precedence is unit-testable
 /// without spawning a child session.
@@ -708,15 +718,20 @@ async fn resolve_effective_model_config(
     subagent_type: &str,
     definition_model: &xai_grok_agent::config::ModelOverride,
     ctx: &SubagentSpawnContext,
-) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+) -> Result<(xai_grok_sampler::SamplerConfig, acp::ModelId), &'static str> {
     if let Some(model_id) = runtime_override_model {
         if let Some(resolved) = resolve_model_override_to_config(model_id, ctx) {
-            return resolved;
+            return Ok(resolved);
         }
-        tracing::warn!(
-            model_id,
-            "Runtime model override references unknown model, falling through"
-        );
+        if crate::auth::providers::parse_namespaced_model_id(model_id).is_some() {
+            tracing::warn!(
+                "Runtime provider model override is absent from the catalog; failing closed"
+            );
+            return Err(
+                "Provider subagent model is not available in the model catalogue; refusing to inherit the parent route.",
+            );
+        }
+        tracing::warn!("Runtime model override references unknown model, falling through");
     }
     resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
 }
@@ -729,18 +744,20 @@ fn log_subagent_model_resolution(
     resolved_id: &acp::ModelId,
     parent: &xai_grok_sampler::SamplerConfig,
 ) {
+    let child_provider = crate::auth::providers::parse_namespaced_model_id(resolved_id.0.as_ref())
+        .map(|(provider, _)| provider.to_string());
+    let parent_provider = crate::auth::providers::parse_namespaced_model_id(&parent.model)
+        .map(|(provider, _)| provider.to_string());
     xai_grok_telemetry::unified_log::debug(
         "subagent model resolved",
         None,
         Some(serde_json::json!({
             "agent": agent_name,
             "priority": priority,
-            "child_model": resolved_id.0.as_ref(),
-            "child_base_url": &resolved.base_url,
+            "child_provider": child_provider,
             "child_has_credential": resolved.api_key.is_some(),
             "child_auth_scheme": format!("{:?}", resolved.auth_scheme),
-            "parent_model": &parent.model,
-            "parent_base_url": &parent.base_url,
+            "parent_provider": parent_provider,
             "parent_has_credential": parent.api_key.is_some(),
             "parent_auth_scheme": format!("{:?}", parent.auth_scheme),
         })),
@@ -844,17 +861,15 @@ async fn read_parent_sampling_config(
                 header_injector: ctx.sampling_config.header_injector.clone(),
             };
             let model_id = ctx.model_id.clone();
-            let global_model_id = ctx.models_manager.current_model_id();
+            let provider = crate::auth::providers::parse_namespaced_model_id(model_id.0.as_ref())
+                .map(|(provider, _)| provider.to_string());
             xai_grok_telemetry::unified_log::debug(
                 "subagent read parent config (live)",
                 None,
                 Some(serde_json::json!({
-                    "parent_model": &inherited.model,
-                    "parent_base_url": &inherited.base_url,
+                    "parent_provider": provider,
                     "parent_has_credential": inherited.api_key.is_some(),
                     "parent_auth_scheme": format!("{:?}", inherited.auth_scheme),
-                    "session_model_id": model_id.0.as_ref(),
-                    "global_model_id": global_model_id.0.as_ref(),
                     "source": "chat_state",
                 })),
             );
@@ -865,12 +880,13 @@ async fn read_parent_sampling_config(
              falling back to spawn context baseline"
         );
     }
+    let provider = crate::auth::providers::parse_namespaced_model_id(ctx.model_id.0.as_ref())
+        .map(|(provider, _)| provider.to_string());
     xai_grok_telemetry::unified_log::warn(
         "subagent read parent config (fallback)",
         None,
         Some(serde_json::json!({
-            "parent_model": &ctx.sampling_config.model,
-            "parent_base_url": &ctx.sampling_config.base_url,
+            "parent_provider": provider,
             "parent_has_credential": ctx.sampling_config.api_key.is_some(),
             "parent_auth_scheme": format!("{:?}", ctx.sampling_config.auth_scheme),
             "source": "spawn_context_baseline",
@@ -949,20 +965,18 @@ fn resolve_model_override_to_config(
     } else {
         None
     };
+    let provider = crate::auth::providers::parse_namespaced_model_id(model_id)
+        .map(|(provider, _)| provider.to_string());
     xai_grok_telemetry::unified_log::debug(
         "subagent resolve_model_override_to_config",
         None,
         Some(serde_json::json!({
-            "model_id": model_id,
-            "canonical_model": canonical_model_id.0.as_ref(),
-            "resolved_model_raw": &config.model,
-            "base_url": &config.base_url,
+            "provider": provider,
             "has_credential": config.api_key.is_some(),
             "auth_scheme": format!("{:?}", config.auth_scheme),
             "has_own_credentials": entry.has_own_credentials(),
             "has_session_key": has_session_key,
             "auth_type": format!("{:?}", resolved_auth_type),
-            "auth_method_id": ctx.auth_method_id.0.as_ref(),
         })),
     );
     Some((config, canonical_model_id))

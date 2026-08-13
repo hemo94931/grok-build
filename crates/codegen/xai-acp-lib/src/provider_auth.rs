@@ -19,22 +19,7 @@ pub const PROMPT_SECRET_CAPABILITY: &str = "x.ai/providerAuth.promptSecret";
 /// Redact credential-shaped values before provider-auth errors reach tracing,
 /// ACP error data, truncation, or user-visible scrollback.
 pub fn redact_provider_auth_error(raw: &str) -> String {
-    static LABELED_SECRET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static PREFIXED_SECRET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let labeled = LABELED_SECRET.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)((?:bearer\s+|authorization[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?|(?:api[_ -]?key|access[_ -]?token|secret|password)[\"']?\s*[:=]\s*[\"']?))([^\s,;\"'}]+)"#,
-        )
-        .expect("provider auth labeled-secret regex")
-    });
-    let prefixed = PREFIXED_SECRET.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b(?:sk[-_]|gh[pousr]_|github_pat_|gsk_|or-|rk-|pk-|xai[-_])[a-z0-9._-]{6,}",
-        )
-        .expect("provider auth prefixed-secret regex")
-    });
-    let redacted = labeled.replace_all(raw, "${1}[REDACTED]");
-    prefixed.replace_all(&redacted, "[REDACTED]").into_owned()
+    xai_grok_sampling_types::redact_credential_shaped_text(raw)
 }
 
 /// Provider credential method carried by the provider-auth ACP protocol.

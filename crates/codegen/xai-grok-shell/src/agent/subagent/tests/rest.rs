@@ -2099,7 +2099,8 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("known runtime override");
     assert_eq!(
             config.model, "goal-model",
             "the goal runtime override must win over the `[subagents.models]` pin",
@@ -2112,7 +2113,8 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("known configured pin");
     assert_eq!(
             config.model, "pinned-model",
             "with no runtime override, the `[subagents.models]` pin wins",
@@ -2125,11 +2127,23 @@ async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("unknown unnamespaced override falls through");
     assert_eq!(
             config.model, "pinned-model",
             "an unknown override falls through to the pin",
         );
+
+    let ctx = build_ctx();
+    let error = resolve_effective_model_config(
+            Some("deepseek/catalog-entry-missing"),
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await
+        .expect_err("unknown namespaced runtime override must fail closed");
+    assert!(error.contains("refusing to inherit the parent route"));
 }
 /// A `fork_context = true` spawn must infer on the parent session model
 /// (`ctx.model_id`) for per-model radix reuse, even when a
@@ -2168,7 +2182,8 @@ async fn fork_context_pins_parent_model_over_overrides() {
             &agent_def,
             &ctx,
         )
-        .await;
+        .await
+        .expect("known parent fork override");
     assert_eq!(
             config.model, "parent-model",
             "fork_context must pin the parent model over the [subagents.models] pin and agent-def override",
@@ -2181,7 +2196,8 @@ async fn fork_context_pins_parent_model_over_overrides() {
             &agent_def,
             &ctx,
         )
-        .await;
+        .await
+        .expect("known configured pin");
     assert_eq!(
             config.model, "pinned-model",
             "without the fork pin the [subagents.models] override wins",
@@ -2203,7 +2219,8 @@ async fn resolve_subagent_inherits_parent_model_without_pins() {
                 &ModelOverride::Inherit,
                 &ctx,
             )
-            .await;
+            .await
+            .expect("subagent model resolution");
         assert_eq!(
                 config.model, parent_model,
                 "subagent must inherit parent model {parent_model:?} when no pin is set",
@@ -2231,7 +2248,8 @@ async fn resolve_subagent_config_override_pin_applies_for_any_parent() {
                 &ModelOverride::Inherit,
                 &ctx,
             )
-            .await;
+            .await
+            .expect("subagent model resolution");
         assert_eq!(
                 config.model, "pinned-model",
                 "config pin must win for parent {parent_model:?}",
@@ -2255,7 +2273,8 @@ async fn resolve_subagent_agent_definition_pin_applies_for_light_parent() {
             &agent_model,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(config.model, "pinned-model");
     assert_eq!(model_id.0.as_ref(), "pinned-model");
 }
@@ -2278,11 +2297,12 @@ async fn resolve_subagent_config_override_wins_over_agent_definition() {
             &agent_model,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(config.model, "config-pin");
     assert_eq!(model_id.0.as_ref(), "config-pin");
 }
-/// An unresolvable `[subagents.models]` pin (model absent from
+/// An unresolvable unnamespaced `[subagents.models]` pin (model absent from
 /// `available_models`) falls through to inherit the parent model.
 #[tokio::test]
 async fn resolve_subagent_config_override_unknown_model_falls_through_to_inherit() {
@@ -2297,9 +2317,23 @@ async fn resolve_subagent_config_override_unknown_model_falls_through_to_inherit
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(config.model, "grok-4.5");
     assert_eq!(model_id.0.as_ref(), "grok-4.5");
+
+    ctx.subagent_model_overrides.insert(
+        "explore".to_string(),
+        "deepseek/catalog-entry-missing".to_string(),
+    );
+    let error = resolve_subagent_sampling_config(
+            "explore",
+            &ModelOverride::Inherit,
+            &ctx,
+        )
+        .await
+        .expect_err("unknown namespaced config pin must fail closed");
+    assert!(error.contains("refusing to inherit the parent route"));
 }
 /// An unresolvable `AgentDefinition.model` pin (model absent from
 /// `available_models`) falls through to inherit the parent model.
@@ -2315,9 +2349,20 @@ async fn resolve_subagent_agent_definition_unknown_model_falls_through_to_inheri
             &agent_model,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(config.model, "grok-4.5");
     assert_eq!(model_id.0.as_ref(), "grok-4.5");
+
+    let namespaced = ModelOverride::Override("zai/catalog-entry-missing".to_string());
+    let error = resolve_subagent_sampling_config(
+            "explore",
+            &namespaced,
+            &ctx,
+        )
+        .await
+        .expect_err("unknown namespaced definition pin must fail closed");
+    assert!(error.contains("refusing to inherit the parent route"));
 }
 /// Spawn-time credentials are cache-only: a cold spawn has no key,
 /// never the parent session key.
@@ -2348,7 +2393,8 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(model_id.0.as_ref(), "proxied");
     assert_eq!(
             config.api_key, None,
@@ -2360,10 +2406,47 @@ async fn subagent_override_provider_model_spawns_cache_only_credentials() {
             &ModelOverride::Inherit,
             &ctx,
         )
-        .await;
+        .await
+        .expect("subagent model resolution");
     assert_eq!(config.api_key.as_deref(), Some("tok-1"));
     assert_eq!(config.base_url, "https://gateway.example/v1");
 }
+#[test]
+fn first_class_provider_subagent_override_keeps_route_and_parent_key_isolation() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.auth = Some(crate::auth::GrokAuth {
+        key: "unrelated-parent-session-key".to_owned(),
+        ..Default::default()
+    });
+    let mut entry = test_model_entry("deepseek/deepseek-v4-flash");
+    entry.info.base_url = "https://api.deepseek.com".to_owned();
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+    entry.info.auth_scheme = xai_grok_sampler::AuthScheme::Bearer;
+    entry.api_key = Some("deepseek-subagent-key".to_owned());
+    ctx.available_models
+        .insert("deepseek/deepseek-v4-flash".to_owned(), entry);
+
+    let (config, model_id) =
+        resolve_model_override_to_config("deepseek/deepseek-v4-flash", &ctx)
+            .expect("provider model override");
+    assert_eq!(model_id.0.as_ref(), "deepseek/deepseek-v4-flash");
+    assert_eq!(config.api_key.as_deref(), Some("deepseek-subagent-key"));
+    assert_eq!(config.base_url, "https://api.deepseek.com");
+    assert_eq!(config.auth_scheme, xai_grok_sampler::AuthScheme::Bearer);
+    assert!(config.bearer_resolver.is_none());
+
+    let route_hint = crate::auth::providers::sampler_route_hint(
+        model_id.0.as_ref(),
+        &config.model,
+    );
+    let client = crate::sampling::Client::new_with_route(config, route_hint)
+        .expect("known provider subagent client");
+    assert_eq!(
+        client.endpoint_url("chat/completions"),
+        "https://api.deepseek.com/chat/completions"
+    );
+}
+
 #[test]
 fn non_cursor_persona_injected_as_system_reminder() {
     use xai_grok_sampling_types::conversation::{ConversationItem, SyntheticReason};

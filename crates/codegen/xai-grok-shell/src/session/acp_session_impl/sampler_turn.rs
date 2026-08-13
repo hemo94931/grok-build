@@ -491,7 +491,7 @@ impl SessionActor {
     /// even when server-side metrics only show the aggregate 401. No-op for a
     /// definite `Byok`/`NotByok`, so steady-state turns stay quiet — a burst of
     /// these is itself the signal that `Unknown` is being hit in the field.
-    fn log_auth_gate_unknown(&self, site: &str, gate: SessionTokenAuthGate, base_url: &str) {
+    fn log_auth_gate_unknown(&self, site: &str, gate: SessionTokenAuthGate) {
         use crate::agent::auth_method::ModelByok;
         if gate.model_byok != ModelByok::Unknown || !gate.is_session_based {
             return;
@@ -503,7 +503,6 @@ impl SessionActor {
             "is_session_based": gate.is_session_based,
             "endpoint_is_first_party": gate.endpoint_is_first_party,
             "refresh_active": refresh_active,
-            "base_url": base_url,
         });
         let sid = Some(self.session_info.id.0.as_ref());
         if refresh_active {
@@ -622,7 +621,7 @@ impl SessionActor {
                 Ok(None) => unreachable!("namespaced provider model must resolve a provider route"),
                 Err(error) => {
                     let error = xai_acp_lib::redact_provider_auth_error(&error.to_string());
-                    tracing::warn!(model = %full_config.model, %error, "provider route unavailable; request will fail closed locally");
+                    tracing::warn!(%error, "provider route unavailable; request will fail closed locally");
                     None
                 }
             };
@@ -685,7 +684,7 @@ impl SessionActor {
             &full_config.base_url,
         );
         let use_bearer_resolver = gate.active();
-        self.log_auth_gate_unknown("reconstruct_full_config", gate, &full_config.base_url);
+        self.log_auth_gate_unknown("reconstruct_full_config", gate);
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
@@ -793,10 +792,21 @@ impl SessionActor {
             .await
             .map(|c| c.model)
             .unwrap_or_default();
-        let aux_classifier_sampler = match auto_cfg.classifier_model.as_deref() {
+        let configured_classifier_slug = auto_cfg.classifier_model.as_deref();
+        let aux_classifier_sampler = match configured_classifier_slug {
             Some(slug) => self.resolve_auto_classifier_sampler(slug).await,
             None => None,
         };
+        if aux_classifier_sampler.is_none()
+            && configured_classifier_slug
+                .and_then(crate::auth::providers::parse_namespaced_model_id)
+                .is_some()
+        {
+            tracing::warn!(
+                "permission auto classifier provider model is unavailable; refusing session-model fallback"
+            );
+            return;
+        }
         let models = self.models_manager.models();
         let effective_supports_re = crate::agent::config::effective_classifier_supports_re(
             aux_classifier_sampler
@@ -904,7 +914,8 @@ impl SessionActor {
     /// catalog routing (Tier-1 catalog creds / Tier-2 xAI-proxy via session token
     /// / `XAI_API_KEY` / deployment key), gathering the session-local auth context
     /// once. Shared by image-describe and the classifier so the gather can't
-    /// drift. `None` ⇒ caller falls back to the session model.
+    /// drift. `None` means no dedicated client resolved; callers may inherit
+    /// only for unnamespaced slugs. Recognized provider namespaces fail closed.
     pub(super) async fn resolve_aux_sampler_config(
         &self,
         slug: &str,
@@ -934,8 +945,8 @@ impl SessionActor {
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
     /// on the resolver, not a config override, for `base_url`/`api_backend` so
-    /// credentials stay consistent). `None` ⇒ caller falls back to the session
-    /// client + model.
+    /// credentials stay consistent). `None` means resolution/build failed;
+    /// callers decide whether unnamespaced session-model fallback is allowed.
     async fn resolve_auto_classifier_sampler(
         &self,
         slug: &str,
@@ -952,7 +963,8 @@ impl SessionActor {
         let route_hint = crate::auth::providers::sampler_route_hint(slug, &cfg.model);
         let client = xai_grok_sampler::SamplingClient::new_with_route(cfg, route_hint)
             .map_err(|e| {
-                tracing::warn!(error = %e, "auto classifier aux sampler build failed; using session model")
+                let error = xai_acp_lib::redact_provider_auth_error(&e.to_string());
+                tracing::warn!(error = %error, "auto classifier aux sampler build failed")
             })
             .ok()?;
         Some((client, model))
@@ -1352,7 +1364,7 @@ impl SessionActor {
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
             let gate = self.auth_gate(&failed_model_id, &failed_base_url);
             let eligible = gate.active();
-            self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
+            self.log_auth_gate_unknown("handle_sampling_failure", gate);
             if !eligible && auth_provider.is_none() && namespaced_provider.is_none() {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
@@ -2029,9 +2041,6 @@ impl SessionActor {
     }
     pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
         self.signals_handle().record_assistant_message();
-        if let ConversationItem::Assistant(ref a) = assistant_item {
-            tracing::info!(model_id = ?a.model_id, "DEBUG record_assistant_response model_id");
-        }
         if let ConversationItem::Assistant(ref a) = assistant_item
             && let Some(first_call) = a.tool_calls.first()
         {
@@ -2050,11 +2059,15 @@ fn terminal_failure_attributes(
     provider_id: Option<&str>,
     auth: Option<&crate::auth::GrokAuth>,
 ) -> serde_json::Value {
+    let message = xai_grok_sampling_types::redact_known_credential(
+        message,
+        auth.map(|value| value.key.as_str()),
+    );
     let mut attributes = serde_json::json!({
         "error_type": error_type,
         "status_code": status_code,
         "reauthable": reauthable,
-        "message": crate::util::truncate(message, 300),
+        "message": crate::util::truncate(&message, 300),
     });
     let object = attributes
         .as_object_mut()
@@ -2067,9 +2080,8 @@ fn terminal_failure_attributes(
             auth.map(|value| format!("{:?}", value.auth_mode)).into(),
         );
         object.insert(
-            "key_prefix".to_owned(),
-            auth.map(|value| xai_grok_auth::bearer_suffix(&value.key).to_owned())
-                .into(),
+            "has_credential".to_owned(),
+            auth.map(|value| !value.key.is_empty()).into(),
         );
         object.insert(
             "expires_at".to_owned(),
@@ -2104,6 +2116,40 @@ mod terminal_failure_tests {
     }
 
     #[test]
+    fn terminal_failure_redacts_provider_secret_sentinels_before_truncation() {
+        for secret in [
+            "sentinel-prefix-raw-value-sentinel-suffix",
+            "sk-ant-oat-sentinel-prefix-middle-sentinel-suffix",
+            "xy",
+        ] {
+            let message = format!("upstream rejected {secret}; authorization: Bearer {secret}");
+            let auth = crate::auth::GrokAuth {
+                key: secret.to_owned(),
+                ..Default::default()
+            };
+            let attrs = super::terminal_failure_attributes(
+                "auth",
+                Some(401),
+                true,
+                &message,
+                None,
+                Some(&auth),
+            );
+            let rendered = attrs.to_string();
+            for fragment in [
+                secret,
+                &secret[..secret.len().min(8)],
+                &secret[secret.len().saturating_sub(secret.len().min(8))..],
+            ] {
+                assert!(
+                    !rendered.contains(fragment),
+                    "terminal telemetry leaked {fragment:?}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn multi_provider_regression_provider_telemetry_omits_xai_auth_fields() {
         let provider = super::terminal_failure_attributes(
             "provider_auth:anthropic",
@@ -2114,15 +2160,16 @@ mod terminal_failure_tests {
             None,
         );
         assert_eq!(provider["provider_id"], "anthropic");
-        for key in ["auth_mode", "key_prefix", "expires_at"] {
+        for key in ["auth_mode", "has_credential", "expires_at"] {
             assert!(provider.get(key).is_none(), "provider event leaked {key}");
         }
 
         let xai =
             super::terminal_failure_attributes("auth", Some(401), true, "unauthorized", None, None);
-        for key in ["auth_mode", "key_prefix", "expires_at"] {
+        for key in ["auth_mode", "has_credential", "expires_at"] {
             assert!(xai.get(key).is_some(), "xAI event omitted {key}");
         }
+        assert!(xai.get("key_prefix").is_none());
     }
 }
 

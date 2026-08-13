@@ -80,7 +80,7 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
         SamplingError::MaxTokensTruncation => true,
-        SamplingError::Http(_)
+        SamplingError::Http { .. }
         | SamplingError::EventStreamError(_)
         | SamplingError::StreamError { .. }
         | SamplingError::EmptyResponse { .. }
@@ -945,7 +945,7 @@ mod classify_tests {
         let http_err = rt
             .block_on(reqwest::get("http://127.0.0.1:0"))
             .expect_err("connecting to port 0 must fail");
-        assert!(!is_det(&classify_sampling_error(SamplingError::Http(
+        assert!(!is_det(&classify_sampling_error(SamplingError::from(
             http_err
         ))));
     }

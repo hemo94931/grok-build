@@ -109,6 +109,34 @@ async fn set_auto_mode_path_wires_live_side_query_via_session_actor() {
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(remote_auto_mode_cache)]
+async fn missing_namespaced_classifier_refuses_session_model_fallback() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            install_real_permissions(&mut actor);
+            actor.permissions.set_auto_mode(true);
+
+            crate::util::config::cache_remote_auto_mode(Some(serde_json::json!({
+                "classifier_model": "deepseek/missing-classifier-model"
+            })));
+            let session = Arc::new(actor);
+            session.wire_permission_auto_llm_classifier().await;
+            crate::util::config::cache_remote_auto_mode(None);
+
+            assert!(
+                !session.permissions.has_llm_side_query(),
+                "missing namespaced classifier must not inherit the session sampler"
+            );
+        })
+        .await;
+}
+
 /// Spawn-time path: auto already on → wire installs side-query (same as
 /// post-`spawn_session_actor` call at acp_session.rs:6156-6159).
 #[tokio::test(flavor = "current_thread")]

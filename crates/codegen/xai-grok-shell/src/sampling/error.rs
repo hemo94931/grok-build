@@ -116,8 +116,8 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
     match err {
         SamplingError::Auth { message, .. } => acp::Error::auth_required().data(message),
         SamplingError::InvalidConfiguration(msg) => acp::Error::invalid_params().data(msg),
-        SamplingError::Http(e) => {
-            acp::Error::internal_error().data(format!("http client init failed: {e}"))
+        SamplingError::Http { kind, .. } => {
+            acp::Error::internal_error().data(format!("http client request failed ({kind})"))
         }
         SamplingError::Serialization(_) => acp::Error::invalid_params().data(err.to_string()),
         SamplingError::Api {

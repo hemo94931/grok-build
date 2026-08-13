@@ -379,6 +379,128 @@ async fn probe_writable(handle: &PersistenceHandle) -> io::Result<()> {
     rx.await.unwrap()
 }
 
+#[tokio::test]
+async fn explicit_dir_summary_uses_child_route_model_and_credential() {
+    use xai_grok_sampler::{
+        ApiBackend, AuthScheme, KnownProvider, ProviderRouteHint, SamplerConfig, SamplingClient,
+    };
+    use xai_grok_test_support::{MockInferenceServer, MockModelEntry, ScriptedResponse};
+
+    const CHILD_KEY: &str = "child-provider-key";
+    const PARENT_KEY: &str = "parent-session-key";
+    const CHILD_MODEL: &str = "deepseek/deepseek-chat";
+    assert_ne!(CHILD_KEY, PARENT_KEY);
+
+    let server = MockInferenceServer::start_with_required_auth(
+        vec![MockModelEntry::new("deepseek-chat")],
+        CHILD_KEY,
+    )
+    .await
+    .expect("start child-route inference server");
+    server.enqueue_response(
+        "/v1/chat/completions",
+        ScriptedResponse::sse(
+            xai_grok_test_support::sse::chat_completions_reasoning_then_tool_call_events(
+                "title",
+                "call-title",
+                "session_title",
+                r#"{"session_title":"Child route summary"}"#,
+                "deepseek-chat",
+            ),
+        ),
+    );
+
+    let client = SamplingClient::new_with_route(
+        SamplerConfig {
+            api_key: Some(CHILD_KEY.to_owned()),
+            base_url: server.url(),
+            model: CHILD_MODEL.to_owned(),
+            api_backend: ApiBackend::ChatCompletions,
+            auth_scheme: AuthScheme::Bearer,
+            context_window: 16_384,
+            ..SamplerConfig::default()
+        },
+        ProviderRouteHint::Known(KnownProvider::Deepseek),
+    )
+    .expect("child provider client");
+
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("explicit-dir-child-route"),
+        cwd: "/test".into(),
+    };
+    let persistence = new_with_explicit_dir(
+        &info,
+        dir.path().to_path_buf(),
+        acp::ModelId::new(CHILD_MODEL),
+        client,
+        CHILD_MODEL.to_owned(),
+    )
+    .await
+    .expect("explicit-dir persistence actor");
+    flush_ack(&persistence).await.unwrap();
+    persistence
+        .tx
+        .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
+            vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "Investigate child authentication isolation",
+            ))],
+        )))
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let request = loop {
+        if let Some(request) = server
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/v1/chat/completions")
+        {
+            break request;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for explicit-dir summary request; requests={:?}",
+            server
+                .requests()
+                .into_iter()
+                .map(|request| format!("{} {}", request.method, request.path))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some("Bearer child-provider-key")
+    );
+    assert_ne!(
+        request.authorization.as_deref(),
+        Some("Bearer parent-session-key")
+    );
+    assert_eq!(
+        request
+            .body
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("deepseek-chat"),
+        "summary request must keep the child's upstream wire model"
+    );
+    assert!(
+        !request
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains(PARENT_KEY))
+    );
+    assert!(
+        !request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.to_string().contains(PARENT_KEY))
+    );
+
+    flush_ack(&persistence).await.unwrap();
+}
+
 /// Manual rename → next `RemoteSync` flush must not revert the backend title.
 ///
 /// Seeds `RemoteSync` with a pre-rename title (the cache at init), drives

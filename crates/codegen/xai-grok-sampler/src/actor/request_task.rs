@@ -115,9 +115,7 @@ pub(crate) async fn run_request_task(
 
     let sampling_span = crate::sampling_log::request_span(
         &request_id,
-        &config.model,
         &format!("{:?}", client.api_backend()),
-        &config.base_url,
         &client.auth_info(),
     );
     if let Some(eff) = config.reasoning_effort {
@@ -210,7 +208,6 @@ pub(crate) async fn run_request_task(
                     reasoning_tokens = context.reasoning_tokens.unwrap_or(0),
                     finish_reason = context.finish_reason_str(),
                     first_choice_seen = context.first_choice_seen,
-                    model = %context.model,
                     "empty response from model: {reason} (retrying)",
                     reason = context.reason,
                 );
@@ -250,7 +247,7 @@ pub(crate) async fn run_request_task(
                     doom_retry_count += 1;
                     tracing::warn!(
                         target: crate::sampling_log::TARGET,
-                        reason = %error,
+                        reason = "doom_loop_detected",
                         attempt = doom_retry_count,
                         max_retries = doom_max_retries,
                         outcome = "resampled",
@@ -444,16 +441,17 @@ async fn apply_retry_decision(
                     err.is_retryable() && next_attempt >= max_retries
                 };
             if budget_exhausted {
+                let safe_error =
+                    xai_grok_sampling_types::redact_credential_shaped_text(&err.to_string());
                 let exhausted_span = tracing::info_span!(
                     "http.retries_exhausted",
                     total_attempts = next_attempt as i64,
-                    model = %config.model,
-                    error = %err,
+                    error = %safe_error,
                     status_code = tracing::field::Empty,
                 );
                 let status_code = match err {
                     SamplingError::Api { status, .. } => Some(status.as_u16()),
-                    SamplingError::Http(e) => e.status().map(|s| s.as_u16()),
+                    SamplingError::Http { source, .. } => source.status().map(|s| s.as_u16()),
                     _ => None,
                 };
                 if let Some(status) = status_code {

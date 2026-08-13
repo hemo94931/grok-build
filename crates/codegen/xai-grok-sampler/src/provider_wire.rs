@@ -52,6 +52,9 @@ pub enum ProviderRouteHint {
     /// provider. Otherwise it remains a custom third-party route.
     #[default]
     Auto,
+    /// Explicit first-party xAI provenance for callers whose transport URL is
+    /// an xAI proxy or a test server and therefore cannot be inferred safely.
+    FirstPartyXai,
     Known(KnownProvider),
     CustomThirdParty,
 }
@@ -161,6 +164,7 @@ impl ProviderWireRoute {
         hint: ProviderRouteHint,
     ) -> Option<Self> {
         let (kind, upstream_model) = match hint {
+            ProviderRouteHint::FirstPartyXai => return None,
             ProviderRouteHint::Known(provider) => {
                 let upstream = model
                     .split_once('/')
@@ -244,7 +248,19 @@ impl ProviderWireRoute {
         }
     }
 
-    pub(crate) fn sanitize_headers(&self, headers: &mut HeaderMap) {
+    pub(crate) fn sanitize_headers(&self, headers: &mut HeaderMap, auth_scheme: AuthScheme) {
+        if self.is_known_provider() {
+            match auth_scheme {
+                AuthScheme::Bearer => {
+                    headers.remove(HeaderName::from_static("x-api-key"));
+                    headers.remove(HeaderName::from_static("api-key"));
+                }
+                AuthScheme::XApiKey => {
+                    headers.remove(reqwest::header::AUTHORIZATION);
+                    headers.remove(HeaderName::from_static("api-key"));
+                }
+            }
+        }
         let rejected = headers
             .keys()
             .filter(|name| !self.header_allowed(name.as_str()))
@@ -681,7 +697,7 @@ mod tests {
         headers.insert("traceparent", HeaderValue::from_static("00-test"));
         headers.insert("x-grok-conv-id", HeaderValue::from_static("secret"));
         headers.insert("x-xai-token-auth", HeaderValue::from_static("secret"));
-        route.sanitize_headers(&mut headers);
+        route.sanitize_headers(&mut headers, AuthScheme::Bearer);
         assert!(headers.contains_key("authorization"));
         assert!(headers.contains_key("traceparent"));
         assert!(!headers.contains_key("x-grok-conv-id"));
@@ -809,7 +825,7 @@ mod tests {
                 HeaderValue::from_static("custom-value"),
             );
             headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
-            route.sanitize_headers(&mut headers);
+            route.sanitize_headers(&mut headers, AuthScheme::Bearer);
             assert_eq!(
                 headers.get("authorization").unwrap(),
                 HeaderValue::from_static("Bearer custom")
@@ -933,7 +949,7 @@ mod tests {
         headers.insert("authorization", HeaderValue::from_static("Bearer custom"));
         headers.insert("anthropic-version", HeaderValue::from_static("custom"));
         headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
-        route.sanitize_headers(&mut headers);
+        route.sanitize_headers(&mut headers, AuthScheme::Bearer);
         assert!(headers.contains_key("authorization"));
         assert!(headers.contains_key("anthropic-version"));
         assert!(!headers.contains_key("x-grok-conv-id"));
@@ -987,7 +1003,7 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
         }
-        route.sanitize_headers(&mut headers);
+        route.sanitize_headers(&mut headers, AuthScheme::Bearer);
         assert_eq!(headers.len(), 3);
         assert!(headers.contains_key("authorization"));
         assert!(headers.contains_key("content-type"));
@@ -1030,7 +1046,7 @@ mod tests {
             headers.insert("authorization", HeaderValue::from_static("Bearer known"));
             headers.insert("anthropic-version", HeaderValue::from_static("foreign"));
             headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
-            route.sanitize_headers(&mut headers);
+            route.sanitize_headers(&mut headers, AuthScheme::Bearer);
             assert_eq!(headers.len(), 1);
             assert!(headers.contains_key("authorization"));
 
@@ -1045,7 +1061,7 @@ mod tests {
             custom_headers.insert("authorization", HeaderValue::from_static("Bearer custom"));
             custom_headers.insert("anthropic-version", HeaderValue::from_static("custom"));
             custom_headers.insert("x-grok-conv-id", HeaderValue::from_static("private"));
-            custom.sanitize_headers(&mut custom_headers);
+            custom.sanitize_headers(&mut custom_headers, AuthScheme::Bearer);
             assert!(custom_headers.contains_key("authorization"));
             assert!(custom_headers.contains_key("anthropic-version"));
             assert!(!custom_headers.contains_key("x-grok-conv-id"));

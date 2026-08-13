@@ -124,14 +124,13 @@ Just generate the session_title and nothing else"#,
                 return result.session_title;
             }
             tracing::debug!(
-                model = %model,
                 "session title generation: response did not contain a session_title tool call"
             );
         }
         Err(e) => {
+            let error = xai_acp_lib::redact_provider_auth_error(&e.to_string());
             tracing::warn!(
-                model = %model,
-                error = %e,
+                error = %error,
                 "session title generation failed, falling back to truncated user text"
             );
         }

@@ -45,7 +45,7 @@ pub enum AuthScheme {
 /// `SamplerConfig` is handed to the actor. Auth is selected separately
 /// via `auth_scheme`, while `api_backend` controls only the request/response
 /// protocol shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
     pub base_url: String,
@@ -131,6 +131,90 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+}
+
+impl std::fmt::Debug for SamplerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplerConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("base_url", &RedactedEndpoint(&self.base_url))
+            .field("model", &"[REDACTED]")
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("api_backend", &self.api_backend)
+            .field("auth_scheme", &self.auth_scheme)
+            .field("extra_headers", &RedactedMapSummary(&self.extra_headers))
+            .field("query_params", &RedactedMapSummary(&self.query_params))
+            .field(
+                "env_http_headers",
+                &RedactedMapSummary(&self.env_http_headers),
+            )
+            .field("context_window", &self.context_window)
+            .field("force_http1", &self.force_http1)
+            .field("max_retries", &self.max_retries)
+            .field("stream_tool_calls", &self.stream_tool_calls)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field(
+                "has_origin_client",
+                &self.origin_client.as_ref().map(|_| true),
+            )
+            .field(
+                "client_identifier",
+                &self.client_identifier.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "deployment_id",
+                &self.deployment_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("user_id", &self.user_id.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "client_version",
+                &self.client_version.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "attribution_callback",
+                &self.attribution_callback.as_ref().map(|_| "[configured]"),
+            )
+            .field(
+                "bearer_resolver",
+                &self.bearer_resolver.as_ref().map(|_| "[configured]"),
+            )
+            .field("supports_backend_search", &self.supports_backend_search)
+            .field("compactions_remaining", &self.compactions_remaining)
+            .field("compaction_at_tokens", &self.compaction_at_tokens)
+            .field("doom_loop_recovery", &self.doom_loop_recovery)
+            .field(
+                "header_injector",
+                &self.header_injector.as_ref().map(|_| "[configured]"),
+            )
+            .finish()
+    }
+}
+
+struct RedactedEndpoint<'a>(&'a str);
+struct RedactedMapSummary<'a>(&'a IndexMap<String, String>);
+
+impl std::fmt::Debug for RedactedEndpoint<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match reqwest::Url::parse(self.0) {
+            Ok(url) => f
+                .debug_struct("Endpoint")
+                .field("scheme", &url.scheme())
+                .finish(),
+            Err(_) if self.0.is_empty() => f.write_str("\"\""),
+            Err(_) => f.write_str("\"[REDACTED]\""),
+        }
+    }
+}
+
+impl std::fmt::Debug for RedactedMapSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactedMap")
+            .field("entry_count", &self.0.len())
+            .finish()
+    }
 }
 
 impl SamplerConfig {
@@ -245,6 +329,69 @@ pub struct OriginClientInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_config_debug_redacts_every_string_bearing_diagnostic_field() {
+        let sentinel = "sentinel-prefix-raw-value-sentinel-suffix";
+        let short = "xy";
+        let mut config = SamplerConfig {
+            api_key: Some(sentinel.to_owned()),
+            base_url: format!("https://{sentinel}@example.test/v1?key={short}"),
+            model: format!("provider/{sentinel}"),
+            client_identifier: Some(sentinel.to_owned()),
+            deployment_id: Some(sentinel.to_owned()),
+            user_id: Some(sentinel.to_owned()),
+            client_version: Some(sentinel.to_owned()),
+            origin_client: Some(OriginClientInfo {
+                product: sentinel.to_owned(),
+                version: Some(short.to_owned()),
+            }),
+            ..SamplerConfig::default()
+        };
+        config
+            .extra_headers
+            .insert("authorization".to_owned(), format!("Bearer {sentinel}"));
+        config
+            .extra_headers
+            .insert("x-api-key".to_owned(), short.to_owned());
+        config
+            .extra_headers
+            .insert("traceparent".to_owned(), sentinel.to_owned());
+        config
+            .query_params
+            .insert("key".to_owned(), sentinel.to_owned());
+
+        config.env_http_headers.insert(
+            "authorization".to_owned(),
+            "SENTINEL_SECRET_ENV_NAME".to_owned(),
+        );
+        config
+            .env_http_headers
+            .insert("traceparent".to_owned(), "TRACEPARENT_ENV".to_owned());
+
+        let debug = format!("{config:?}");
+        for fragment in [
+            sentinel,
+            "sentinel-prefix",
+            "sentinel-suffix",
+            short,
+            "SENTINEL_SECRET_ENV_NAME",
+            "TRACEPARENT_ENV",
+        ] {
+            assert!(
+                !debug.contains(fragment),
+                "debug leaked {fragment:?}: {debug}"
+            );
+        }
+        for header_name in ["authorization", "x-api-key", "traceparent"] {
+            assert!(
+                !debug.contains(header_name),
+                "debug leaked header name {header_name:?}: {debug}"
+            );
+        }
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("scheme"));
+    }
 
     #[test]
     fn retry_policy_defaults() {

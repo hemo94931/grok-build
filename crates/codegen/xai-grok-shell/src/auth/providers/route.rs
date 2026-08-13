@@ -237,12 +237,18 @@ pub(crate) fn provider_descriptor(id: ProviderId) -> ProviderDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProviderSecretSource {
     Model,
     StoredOAuth,
     StoredApiKey,
     Environment(&'static str),
+}
+
+impl fmt::Debug for ProviderSecretSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ProviderSecretSource {
@@ -497,9 +503,9 @@ pub(crate) async fn resolve_fresh_provider_secret(
 impl fmt::Debug for ProviderSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderSecret")
-            .field("token", &"[REDACTED]")
+            .field("has_token", &!self.token.is_empty())
             .field("auth_scheme", &self.auth_scheme)
-            .field("source", &self.source)
+            .field("source", &self.source.as_str())
             .finish()
     }
 }
@@ -613,16 +619,14 @@ impl fmt::Debug for ProviderRequestContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderRequestContext")
             .field("provider_id", &self.provider_id)
-            .field("principal", &self.principal)
-            .field("token", &"[REDACTED]")
+            .field("has_principal", &!self.principal.is_empty())
+            .field("has_token", &!self.token.is_empty())
             .field("auth_scheme", &self.auth_scheme)
-            .field("base_url", &self.base_url)
-            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("has_base_url", &!self.base_url.is_empty())
+            .field("header_count", &self.headers.len())
             .field("api_backend", &self.api_backend)
             .field("wire_dialect", &self.wire_dialect)
-            .field("catalog_model_id", &self.catalog_model_id)
-            .field("upstream_model_id", &self.upstream_model_id)
-            .field("credential_source", &self.credential_source)
+            .field("credential_source", &self.credential_source.as_str())
             .finish()
     }
 }
@@ -801,6 +805,44 @@ mod tests {
             assert_eq!(
                 context.headers.contains_key("x-app"),
                 expected_scheme == AuthScheme::Bearer
+            );
+        }
+    }
+
+    #[test]
+    fn provider_route_debug_omits_credentials_endpoints_models_and_env_names() {
+        let secret = secret(
+            ProviderId::Anthropic,
+            "route-debug-secret".to_owned(),
+            ProviderSecretSource::Environment("ANTHROPIC_API_KEY"),
+        )
+        .unwrap();
+        let secret_debug = format!("{secret:?}");
+        let context = ProviderRequestContext::build(
+            ProviderId::Anthropic,
+            "sensitive-model-slug",
+            secret,
+            None,
+            Some("https://provider.example/v1?key=query-secret"),
+            None,
+            None,
+        )
+        .unwrap();
+        let context_debug = format!("{context:?}");
+        for forbidden in [
+            "route-debug-secret",
+            "ANTHROPIC_API_KEY",
+            "sensitive-model-slug",
+            "provider.example",
+            "query-secret",
+        ] {
+            assert!(
+                !secret_debug.contains(forbidden),
+                "secret Debug leaked {forbidden}"
+            );
+            assert!(
+                !context_debug.contains(forbidden),
+                "request context Debug leaked {forbidden}"
             );
         }
     }

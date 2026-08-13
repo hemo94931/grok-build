@@ -3556,11 +3556,7 @@ pub(crate) fn resolve_model_list(
 ) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     if cfg.endpoints.has_custom_endpoint() {
-        tracing::info!(
-            models_base_url = ?cfg.endpoints.models_base_url,
-            models_list_url = ?cfg.endpoints.models_list_url,
-            "custom models endpoint active, skipping built-in defaults",
-        );
+        tracing::info!("custom models endpoint active, skipping built-in defaults");
     } else {
         let defaults = default_model_entries(&cfg.endpoints);
         tracing::debug!(count = defaults.len(), "loaded default models");
@@ -3576,11 +3572,8 @@ pub(crate) fn resolve_model_list(
                     && donor.info.context_window.get() != default_cw
                 {
                     tracing::debug!(
-                        model_key = %key,
-                        model = %entry.info.model,
                         client_default = default_cw,
                         inherited = donor.info.context_window.get(),
-                        donor_model = %donor.info.model,
                         "prefetched model missing context_window, inheriting from hardcoded default"
                     );
                     entry.info.context_window = donor.info.context_window;
@@ -3622,12 +3615,10 @@ pub(crate) fn resolve_model_list(
         let effective = with_provider.as_ref().unwrap_or(model_override);
         let entry = effective.apply(key, base, &cfg.endpoints);
         tracing::debug!(
-            model_key = %key,
-            base_url = %entry.info.base_url,
             has_api_key = entry.api_key.is_some(),
-            env_key = ?entry.env_key,
-            auth_provider = entry.auth_provider.as_ref().map(|p| p.name.as_str()),
-            model_provider = model_override.model_provider.as_deref(),
+            has_env_key = entry.env_key.is_some(),
+            has_auth_provider = entry.auth_provider.is_some(),
+            has_model_provider = model_override.model_provider.is_some(),
             had_base,
             "config model override applied"
         );
@@ -3679,7 +3670,6 @@ pub(crate) fn resolve_model_list(
             if let Some((donor_cw, donor_backend)) = donors.get(&entry.info.model) {
                 if entry.info.context_window.get() == default_cw {
                     tracing::debug!(
-                        model = %entry.info.model,
                         from = default_cw,
                         to = donor_cw.get(),
                         "slug-match: inheriting context_window from sibling catalog entry"
@@ -4925,7 +4915,8 @@ pub(crate) fn resolve_credentials(
             },
             Ok(None) => unreachable!("namespaced provider model must resolve a provider route"),
             Err(error) => {
-                tracing::warn!(model = %info.model, %error, "provider credentials unavailable; failing closed");
+                let error = xai_acp_lib::redact_provider_auth_error(&error.to_string());
+                tracing::warn!(%error, "provider credentials unavailable; failing closed");
                 ResolvedCredentials {
                     api_key: None,
                     base_url: info.base_url.clone(),
@@ -4965,9 +4956,7 @@ pub(crate) fn resolve_credentials(
             && !env_keys.is_empty()
         {
             tracing::warn!(
-                model = %info.model,
-                env_key = %env_keys,
-                "model has env_key configured but none of the environment variables are set — \
+                "model has env_key configured but none of the configured environment variables are set — \
                  requests will have no API key",
             );
         }
@@ -4978,11 +4967,7 @@ pub(crate) fn resolve_credentials(
         )
     };
     let auth_scheme = info.auth_scheme;
-    tracing::debug!(
-        model = %info.model,
-        auth_type = ?auth_type,
-        "resolved credentials"
-    );
+    tracing::debug!(auth_type = ?auth_type, "resolved credentials");
     ResolvedCredentials {
         api_key,
         base_url,
@@ -5125,7 +5110,9 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image
 /// description, session summary, ...), resolved through the catalog so a
 /// `[model.*]` override redirects it to its own endpoint, credentials, and
-/// routing `model`. `None` → caller falls back to the active session's model.
+/// routing `model`. `None` means resolution failed or no dedicated model is
+/// available. Callers may inherit the active session model only for an
+/// unnamespaced slug; recognized provider namespaces must fail closed.
 pub(crate) fn resolve_aux_model_sampling_config(
     model_id: &str,
     models: &IndexMap<String, ModelEntry>,
@@ -5136,6 +5123,11 @@ pub(crate) fn resolve_aux_model_sampling_config(
     client_version: Option<String>,
 ) -> Option<SamplerConfig> {
     let catalog_entry = find_model_by_id(models, model_id).cloned();
+    let provider_namespace = crate::auth::providers::parse_namespaced_model_id(model_id);
+    if provider_namespace.is_some() && catalog_entry.is_none() {
+        tracing::warn!("known provider auxiliary model is absent from the catalog; failing closed");
+        return None;
+    }
     if let Some(entry) = &catalog_entry {
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
@@ -5149,9 +5141,12 @@ pub(crate) fn resolve_aux_model_sampling_config(
         if sampler.api_key.is_some() {
             return Some(sampler);
         }
+        if provider_namespace.is_some() {
+            tracing::warn!("provider credentials unavailable for auxiliary model; failing closed");
+            return None;
+        }
         if entry.effective_auth_provider().is_some() {
             tracing::warn!(
-                model = %model_id,
                 "aux model uses an auth provider with no cached token; the caller falls back to its session default"
             );
             return None;
@@ -5215,10 +5210,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
         );
         return Some(sampler);
     }
-    tracing::warn!(
-        aux_model = %model_id,
-        "no credentials for auxiliary model; falling back to active model",
-    );
+    tracing::warn!("no credentials for auxiliary model; falling back to active model");
     None
 }
 /// Stamp the session-local fields (client id, attribution, bearer resolver,
@@ -6015,6 +6007,96 @@ reasoning_effort = "low"
         assert_eq!(resolved.base_url, "https://vendor.example/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("vendor-key"));
     }
+    #[test]
+    fn namespaced_provider_aux_sampler_missing_catalog_or_credentials_fails_closed() {
+        let endpoints = EndpointsConfig {
+            deployment_key: Some("deployment-parent-key".to_owned()),
+            ..EndpointsConfig::default()
+        };
+        assert!(
+            resolve_aux_model_sampling_config(
+                "deepseek/deepseek-v4-flash",
+                &IndexMap::new(),
+                &endpoints,
+                Some("session-parent-key"),
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "an absent known-provider catalog row must not use xAI/session fallback"
+        );
+
+        let mut entry = test_model_entry(
+            "deepseek/deepseek-v4-flash",
+            "https://api.deepseek.com",
+            None,
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::ChatCompletions;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        let mut catalog = IndexMap::new();
+        catalog.insert("deepseek/deepseek-v4-flash".to_owned(), entry);
+        assert!(
+            resolve_aux_model_sampling_config(
+                "deepseek/deepseek-v4-flash",
+                &catalog,
+                &endpoints,
+                Some("session-parent-key"),
+                false,
+                None,
+                None,
+            )
+            .is_none(),
+            "a provider row with no provider credential must not inherit the parent key"
+        );
+    }
+
+    #[test]
+    fn namespaced_provider_aux_sampler_keeps_provider_identity_and_isolates_parent_key() {
+        let endpoints = EndpointsConfig::default();
+        let mut entry = test_model_entry(
+            "deepseek/deepseek-v4-flash",
+            "https://api.deepseek.com",
+            Some("deepseek-child-key"),
+            None,
+            None,
+        );
+        entry.info.api_backend = ApiBackend::ChatCompletions;
+        entry.info.auth_scheme = AuthScheme::Bearer;
+        let mut catalog = IndexMap::new();
+        catalog.insert("deepseek/deepseek-v4-flash".to_string(), entry);
+
+        let resolved = resolve_aux_model_sampling_config(
+            "deepseek/deepseek-v4-flash",
+            &catalog,
+            &endpoints,
+            Some("unrelated-parent-session-key"),
+            false,
+            None,
+            None,
+        )
+        .expect("provider aux config");
+
+        assert_eq!(resolved.model, "deepseek/deepseek-v4-flash");
+        assert_eq!(resolved.base_url, "https://api.deepseek.com");
+        assert_eq!(resolved.api_key.as_deref(), Some("deepseek-child-key"));
+        assert_eq!(resolved.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(resolved.api_backend, ApiBackend::ChatCompletions);
+        assert!(resolved.bearer_resolver.is_none());
+        let route_hint = crate::auth::providers::sampler_route_hint(
+            "deepseek/deepseek-v4-flash",
+            &resolved.model,
+        );
+        let client = xai_grok_sampler::SamplingClient::new_with_route(resolved, route_hint)
+            .expect("known provider client");
+        assert_eq!(
+            client.endpoint_url("chat/completions"),
+            "https://api.deepseek.com/chat/completions"
+        );
+    }
+
     /// Cold cache falls back to the session model, never the xAI proxy;
     /// warm cache serves the provider token at the provider endpoint.
     #[tokio::test]
@@ -6677,6 +6759,178 @@ reasoning_effort = "low"
             env_key: env_key.map(EnvKeys::single),
             auth_provider: None,
             api_base_url: api_base_url.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_batch_model_byok_resolves_route_through_mock_http() {
+        use crate::auth::providers::{ProviderId, sampler_route_hint};
+        use xai_grok_sampler::{AuthScheme, SamplingClient};
+        use xai_grok_sampling_types::{ConversationItem, ConversationRequest};
+        use xai_grok_test_support::{MockInferenceServer, ScriptedResponse};
+
+        struct Case {
+            provider: ProviderId,
+            upstream_model: &'static str,
+            backend: ApiBackend,
+            expected_path: &'static str,
+            expected_scheme: AuthScheme,
+            expected_header: Option<(&'static str, &'static str)>,
+            use_origin: bool,
+        }
+        let cases = [
+            Case {
+                provider: ProviderId::Anthropic,
+                upstream_model: "claude-fable-5",
+                backend: ApiBackend::Messages,
+                expected_path: "/v1/messages",
+                expected_scheme: AuthScheme::XApiKey,
+                expected_header: Some(("anthropic-version", "2023-06-01")),
+                use_origin: true,
+            },
+            Case {
+                provider: ProviderId::GithubCopilot,
+                upstream_model: "gpt-4.1",
+                backend: ApiBackend::ChatCompletions,
+                expected_path: "/v1/chat/completions",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: Some(("copilot-integration-id", "vscode-chat")),
+                use_origin: false,
+            },
+            Case {
+                provider: ProviderId::Openrouter,
+                upstream_model: "openai/gpt-5.2",
+                backend: ApiBackend::ChatCompletions,
+                expected_path: "/v1/chat/completions",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: None,
+                use_origin: false,
+            },
+            Case {
+                provider: ProviderId::KimiCoding,
+                upstream_model: "k3",
+                backend: ApiBackend::Messages,
+                expected_path: "/v1/messages",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: Some(("anthropic-version", "2023-06-01")),
+                use_origin: true,
+            },
+            Case {
+                provider: ProviderId::Radius,
+                upstream_model: "radius-1",
+                backend: ApiBackend::Messages,
+                expected_path: "/v1/messages",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: None,
+                use_origin: false,
+            },
+            Case {
+                provider: ProviderId::Deepseek,
+                upstream_model: "deepseek-v4-flash",
+                backend: ApiBackend::ChatCompletions,
+                expected_path: "/v1/chat/completions",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: None,
+                use_origin: false,
+            },
+            Case {
+                provider: ProviderId::Zai,
+                upstream_model: "glm-5.2",
+                backend: ApiBackend::ChatCompletions,
+                expected_path: "/v1/chat/completions",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: None,
+                use_origin: false,
+            },
+            Case {
+                provider: ProviderId::ZaiCodingCn,
+                upstream_model: "glm-5.2",
+                backend: ApiBackend::ChatCompletions,
+                expected_path: "/v1/chat/completions",
+                expected_scheme: AuthScheme::Bearer,
+                expected_header: None,
+                use_origin: false,
+            },
+        ];
+
+        for case in cases {
+            let server = MockInferenceServer::start().await.unwrap();
+            server.enqueue_response(
+                case.expected_path,
+                ScriptedResponse::json(
+                    reqwest::StatusCode::UNAUTHORIZED.as_u16(),
+                    serde_json::json!({"error":{"message":"rejected"}}),
+                ),
+            );
+            let catalog_model = format!("{}/{}", case.provider, case.upstream_model);
+            let base_url = if case.use_origin {
+                server.origin()
+            } else {
+                server.url()
+            };
+            let mut model = test_model_entry(
+                &catalog_model,
+                &base_url,
+                Some("child-provider-key"),
+                None,
+                None,
+            );
+            model.info.api_backend = case.backend;
+
+            let credentials = resolve_credentials(&model, Some("parent-session-key"));
+            assert_eq!(credentials.auth_scheme, case.expected_scheme);
+            let config = sampling_config_for_model(&model, credentials, None, None, None, None);
+            let client = SamplingClient::new_with_route(
+                config,
+                sampler_route_hint(&catalog_model, &catalog_model),
+            )
+            .expect("resolved provider client");
+            let error = client
+                .conversation_collect(ConversationRequest {
+                    items: vec![ConversationItem::user("hello")],
+                    ..Default::default()
+                })
+                .await
+                .expect_err("scripted 401");
+            assert!(matches!(
+                error,
+                xai_grok_sampling_types::SamplingError::Auth { .. }
+            ));
+
+            let requests = server.requests();
+            let request = requests.last().expect("captured provider request");
+            assert_eq!(request.path, case.expected_path, "{}", case.provider);
+            assert_eq!(
+                request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("model"))
+                    .and_then(serde_json::Value::as_str),
+                Some(case.upstream_model),
+                "{}",
+                case.provider
+            );
+            match case.expected_scheme {
+                AuthScheme::Bearer => assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer child-provider-key")
+                ),
+                AuthScheme::XApiKey => {
+                    assert_eq!(request.header("x-api-key"), Some("child-provider-key"));
+                    assert!(request.authorization.is_none());
+                }
+            }
+            if let Some((name, value)) = case.expected_header {
+                assert_eq!(request.header(name), Some(value), "{}", case.provider);
+            }
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|(_, value)| value.contains("parent-session-key")),
+                "{} inherited the parent credential",
+                case.provider
+            );
         }
     }
     /// The effective-model RE-support lookup must use the model ACTUALLY used:

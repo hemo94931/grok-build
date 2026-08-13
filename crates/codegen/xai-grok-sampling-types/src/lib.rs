@@ -11,6 +11,7 @@ pub mod doom_loop;
 pub mod error;
 pub mod messages;
 pub mod provider_error;
+pub mod secret_redaction;
 pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
@@ -23,7 +24,11 @@ pub use self::doom_loop::{
 pub use self::error::{
     EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
     SentCredential, is_context_length_error, is_retryable_api_status, status_user_message,
-    user_facing_api_error_message,
+    try_parse_stream_error_with_credentials, user_facing_api_error_message,
+    user_facing_api_error_message_with_credentials,
+};
+pub use self::secret_redaction::{
+    redact_credential_shaped_text, redact_known_credential, redact_known_credentials,
 };
 pub use self::tool_overrides::{
     ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,

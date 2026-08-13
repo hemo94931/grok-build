@@ -418,13 +418,20 @@ pub(crate) async fn run_shell_child(
     if request.fork_context {
         effective_runtime.model = Some(ctx.model_id.0.to_string());
     }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
-        effective_runtime.model.as_deref(),
-        &request.subagent_type,
-        &definition.model,
-        &ctx,
-    )
-    .await;
+    let (mut effective_sampling_config, mut effective_model_id) =
+        match resolve_effective_model_config(
+            effective_runtime.model.as_deref(),
+            &request.subagent_type,
+            &definition.model,
+            &ctx,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                return child_run_output(failure_result(&request, message), completion_data, None);
+            }
+        };
     let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
     {
         let model_str = &effective_sampling_config.model;
@@ -436,13 +443,21 @@ pub(crate) async fn run_shell_child(
                 .values()
                 .any(|e| e.info().model == *model_str);
         if model_unknown {
+            if crate::auth::providers::parse_namespaced_model_id(model_str).is_some()
+                || crate::auth::providers::parse_namespaced_model_id(effective_model_id.0.as_ref())
+                    .is_some()
+            {
+                let msg = "Resolved provider subagent model is not available in the model catalogue; refusing to inherit the parent route.";
+                tracing::warn!(
+                    subagent_id = %request.id,
+                    "Resolved provider subagent model not found; failing closed"
+                );
+                return child_run_output(failure_result(&request, msg), completion_data, None);
+            }
             let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
             tracing::warn!(
                 subagent_id = %request.id,
-                resolved_model = %model_str,
-                parent_model = %parent_config.model,
-                "Resolved subagent model not found in available models — \
-                 falling back to parent model"
+                "Resolved subagent model not found in available models — falling back to parent model"
             );
             effective_sampling_config = parent_config;
             effective_model_id = parent_mid;
@@ -455,16 +470,13 @@ pub(crate) async fn run_shell_child(
         if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
             tracing::info!(
                 subagent_id = %request.id,
-                resolved_model = %effective_model_id.0,
-                source_model = source_model,
                 "Pinning resumed child to source model"
             );
             effective_sampling_config = resolved.0;
             effective_model_id = resolved.1;
         } else {
             let msg = format!(
-                "Cannot resume from subagent '{}': source model '{source_model}' \
-                 is no longer available in the model catalogue.",
+                "Cannot resume from subagent '{}': its source model is no longer available in the model catalogue.",
                 source.subagent_id,
             );
             return child_run_output(failure_result(&request, &msg), completion_data, None);
@@ -651,7 +663,14 @@ pub(crate) async fn run_shell_child(
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
     };
-    let sampling_client = match crate::sampling::Client::new(effective_sampling_config.clone()) {
+    let route_hint = crate::auth::providers::sampler_route_hint(
+        effective_model_id.0.as_ref(),
+        &effective_sampling_config.model,
+    );
+    let sampling_client = match crate::sampling::Client::new_with_route(
+        effective_sampling_config.clone(),
+        route_hint,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("Sampling client error: {e}");
@@ -736,21 +755,23 @@ pub(crate) async fn run_shell_child(
         alpha_test_key: ctx.alpha_test_key.clone(),
         client_version: effective_sampling_config.client_version.clone(),
     };
+    let effective_provider =
+        crate::auth::providers::parse_namespaced_model_id(effective_model_id.0.as_ref())
+            .map(|(provider, _)| provider.to_string());
+    let parent_provider =
+        crate::auth::providers::parse_namespaced_model_id(ctx.model_id.0.as_ref())
+            .map(|(provider, _)| provider.to_string());
     xai_grok_telemetry::unified_log::info(
         "subagent spawn credentials",
         None,
         Some(serde_json::json!({
-            "subagent_id": &request.id,
             "subagent_type": &request.subagent_type,
-            "effective_model": effective_model_id.0.as_ref(),
-            "effective_model_raw": &effective_sampling_config.model,
-            "base_url": &effective_sampling_config.base_url,
+            "effective_provider": effective_provider,
             "has_credential": effective_sampling_config.api_key.is_some(),
             "auth_scheme": format!("{:?}", effective_sampling_config.auth_scheme),
             "auth_type": format!("{:?}", inherited_auth_type),
             "model_has_own_creds": model_has_own_creds,
-            "auth_method_id": ctx.auth_method_id.0.as_ref(),
-            "parent_model": ctx.model_id.0.as_ref(),
+            "parent_provider": parent_provider,
             "parent_has_credential": ctx.sampling_config.api_key.is_some(),
             "parent_auth_scheme": format!("{:?}", ctx.sampling_config.auth_scheme),
             "context_window": effective_sampling_config.context_window,

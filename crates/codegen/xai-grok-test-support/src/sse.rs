@@ -11,8 +11,16 @@ use crate::scripted::SseEvent;
 /// Generate Anthropic Messages SSE events: one text block streamed as a
 /// single delta, terminated by a `message_delta` carrying `stop_reason`.
 pub fn messages_api_events(text: &str, model: &str, stop_reason: &str) -> Vec<Event> {
+    messages_api_script(text, model, stop_reason)
+        .into_iter()
+        .map(scripted_event_to_axum)
+        .collect()
+}
+
+/// Generate Anthropic Messages SSE events as pure scripted data.
+pub fn messages_api_script(text: &str, model: &str, stop_reason: &str) -> Vec<SseEvent> {
     vec![
-        Event::default().data(
+        SseEvent::data(
             json!({
                 "type": "message_start",
                 "message": {
@@ -26,20 +34,20 @@ pub fn messages_api_events(text: &str, model: &str, stop_reason: &str) -> Vec<Ev
             })
             .to_string(),
         ),
-        Event::default().data(
+        SseEvent::data(
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
                 .to_string(),
         ),
-        Event::default().data(
+        SseEvent::data(
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})
                 .to_string(),
         ),
-        Event::default().data(json!({"type":"content_block_stop","index":0}).to_string()),
-        Event::default().data(
+        SseEvent::data(json!({"type":"content_block_stop","index":0}).to_string()),
+        SseEvent::data(
             json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":5,"input_tokens":10}})
                 .to_string(),
         ),
-        Event::default().data(json!({"type":"message_stop"}).to_string()),
+        SseEvent::data(json!({"type":"message_stop"}).to_string()),
     ]
 }
 
@@ -248,17 +256,16 @@ fn responses_api_script_from_deltas(deltas: &[String], text: &str, model: &str) 
     events
 }
 
+fn scripted_event_to_axum(event: SseEvent) -> Event {
+    let event_out = Event::default().data(event.data);
+    match event.event {
+        Some(name) => event_out.event(name),
+        None => event_out,
+    }
+}
+
 fn scripted_to_axum(events: Vec<SseEvent>) -> Vec<Event> {
-    events
-        .into_iter()
-        .map(|scripted| {
-            let event = Event::default().data(scripted.data);
-            match scripted.event {
-                Some(name) => event.event(name),
-                None => event,
-            }
-        })
-        .collect()
+    events.into_iter().map(scripted_event_to_axum).collect()
 }
 
 /// Generate Responses API SSE events for a reasoning-only completion: the

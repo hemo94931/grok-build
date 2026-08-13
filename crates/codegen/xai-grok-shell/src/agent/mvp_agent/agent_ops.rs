@@ -123,14 +123,21 @@ impl MvpAgent {
                 );
                 cfg
             }
+            None if crate::auth::providers::parse_namespaced_model_id(&slug).is_some() => {
+                return Err(acp::Error::internal_error().data(
+                    "session summary provider model is unavailable or missing credentials",
+                ));
+            }
             None => {
                 let mut fallback = primary.clone();
-                fallback.model = slug;
+                fallback.model = slug.clone();
                 fallback
             }
         };
         let model = config.model.clone();
-        let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
+        let route_hint = crate::auth::providers::sampler_route_hint(&slug, &config.model);
+        let client = OaiCompatClient::new_with_route(config, route_hint)
+            .map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
     }
     fn has_proxy_credentials(&self) -> bool {

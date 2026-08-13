@@ -918,6 +918,13 @@ impl SessionActor {
         let resolved_describe = self
             .resolve_aux_sampler_config(&self.image_description_model)
             .await;
+        if resolved_describe.is_none()
+            && crate::auth::providers::parse_namespaced_model_id(&self.image_description_model)
+                .is_some()
+        {
+            return Err(acp::Error::internal_error()
+                .data("image-description provider model is unavailable or missing credentials"));
+        }
         let (describe_model, sampler_config) =
             crate::agent::config::finalize_image_describe_sampler_config(
                 resolved_describe,

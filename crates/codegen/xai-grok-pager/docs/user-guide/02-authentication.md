@@ -16,13 +16,9 @@ Grok stores xAI credentials in `~/.grok/auth.json` and reuses them across sessio
 
 ### Credential storage
 
-xAI credentials stay in `~/.grok/auth.json`. OAuth credentials for additional model providers stay in a separate `~/.grok/providers.json`; the files have different schemas and are never merged. Writes to both files share `auth.json.lock` so concurrent login and token refresh operations cannot overwrite each other.
+xAI credentials stay in `~/.grok/auth.json`; additional-provider credentials stay in `~/.grok/providers.json`. See [Additional Model Providers](#additional-model-providers) for slot semantics, precedence, permissions, and secret-handling guarantees.
 
-Tokens in both files (and MCP OAuth tokens in `~/.grok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
-
-- Prefer full-disk encryption (FileVault, BitLocker, LUKS, or equivalent).
-- Do not copy `auth.json`, `providers.json`, or `mcp_credentials.json` into shared directories, tickets, or chat.
-- On multi-user hosts, keep `$HOME` / `$GROK_HOME` private to your account.
+Prefer full-disk encryption and keep `$HOME` / `$GROK_HOME` private to your account.
 
 ### Re-authenticate
 
@@ -45,35 +41,79 @@ Use `grok logout` to select and clear one cached provider session.
 
 ## Additional Model Providers
 
-Grok can authenticate with Anthropic, OpenAI Codex, GitHub Copilot, OpenRouter, Kimi Coding, and Radius. Select a provider explicitly or process every provider in sequence:
+Grok has first-class authentication and wire compatibility for Anthropic, OpenAI Codex, GitHub Copilot, OpenRouter, Kimi Coding, Radius, DeepSeek, Z.AI, and Z.AI Coding CN.
+
+### Methods versus transports
+
+A **credential method** is either OAuth or API key. Browser and device code are OAuth **transports**; they are not additional credential methods. The CLI, ACP clients, and TUI read the same provider-method registry, which currently exposes 15 login choices including xAI.
 
 ```bash
-grok login --provider anthropic
+grok login --provider anthropic --api-key
+grok login --provider anthropic --oauth
 grok login --provider openai-codex --device-auth
-grok login --all
+grok login --provider deepseek --api-key
+grok login --all                 # OAuth-capable provider methods only
 
 grok logout --provider radius
 grok logout --all
 ```
 
-Valid provider IDs are `xai`, `anthropic`, `openai-codex`, `github-copilot`, `openrouter`, `kimi-coding`, and `radius`. `--provider` and `--all` are mutually exclusive. A forced browser or device flow fails clearly when that provider does not support it.
+| Flag | Meaning |
+|------|---------|
+| `--api-key` | Select API-key entry. The flag is boolean-only; the secret is read from the dedicated hidden secret prompt, never from a command-line argument. |
+| `--oauth` | Select OAuth and force the browser transport. |
+| `--device-auth` / `--device-code` | Select OAuth and force the device-code transport. |
+| `--all` | Run all OAuth-capable provider methods. It does not prompt for every API key. |
 
-In the TUI, use `/login <provider>` and `/logout <provider>`; argument completion shows the same provider list. Provider models appear in the model picker as `Provider · Model`. A provider-specific 401 prompts you to re-authenticate only that provider.
+`--provider` and `--all` are mutually exclusive. Conflicting method or transport flags, duplicate flags, unknown providers, and unsupported combinations fail locally. OpenAI Codex remains OAuth-only.
 
-### Provider environment keys
+In the TUI, use `/login <provider>` and `/logout <provider>`. For API-key methods, Grok opens a dedicated masked secret field (`••••••••`) that owns keyboard and paste input until submit or cancel. ACP clients use the dedicated `x.ai/providerAuth/promptSecret` channel rather than a generic question or prompt. Headless clients that cannot provide that secure channel fail closed.
 
-API keys are read from the environment; there is no interactive API-key prompt. OpenAI Codex supports OAuth only.
+### Storage and precedence
 
-| Provider | Login flow | Environment keys |
-|----------|------------|------------------|
-| Anthropic | Browser | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
-| OpenAI Codex | Browser or device code | None |
-| GitHub Copilot | Device code | `COPILOT_GITHUB_TOKEN` |
-| OpenRouter | Browser | `OPENROUTER_API_KEY` |
-| Kimi Coding | Device code | `KIMI_API_KEY` |
-| Radius | Browser or device code | `RADIUS_API_KEY` |
+xAI credentials stay in `~/.grok/auth.json`. Additional-provider credentials stay in `~/.grok/providers.json`; the files have different schemas and are never merged. `providers.json` has one slot per provider, containing either OAuth or an API key, so a later login for that provider replaces the earlier credential method. A stored slot belongs to that provider only.
 
-For a provider model, credential precedence is: per-model key, that provider's stored OAuth credential, then that provider's environment keys. The route fails locally if none is available. It never falls back to the xAI session token or `XAI_API_KEY`, and a provider login or refresh does not change the active xAI authentication method.
+Provider credentials resolve in this order:
+
+1. The selected model's non-empty `api_key` or first non-empty `env_key`.
+2. That provider's stored slot in `providers.json` (OAuth or API key).
+3. That provider's environment variables, in the order listed below.
+4. Fail closed.
+
+A present but malformed or unsupported stored slot fails closed instead of silently falling back to the environment. Additional providers never receive the xAI session token or `XAI_API_KEY`, and switching providers does not reuse the previous provider's credential, headers, or compatibility profile.
+
+Both credential files are updated under a shared lock with atomic replacement. Credentials are written with owner-only permissions (`0600` on Unix). Provider API-key login is a **blind store**: saving the key does not contact the provider or prove that the key is accepted; the first model or catalog request can still return 401.
+
+Secrets are excluded from `Debug` output, tracing and unified logs, ACP annotations, TUI history/scrollback, previews, task results, telemetry, attribution, generated model caches, and session persistence. Do not copy `auth.json`, `providers.json`, or `mcp_credentials.json` into shared directories, tickets, or chat.
+
+### Provider methods and environment keys
+
+| Provider ID | Supported methods | OAuth transport(s) | Environment keys |
+|-------------|-------------------|--------------------|------------------|
+| `anthropic` | OAuth, API key | Browser | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+| `openai-codex` | OAuth only | Browser, device code | None |
+| `github-copilot` | OAuth, API key/token | Device code | `COPILOT_GITHUB_TOKEN` |
+| `openrouter` | OAuth, API key | Browser | `OPENROUTER_API_KEY` |
+| `kimi-coding` | OAuth, API key | Device code | `KIMI_API_KEY` |
+| `radius` | OAuth, API key | Browser, device code | `RADIUS_API_KEY` |
+| `deepseek` | API key only | — | `DEEPSEEK_API_KEY` |
+| `zai` | API key only | — | `ZAI_API_KEY` |
+| `zai-coding-cn` | API key only | — | `ZAI_CODING_CN_API_KEY` |
+
+Anthropic uses `Authorization: Bearer …` for stored OAuth credentials and `ANTHROPIC_AUTH_TOKEN`. Stored API keys, `ANTHROPIC_OAUTH_TOKEN`, and `ANTHROPIC_API_KEY` use `x-api-key` unless the token contains `sk-ant-oat`, in which case they use Bearer authentication. Other API-key providers in this table use Bearer authentication on their provider routes.
+
+Provider models appear in the picker as `Provider · Model` only when their provider credential is resolvable. The first-class DeepSeek entries are `deepseek-v4-flash` and `deepseek-v4-pro`. Z.AI and Z.AI Coding CN each expose `glm-4.7`, `glm-5-turbo`, `glm-5.2`, and `glm-5.2-highspeed`; their credentials and base URLs are isolated by region.
+
+### Provider 401 recovery
+
+Recovery is based on the credential source captured when the failed request was built:
+
+- **Stored OAuth:** Grok may refresh that exact provider and retry.
+- **Stored API key:** Grok can reopen the same provider's API-key login after stashing the failed prompt.
+- **Provider environment key:** update the named environment variable and restart/retry; Grok does not refresh it.
+- **Model `api_key` / `env_key`:** update that model setting. A stored provider key would remain shadowed, so Grok does not misleadingly direct you to save one.
+
+Cancellation is scoped to the provider and login request. Cancelling or failing re-authentication does not resend the stashed prompt. A successful replacement credential can resume it once. Provider-auth errors are sanitized before they reach logs, ACP error data, persistence, telemetry, or scrollback.
 
 ---
 
@@ -298,7 +338,7 @@ You can also implement the device-code flow through an [External Auth Provider](
 Grok automatically refreshes expired credentials:
 
 - **Before expiry:** If your auth provider returned `expires_in` (JSON output) or you set `auth_token_ttl`, Grok re-runs the auth binary ~5 minutes before expiry.
-- **On auth error:** If the server returns 401 Unauthorized, Grok refreshes the credentials and retries the request.
+- **On auth error:** If the rejected request used refreshable xAI credentials or a stored provider OAuth credential, Grok can refresh that exact source and retry. API keys and environment/model BYOK credentials are never auto-refreshed.
 - **OIDC:** If a `refresh_token` is available, Grok silently refreshes via your IdP without re-opening the browser.
 
 Tune the refresh buffer:

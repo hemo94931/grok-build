@@ -21,8 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampler::{
-    ApiBackend, RequestId, RetryPolicy, SamplerActor, SamplerConfig, SamplingChannel,
-    SamplingErrorKind, SamplingEvent,
+    ApiBackend, ProviderRouteHint, RequestId, RetryPolicy, SamplerActor, SamplerConfig,
+    SamplingChannel, SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
     ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, UserItem,
@@ -716,32 +716,41 @@ async fn messages_unparseable_event_is_fatal_without_retry() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_config_changes_subsequent_request_model() {
+async fn update_config_changes_subsequent_request_model_and_credential() {
     use std::sync::Mutex;
 
-    let captured_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let captured_handler = Arc::clone(&captured_models);
+    let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured);
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let captured = Arc::clone(&captured_handler);
-            async move {
-                let model = body
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                captured.lock().unwrap().push(model);
-                let events = sse::chat_completion_events("ok", "test-model");
-                Sse::new(stream::iter(
-                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
-                ))
-            }
-        }),
+        post(
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    let model = body
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    captured.lock().unwrap().push((model, authorization));
+                    let events = sse::chat_completion_events("ok", "test-model");
+                    Sse::new(stream::iter(
+                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    ))
+                }
+            },
+        ),
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let cfg = test_config(server.base_url(), "model-A");
+    let mut cfg = test_config(server.base_url(), "model-A");
+    cfg.api_key = Some("credential-A".to_owned());
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
     let _ = handle
@@ -750,7 +759,7 @@ async fn update_config_changes_subsequent_request_model() {
         .expect("first req ok");
 
     let mut new_cfg = test_config(server.base_url(), "model-B");
-    new_cfg.api_key = Some("test-key".into());
+    new_cfg.api_key = Some("credential-B".into());
     handle.update_config(new_cfg);
 
     let _ = handle
@@ -760,10 +769,14 @@ async fn update_config_changes_subsequent_request_model() {
 
     server.shutdown();
 
-    let models = captured_models.lock().unwrap();
+    let captured = captured.lock().unwrap();
     assert_eq!(
-        models.as_slice(),
-        &["model-A".to_string(), "model-B".to_string()]
+        captured.as_slice(),
+        &[
+            ("model-A".to_string(), "Bearer credential-A".to_string()),
+            ("model-B".to_string(), "Bearer credential-B".to_string()),
+        ],
+        "update_config must rebuild from the new model and credential rather than reuse the old client"
     );
 }
 
@@ -806,8 +819,9 @@ async fn responses_doom_loop_signals_reach_completed_response() {
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let handle = SamplerActor::spawn(
+    let handle = SamplerActor::spawn_with_route(
         responses_config(server.base_url(), Some(DoomLoopRecoveryPolicy::default())),
+        ProviderRouteHint::FirstPartyXai,
         RetryPolicy::default(),
         event_tx,
     );
@@ -863,8 +877,9 @@ async fn responses_confident_doom_loop_signal_resamples_once() {
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let handle = SamplerActor::spawn(
+    let handle = SamplerActor::spawn_with_route(
         responses_config(server.base_url(), Some(DoomLoopRecoveryPolicy::default())),
+        ProviderRouteHint::FirstPartyXai,
         RetryPolicy::default(),
         event_tx,
     );

@@ -1198,7 +1198,8 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
 
     let mut config = test_sampler_config(&server.url(), ApiBackend::Responses, &[]);
     config.doom_loop_recovery = Some(Default::default());
-    let client = Client::new(config).unwrap();
+    let client =
+        Client::new_with_route(config, xai_grok_sampler::ProviderRouteHint::FirstPartyXai).unwrap();
 
     let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
     let (mut stream, _metadata, collector) =

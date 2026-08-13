@@ -308,7 +308,11 @@ pub fn create_test_client_with_extra_headers(
     api_backend: ApiBackend,
     extra_headers: &[(&str, &str)],
 ) -> Client {
-    Client::new(test_sampler_config(base_url, api_backend, extra_headers)).unwrap()
+    Client::new_with_route(
+        test_sampler_config(base_url, api_backend, extra_headers),
+        xai_grok_sampler::ProviderRouteHint::FirstPartyXai,
+    )
+    .unwrap()
 }
 
 /// The shared mock-server `SamplerConfig`; tests needing a non-default field

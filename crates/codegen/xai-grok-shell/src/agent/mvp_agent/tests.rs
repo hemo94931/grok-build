@@ -1852,6 +1852,27 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
+#[tokio::test(flavor = "current_thread")]
+async fn namespaced_summary_resolution_never_clones_primary_credentials() {
+    let mut agent = build_minimal_agent_for_tests();
+    agent.cfg.borrow_mut().session_summary_model =
+        Some("deepseek/deepseek-v4-flash".to_owned());
+    let primary = xai_grok_sampler::SamplerConfig {
+        api_key: Some("unrelated-primary-key".to_owned()),
+        base_url: "https://api.x.ai/v1".to_owned(),
+        model: "grok-primary".to_owned(),
+        ..Default::default()
+    };
+
+    let error = match agent.build_summary_client(&primary) {
+        Ok(_) => panic!("missing namespaced summary route must fail closed"),
+        Err(error) => error,
+    };
+    let rendered = format!("{error:?}");
+    assert!(rendered.contains("session summary provider model"));
+    assert!(!rendered.contains("unrelated-primary-key"));
+}
+
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(
         "x.ai/session/usage",
