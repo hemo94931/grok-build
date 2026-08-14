@@ -50,7 +50,9 @@ pub use config::{
     SharedBearerResolver, SharedHeaderInjector,
 };
 pub use doom_loop::DoomLoopSignalCollector;
-pub use events::{SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent};
+pub use events::{
+    SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent, StripReason,
+};
 pub use handle::SamplerHandle;
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use provider_wire::{KnownProvider, ProviderRouteHint};

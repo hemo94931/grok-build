@@ -1162,7 +1162,7 @@ pub fn publish_staged_compaction_segment_durable(
     wrapper_digest: &str,
 ) -> io::Result<PublishedCompactionSegment> {
     validate_checkpoint_component(checkpoint_id)?;
-    let compaction_dir = session_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let compaction_dir = session_dir.join(xai_compaction_transcript::COMPACTION_DIR);
     std::fs::create_dir_all(&compaction_dir)?;
     reject_symlink_components(session_dir, &compaction_dir)?;
     let staging_path = segment_staging_path(session_dir, checkpoint_id)?;
@@ -1192,7 +1192,7 @@ pub fn publish_staged_compaction_segment_durable(
         io::Error::new(io::ErrorKind::InvalidData, "invalid staged segment detail")
     })?;
     let index = next_compaction_segment_index(&compaction_dir)?;
-    let rendered = xai_chat_state::compaction_transcript::render_segment_md(
+    let rendered = xai_compaction_transcript::render_segment_md(
         &staging.items,
         &staging.summary,
         index,
@@ -1201,7 +1201,7 @@ pub fn publish_staged_compaction_segment_durable(
     );
     let markdown = format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{checkpoint_id} -->\n{rendered}");
     let segment_path = compaction_dir.join(
-        xai_chat_state::compaction_transcript::segment_filename(index),
+        xai_compaction_transcript::segment_filename(index),
     );
     write_bytes_durable(&segment_path, markdown.as_bytes())?;
     ensure_segment_index(
@@ -1235,7 +1235,7 @@ fn validate_checkpoint_component(checkpoint_id: &str) -> io::Result<()> {
 fn segment_staging_path(session_dir: &Path, checkpoint_id: &str) -> io::Result<PathBuf> {
     validate_checkpoint_component(checkpoint_id)?;
     Ok(session_dir
-        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+        .join(xai_compaction_transcript::COMPACTION_DIR)
         .join("staging")
         .join(format!("{checkpoint_id}.json")))
 }
@@ -1251,7 +1251,7 @@ fn find_published_segment(
         let Some(index) = entry
             .file_name()
             .to_str()
-            .and_then(xai_chat_state::compaction_transcript::parse_segment_index)
+            .and_then(xai_compaction_transcript::parse_segment_index)
         else {
             continue;
         };
@@ -1280,7 +1280,7 @@ fn next_compaction_segment_index(compaction_dir: &Path) -> io::Result<u64> {
         if let Some(index) = entry
             .file_name()
             .to_str()
-            .and_then(xai_chat_state::compaction_transcript::parse_segment_index)
+            .and_then(xai_compaction_transcript::parse_segment_index)
         {
             next = next.max(index.saturating_add(1));
         }
@@ -1295,11 +1295,11 @@ fn ensure_segment_index(
     summary: &str,
     items_len: usize,
 ) -> io::Result<()> {
-    let index_path = compaction_dir.join(xai_chat_state::compaction_transcript::INDEX_FILE);
+    let index_path = compaction_dir.join(xai_compaction_transcript::INDEX_FILE);
     if !index_path.exists() {
         write_bytes_durable(
             &index_path,
-            xai_chat_state::compaction_transcript::INDEX_HEADER.as_bytes(),
+            xai_compaction_transcript::INDEX_HEADER.as_bytes(),
         )?;
     }
     let metadata = std::fs::symlink_metadata(&index_path)?;
@@ -1309,8 +1309,8 @@ fn ensure_segment_index(
             "compaction segment index is not a regular file",
         ));
     }
-    let keywords = xai_chat_state::compaction_transcript::extract_keywords(summary);
-    let row = xai_chat_state::compaction_transcript::render_index_row(
+    let keywords = xai_compaction_transcript::extract_keywords(summary);
+    let row = xai_compaction_transcript::render_index_row(
         index,
         items_len,
         markdown.len(),

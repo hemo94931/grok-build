@@ -22,17 +22,18 @@ pub use self::doom_loop::{
     DoomLoopSignal, DoomLoopSignalKind, is_check_event, peek_doom_loop,
 };
 pub use self::error::{
-    EmptyReason, EmptyResponseContext, HttpErrorKind, ResponseModelMetadata, Result, SamplingError,
-    SentCredential, http_error_kind, is_context_length_error, is_retryable_api_status,
-    status_user_message, try_parse_stream_error_with_credentials, user_facing_api_error_message,
-    user_facing_api_error_message_with_credentials,
+    ApiErrorCode, EmptyReason, EmptyResponseContext, HttpErrorKind, INVALID_IMAGE_ERROR_CODE,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, http_error_kind,
+    is_context_length_error, is_retryable_api_status, parse_error_code, status_user_message,
+    try_parse_stream_error, try_parse_stream_error_with_credentials,
+    user_facing_api_error_message, user_facing_api_error_message_with_credentials,
 };
 pub use self::secret_redaction::{
     redact_credential_shaped_text, redact_known_credential, redact_known_credentials,
 };
 pub use self::tool_overrides::{
-    ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,
-    WebSearchOptions, XSearchOptions,
+    ClearableField, MAX_WEB_SEARCH_DOMAINS, SearchDateBound, SearchDateBoundError, ToolOverrides,
+    ToolOverridesUpdate, WebSearchOptions, WebSearchOptionsError, XSearchOptions,
 };
 pub use self::types::*;
 

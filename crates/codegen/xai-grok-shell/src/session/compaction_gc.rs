@@ -348,7 +348,7 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
     // id retains that id's sidecar (never deleted while a marker may still
     // reference it). A recognized segment file that cannot be read fails the
     // scan closed — the reference set would be incomplete.
-    let compaction_dir = session_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    let compaction_dir = session_dir.join(xai_compaction_transcript::COMPACTION_DIR);
     let entries = match std::fs::read_dir(&compaction_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -362,7 +362,7 @@ fn scan_references(session_dir: &Path) -> io::Result<(BTreeSet<String>, BTreeSet
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if xai_chat_state::compaction_transcript::parse_segment_index(&name).is_none() {
+        if xai_compaction_transcript::parse_segment_index(&name).is_none() {
             continue;
         }
         let metadata = entry.metadata()?;
