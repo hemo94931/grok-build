@@ -41,7 +41,7 @@
 
 use std::time::Duration;
 
-use xai_grok_sampling_types::{SamplingError, is_retryable_api_status};
+use xai_grok_sampling_types::{SamplingError, http_error_kind, is_retryable_api_status};
 
 /// After this many rate-limit (429) retries, escalate to the caller
 /// instead of waiting again. Rate-limit waits can be long and there is
@@ -295,7 +295,8 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
             )
         }
 
-        SamplingError::Http { kind, source } => {
+        SamplingError::Http(source) => {
+            let kind = http_error_kind(source);
             let status = source
                 .status()
                 .map(|status| format!(" with status {}", status.as_u16()))
@@ -401,9 +402,10 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             credential: *credential,
         },
         SamplingError::InvalidConfiguration(msg) => SamplingError::InvalidConfiguration(msg),
-        SamplingError::Http { kind, source } => {
+        SamplingError::Http(source) => {
             // reqwest::Error is not Clone. Preserve only categorical transport
             // facts; raw displays can contain URL userinfo or query secrets.
+            let kind = http_error_kind(source);
             let status = source
                 .status()
                 .map(|status| format!(" with status {}", status.as_u16()))

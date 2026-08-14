@@ -22,9 +22,9 @@ pub use self::doom_loop::{
     DoomLoopSignal, DoomLoopSignalKind, is_check_event, peek_doom_loop,
 };
 pub use self::error::{
-    EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
-    SentCredential, is_context_length_error, is_retryable_api_status, status_user_message,
-    try_parse_stream_error_with_credentials, user_facing_api_error_message,
+    EmptyReason, EmptyResponseContext, HttpErrorKind, ResponseModelMetadata, Result, SamplingError,
+    SentCredential, http_error_kind, is_context_length_error, is_retryable_api_status,
+    status_user_message, try_parse_stream_error_with_credentials, user_facing_api_error_message,
     user_facing_api_error_message_with_credentials,
 };
 pub use self::secret_redaction::{

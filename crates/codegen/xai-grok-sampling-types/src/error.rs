@@ -153,12 +153,12 @@ pub enum SamplingError {
     },
     #[error("invalid client configuration: {0}")]
     InvalidConfiguration(&'static str),
-    #[error("request error ({kind})")]
-    Http {
-        kind: HttpErrorKind,
-        #[source]
-        source: reqwest::Error,
-    },
+    // Display deliberately omits the inner reqwest::Error text (URLs can carry
+    // userinfo / query secrets). Callers that need the category use
+    // [`http_error_kind`]; the source chain still exposes the raw error via
+    // `std::error::Error::source`.
+    #[error("request error ({})", http_error_kind(.0))]
+    Http(#[source] reqwest::Error),
     #[error("{prefix}{0}", prefix = SERIALIZATION_DISPLAY_PREFIX)]
     Serialization(serde_json::Error),
     #[error("API error (status {status}): {message}")]
@@ -209,7 +209,9 @@ impl fmt::Debug for SamplingError {
                 debug.field("kind", &"Auth").field("credential", credential)
             }
             Self::InvalidConfiguration(_) => debug.field("kind", &"InvalidConfiguration"),
-            Self::Http { kind, .. } => debug.field("kind", &"Http").field("http_kind", kind),
+            Self::Http(err) => debug
+                .field("kind", &"Http")
+                .field("http_kind", &http_error_kind(err)),
             Self::Serialization(_) => debug.field("kind", &"Serialization"),
             Self::Api {
                 status,
@@ -342,7 +344,7 @@ impl SamplingError {
     /// reason.
     pub fn is_likely_body_rejected(&self) -> bool {
         match self {
-            SamplingError::Http { source: err, .. } => {
+            SamplingError::Http(err) => {
                 // `is_request()` covers broken-pipe / connection-reset during
                 // body upload.  `is_body()` covers stream-write failures.
                 // Exclude timeouts and connect errors — those are unrelated.
@@ -385,7 +387,7 @@ impl SamplingError {
         match self {
             SamplingError::Auth { .. } => false,
             SamplingError::InvalidConfiguration(_) => false,
-            SamplingError::Http { source: err, .. } => is_retryable_reqwest(err),
+            SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
             SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
@@ -470,21 +472,29 @@ impl SamplingError {
 }
 
 impl From<reqwest::Error> for SamplingError {
-    fn from(source: reqwest::Error) -> Self {
-        let kind = if source.is_timeout() {
-            HttpErrorKind::Timeout
-        } else if source.is_connect() {
-            HttpErrorKind::Connect
-        } else if source.is_status() {
-            HttpErrorKind::Status
-        } else if source.is_request() {
-            HttpErrorKind::Request
-        } else if source.is_body() {
-            HttpErrorKind::Body
-        } else {
-            HttpErrorKind::Transport
-        };
-        Self::Http { kind, source }
+    fn from(value: reqwest::Error) -> Self {
+        Self::Http(value)
+    }
+}
+
+/// Classify a `reqwest::Error` into a coarse transport category.
+///
+/// Kept as a free function so call sites that need the category (user-facing
+/// copy, sanitized clones) can derive it without storing `kind` on the
+/// `SamplingError::Http` variant itself — matching upstream's newtype shape.
+pub fn http_error_kind(err: &reqwest::Error) -> HttpErrorKind {
+    if err.is_timeout() {
+        HttpErrorKind::Timeout
+    } else if err.is_connect() {
+        HttpErrorKind::Connect
+    } else if err.is_status() {
+        HttpErrorKind::Status
+    } else if err.is_request() {
+        HttpErrorKind::Request
+    } else if err.is_body() {
+        HttpErrorKind::Body
+    } else {
+        HttpErrorKind::Transport
     }
 }
 

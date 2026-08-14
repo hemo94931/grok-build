@@ -451,7 +451,7 @@ async fn apply_retry_decision(
                 );
                 let status_code = match err {
                     SamplingError::Api { status, .. } => Some(status.as_u16()),
-                    SamplingError::Http { source, .. } => source.status().map(|s| s.as_u16()),
+                    SamplingError::Http(source) => source.status().map(|s| s.as_u16()),
                     _ => None,
                 };
                 if let Some(status) = status_code {

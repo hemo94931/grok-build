@@ -80,7 +80,7 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
         SamplingError::MaxTokensTruncation => true,
-        SamplingError::Http { .. }
+        SamplingError::Http(_)
         | SamplingError::EventStreamError(_)
         | SamplingError::StreamError { .. }
         | SamplingError::EmptyResponse { .. }
