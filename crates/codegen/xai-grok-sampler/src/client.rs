@@ -407,7 +407,7 @@ fn apply_env_http_headers(
 #[derive(Clone)]
 pub struct SamplingClient {
     http: reqwest::Client,
-    compact_http: reqwest::Client,
+
     default_headers: HeaderMap,
     defaults: ClientDefaults,
     /// Optional 401-attribution hook. The shell wires this to emit a
@@ -822,17 +822,11 @@ impl SamplingClient {
             }
         }
 
-        let (http, compact_http) = if config.force_http1 {
+        let http = if config.force_http1 {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
-            (
-                crate::shared_http::client_http1().map_err(SamplingError::from)?,
-                crate::shared_http::compact_client_http1().map_err(SamplingError::from)?,
-            )
+            crate::shared_http::client_http1().map_err(SamplingError::from)?
         } else {
-            (
-                crate::shared_http::client().map_err(SamplingError::from)?,
-                crate::shared_http::compact_client().map_err(SamplingError::from)?,
-            )
+            crate::shared_http::client().map_err(SamplingError::from)?
         };
 
         tracing::info!(
@@ -875,7 +869,6 @@ impl SamplingClient {
 
         Ok(Self {
             http,
-            compact_http,
             default_headers: headers,
             defaults,
             attribution_callback: config.attribution_callback,
@@ -892,9 +885,10 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// Stable digest of the exact standalone compaction endpoint template.
+    /// Stable digest of the Responses endpoint used for remote compaction
+    /// (ordinary `/responses` path under the compaction_trigger contract).
     pub fn responses_compact_endpoint_fingerprint(&self) -> String {
-        self.endpoint.fingerprint_for_path("responses/compact")
+        self.endpoint.fingerprint_for_path("responses")
     }
 
     /// POST with default headers, returning the builder coupled to the tail
@@ -2441,7 +2435,6 @@ impl SamplingClient {
 
         self.create_response_stream(wrapper).await
     }
-
 
     /// Send an opaque resolved Responses request (typed normal produced by
     /// the shell's checkpoint planner). The body is frozen at planning time;

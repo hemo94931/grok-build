@@ -39,10 +39,10 @@ pub use attribution::{
 };
 pub use client::responses_compact::{
     CompactAuthKind, CompactCorrelationHeaders, CompactCredential, CompactCredentialResolver,
-    RESPONSES_COMPACT_CONNECT_TIMEOUT, RESPONSES_COMPACT_MAX_BYTES,
-    RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES, RequestCredentialSnapshot, ResponsesCompactError,
-    ResponsesCompactFailure, ResponsesCompactRequest, ResponsesCompactResponse,
-    USER_CONTEXT_DELIMITER, compact_directive_hash, validate_responses_compact_response,
+    RESPONSES_COMPACT_MAX_BYTES, RESPONSES_COMPACT_MAX_ENCRYPTED_BYTES, RequestCredentialSnapshot,
+    ResponsesCompactError, ResponsesCompactFailure, ResponsesCompactRequest,
+    ResponsesCompactResponse, USER_CONTEXT_DELIMITER, collect_compaction_from_completed,
+    compact_directive_hash,
 };
 pub use client::{ApiBackend, EndpointTemplate, SamplingClient, user_agent_string_for};
 pub use config::{

@@ -32,16 +32,16 @@ fn checkpoint_item() -> ConversationItem {
             prior_checkpoint_id: None,
             cache_route_fingerprint: None,
         },
-        output: vec![serde_json::json!({
+        retained_prefix: vec![ConversationItem::user("kept")],
+        compaction_item: serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
-        })],
+        }),
         portable_history_path: "compaction_checkpoints/checkpoint-current.json".into(),
         portable_history_sha256: "portable-digest".into(),
         portable_history_bytes: 10,
         checkpoint_token_seed: 25,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 1,
         prior_checkpoint_id: None,
         memory_revision: None,
     }))
@@ -106,10 +106,10 @@ fn prefire_layout_accepts_normal_and_unique_leading_checkpoint_only() {
 #[test]
 fn prefire_discard_requires_seed_and_committed_total_to_shrink() {
     let response = ResponsesCompactResponse {
-        output: vec![serde_json::json!({
+        compaction_item: serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
-        })],
+        }),
         usage_output_tokens: Some(95),
         usage_total_tokens: None,
         response_bytes: 32,

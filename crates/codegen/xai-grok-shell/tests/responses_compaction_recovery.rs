@@ -79,16 +79,13 @@ fn wrapper(portable: &[ConversationItem]) -> ServerResponsesCheckpoint {
         },
         branch_id: BRANCH_ID.into(),
         identity: identity(),
-        output: vec![
-            json!({"type": "future_item", "provider": {"z": 1}}),
-            json!({"type": "compaction", "encrypted_content": "opaque"}),
-        ],
+        retained_prefix: vec![ConversationItem::user("first")],
+        compaction_item: json!({"type": "compaction", "encrypted_content": "opaque"}),
         portable_history_path: RELATIVE_PATH.into(),
         portable_history_sha256: digest,
         portable_history_bytes: bytes.len() as u64,
         checkpoint_token_seed: 40,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 2,
         prior_checkpoint_id: None,
         memory_revision: Some(7),
     }

@@ -1529,16 +1529,16 @@ async fn copy_session_data_copies_current_responses_sidecar() {
             prior_checkpoint_id: None,
             cache_route_fingerprint: None,
         },
-        output: vec![serde_json::json!({
+        retained_prefix: vec![ConversationItem::user("first")],
+        compaction_item: serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
-        })],
+        }),
         portable_history_path: "compaction_checkpoints/checkpoint-current.json".into(),
         portable_history_sha256: digest,
         portable_history_bytes: bytes.len() as u64,
         checkpoint_token_seed: 42,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 1,
         prior_checkpoint_id: None,
         memory_revision: Some(3),
     };

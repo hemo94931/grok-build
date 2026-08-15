@@ -3,7 +3,7 @@ use std::time::Duration;
 use xai_grok_sampler::{ResponsesCompactFailure, ResponsesCompactResponse};
 use xai_grok_sampling_types::{
     CheckpointIdentity, ConversationItem, RESPONSES_COMPACTION_CONTRACT, ResponsesCompactionMode,
-    TokenSeedSource,
+    TokenSeedSource, is_valid_compaction_item,
 };
 use xai_grok_shell::session::responses_server_compaction::{
     CapabilityKey, NegativeCapabilityCache, ServerCheckpointSeedError,
@@ -26,6 +26,14 @@ fn identity(prior: Option<&str>) -> CheckpointIdentity {
         prior_checkpoint_id: prior.map(str::to_owned),
         cache_route_fingerprint: Some("route-fingerprint".into()),
     }
+}
+
+fn compaction_blob() -> serde_json::Value {
+    serde_json::json!({
+        "type": "compaction",
+        "encrypted_content": "opaque",
+        "future": {"z": 1, "a": 2}
+    })
 }
 
 #[test]
@@ -84,13 +92,13 @@ fn compact_model_layers_keep_valid_precedence_and_safe_fallback() {
 }
 
 #[test]
-fn generic_successor_uses_frozen_contract_and_unversioned_serde_tag() {
+fn generic_successor_uses_retained_prefix_plus_blob() {
     assert_eq!(RESPONSES_COMPACTION_CONTRACT, "responses-compact-grok");
-    let output = vec![serde_json::json!({
-        "type": "compaction",
-        "encrypted_content": "opaque",
-        "future": {"z": 1, "a": 2}
-    })];
+    let retained = vec![
+        ConversationItem::user("kept-user"),
+        ConversationItem::system("kept-system"),
+    ];
+    let blob = compaction_blob();
     let tail = vec![ConversationItem::system_reminder("transcript pointer")];
     let successor = build_server_successor(
         "checkpoint-current",
@@ -103,7 +111,8 @@ fn generic_successor_uses_frozen_contract_and_unversioned_serde_tag() {
         },
         "branch-current",
         identity(Some("checkpoint-prior")),
-        output.clone(),
+        retained.clone(),
+        blob.clone(),
         "compaction_checkpoints/checkpoint-current.json",
         "portable-digest".into(),
         25,
@@ -120,13 +129,14 @@ fn generic_successor_uses_frozen_contract_and_unversioned_serde_tag() {
         wrapper.identity.contract_version,
         RESPONSES_COMPACTION_CONTRACT
     );
-    assert_eq!(wrapper.output, output);
+    assert_eq!(wrapper.retained_prefix.len(), retained.len());
+    assert_eq!(wrapper.compaction_item, blob);
+    assert!(is_valid_compaction_item(&wrapper.compaction_item));
     assert_eq!(wrapper.checkpoint_token_seed, 25);
     assert_eq!(
         wrapper.prior_checkpoint_id.as_deref(),
         Some("checkpoint-prior")
     );
-    assert_eq!(wrapper.server_output_item_count, output.len());
     assert_eq!(successor[1..].len(), tail.len());
     assert_eq!(successor[1].text_content(), tail[0].text_content());
     assert_eq!(
@@ -139,6 +149,10 @@ fn generic_successor_uses_frozen_contract_and_unversioned_serde_tag() {
         serialized.get("type").and_then(serde_json::Value::as_str),
         Some("responses_compaction_checkpoint")
     );
+    // Old unary shape must not appear on the wire of the live wrapper.
+    assert!(serialized.get("output").is_none() || serialized["output"].is_null());
+    // serde tag nests fields under the variant; check wrapper fields via typed access.
+    assert!(serialized.get("server_output_item_count").is_none());
 
     let mut successor_identity = wrapper.identity.clone();
     successor_identity.prior_checkpoint_id = Some(wrapper.checkpoint_id.clone());
@@ -152,12 +166,12 @@ fn generic_successor_uses_frozen_contract_and_unversioned_serde_tag() {
 
 #[test]
 fn checkpoint_seed_prefers_usage_and_reports_did_not_shrink() {
-    let output = vec![serde_json::json!({
+    let blob = serde_json::json!({
         "type": "compaction",
         "encrypted_content": "opaque"
-    })];
+    });
     let with_usage = ResponsesCompactResponse {
-        output: output.clone(),
+        compaction_item: blob.clone(),
         usage_output_tokens: Some(40),
         usage_total_tokens: Some(999),
         response_bytes: 100,
@@ -173,7 +187,7 @@ fn checkpoint_seed_prefers_usage_and_reports_did_not_shrink() {
     ));
 
     let estimated = ResponsesCompactResponse {
-        output,
+        compaction_item: blob,
         usage_output_tokens: None,
         usage_total_tokens: None,
         response_bytes: 100,
@@ -183,23 +197,23 @@ fn checkpoint_seed_prefers_usage_and_reports_did_not_shrink() {
     assert!((6..100).contains(&seed));
     assert_eq!(source, TokenSeedSource::EstimatedCanonicalOutput);
 
-    let image_response = ResponsesCompactResponse {
-        output: vec![serde_json::json!({
-            "type": "message",
-            "content": [{
-                "type": "input_image",
-                "image_url": format!("data:image/png;base64,{}", "a".repeat(100_000))
-            }]
-        })],
+    // Estimate falls back to the single blob; large encrypted content still
+    // produces a non-zero seed without treating image bytes specially inside
+    // the opaque provider payload.
+    let large_blob = ResponsesCompactResponse {
+        compaction_item: serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "a".repeat(10_000)
+        }),
         usage_output_tokens: None,
         usage_total_tokens: None,
         response_bytes: 100_000,
         attempts: 1,
     };
-    let (image_seed, source) = server_checkpoint_token_seed(&image_response, 0, 10_000).unwrap();
+    let (large_seed, source) = server_checkpoint_token_seed(&large_blob, 0, 10_000).unwrap();
     assert_eq!(source, TokenSeedSource::EstimatedCanonicalOutput);
-    assert!(image_seed >= xai_token_estimation::IMAGE_TOKEN_ESTIMATE);
-    assert!(image_seed < 10_000, "image bytes use the image estimate");
+    assert!(large_seed >= 1);
+    assert!(large_seed < 10_000);
 }
 
 #[test]
@@ -251,6 +265,36 @@ fn failure_mapping_is_fixed_and_cancel_never_falls_back() {
         (
             ResponsesCompactFailure::HttpStatus,
             Some(404),
+            None,
+            Reason::Unsupported,
+        ),
+        (
+            ResponsesCompactFailure::HttpStatus,
+            Some(400),
+            None,
+            Reason::Unsupported,
+        ),
+        (
+            ResponsesCompactFailure::HttpStatus,
+            Some(422),
+            None,
+            Reason::Unsupported,
+        ),
+        (
+            ResponsesCompactFailure::HttpStatus,
+            Some(405),
+            None,
+            Reason::Unsupported,
+        ),
+        (
+            ResponsesCompactFailure::HttpStatus,
+            Some(501),
+            None,
+            Reason::Unsupported,
+        ),
+        (
+            ResponsesCompactFailure::CompletedWithoutCompaction,
+            None,
             None,
             Reason::Unsupported,
         ),
@@ -342,9 +386,80 @@ fn unsupported_negative_cache_is_keyed_and_expires_after_one_hour() {
     assert!(!cache.is_unsupported(&distinct, Duration::from_secs(20)));
     assert!(!cache.is_unsupported(&key, Duration::from_secs(3610)));
 
+    assert!(NegativeCapabilityCache::status_is_unsupported(400));
     assert!(NegativeCapabilityCache::status_is_unsupported(404));
     assert!(NegativeCapabilityCache::status_is_unsupported(405));
+    assert!(NegativeCapabilityCache::status_is_unsupported(422));
     assert!(NegativeCapabilityCache::status_is_unsupported(501));
     assert!(!NegativeCapabilityCache::status_is_unsupported(429));
     assert!(!NegativeCapabilityCache::status_is_unsupported(500));
+}
+
+/// D6 recording policy: CompletedWithoutCompaction and HTTP 400/404/405/422/501
+/// are unsupported (and thus negative-cache candidates); transport/timeout are not.
+#[test]
+fn d6_unsupported_classification_for_negative_cache() {
+    assert_eq!(
+        classify_compact_failure(
+            ResponsesCompactFailure::CompletedWithoutCompaction,
+            None,
+            None
+        ),
+        Some(ServerCompactionFailureReason::Unsupported)
+    );
+    for status in [400, 404, 405, 422, 501] {
+        assert_eq!(
+            classify_compact_failure(ResponsesCompactFailure::HttpStatus, Some(status), None),
+            Some(ServerCompactionFailureReason::Unsupported),
+            "status {status} must be unsupported"
+        );
+        assert!(NegativeCapabilityCache::status_is_unsupported(status));
+    }
+    // Transport / timeout fall back without recording.
+    assert_eq!(
+        classify_compact_failure(ResponsesCompactFailure::Transport, None, None),
+        Some(ServerCompactionFailureReason::Transport)
+    );
+    assert_eq!(
+        classify_compact_failure(ResponsesCompactFailure::Timeout, None, None),
+        Some(ServerCompactionFailureReason::Timeout)
+    );
+    assert!(!NegativeCapabilityCache::status_is_unsupported(408));
+    assert!(!NegativeCapabilityCache::status_is_unsupported(500));
+}
+
+#[test]
+fn old_output_shape_sidecar_fails_closed_on_deserialize() {
+    // D1: no compat reader for the unary `/responses/compact` checkpoint.
+    let old_shape = serde_json::json!({
+        "checkpoint_id": "c",
+        "operation_id": "o",
+        "prompt_index": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "auto_continue": false,
+        "mode": {"name": "default"},
+        "branch_id": "b",
+        "identity": {
+            "provider_id": "xai",
+            "api": "responses",
+            "endpoint_fingerprint": "e",
+            "model": "m",
+            "auth_principal_fingerprint": "p",
+            "contract_version": RESPONSES_COMPACTION_CONTRACT,
+            "prompt_envelope_fingerprint": "env",
+            "base_instructions_sha256": "base"
+        },
+        "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+        "portable_history_path": "compaction_checkpoints/c.json",
+        "portable_history_sha256": "digest",
+        "portable_history_bytes": 1,
+        "checkpoint_token_seed": 1,
+        "token_seed_source": "usage_output_tokens",
+        "server_output_item_count": 1
+    });
+    assert!(
+        serde_json::from_value::<xai_grok_sampling_types::ServerResponsesCheckpoint>(old_shape)
+            .is_err(),
+        "old unary output shape must fail closed"
+    );
 }

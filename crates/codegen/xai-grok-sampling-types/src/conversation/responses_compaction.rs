@@ -4,14 +4,125 @@
 //! `role == "system"` items), memory is modeled by
 //! [`SystemSource`](super::SystemSource) instead of string tags, and replay
 //! material is a separately persisted, re-verifiable record.
+//!
+//! Checkpoint shape (compaction_trigger wire contract): retained typed prefix
+//! + a single opaque compaction blob. The trigger control item is request-only
+//! and is never persisted here.
 
 use serde::{Deserialize, Serialize};
 
 use super::responses::canonical_json_bytes;
 use super::{ConversationItem, ResponsesCompactionMode, TokenSeedSource};
 
-/// Frozen `/responses/compact` contract identifier.
+/// Frozen Responses remote-compaction contract identifier.
+///
+/// Unchanged across the unary→trigger migration (D7).
 pub const RESPONSES_COMPACTION_CONTRACT: &str = "responses-compact-grok";
+
+/// Mirror of upstream `RETAINED_MESSAGE_TOKEN_BUDGET` (64k tokens).
+pub const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 64_000;
+
+/// Non-final agent messages larger than this are dropped from the retained
+/// prefix (upstream `MAX_RETAINED_AGENT_MESSAGE_TOKENS`).
+pub const MAX_RETAINED_AGENT_MESSAGE_TOKENS: u64 = 10_000;
+
+/// Bytes-per-token heuristic used for retained-prefix budgeting (matches
+/// `xai_token_estimation` and upstream's 4-bytes/token estimate).
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// Wire control item appended last on every remote-compaction request.
+/// Never enters history and is never persisted.
+pub fn compaction_trigger_wire_item() -> serde_json::Value {
+    serde_json::json!({ "type": "compaction_trigger" })
+}
+
+/// Whether a wire value is a valid opaque compaction blob: type
+/// `compaction` or alias `compaction_summary`, with non-empty
+/// `encrypted_content`.
+pub fn is_valid_compaction_item(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(item_type) = object.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if !matches!(item_type, "compaction" | "compaction_summary") {
+        return false;
+    }
+    object
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|content| !content.is_empty())
+}
+
+/// Token estimate for one conversation item under the bytes/4 heuristic.
+pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
+    let text = item.text_content();
+    (text.len() as u64) / BYTES_PER_TOKEN
+}
+
+/// Whether an item is eligible for the retained typed prefix (D8).
+///
+/// Retains user messages, non-lifted system messages (developer/system
+/// roles on the wire), and non-final agent messages whose estimate is at
+/// most [`MAX_RETAINED_AGENT_MESSAGE_TOKENS`]. Reasoning, tool results,
+/// backend tool calls, checkpoints, and instruction-lifted systems are
+/// excluded — those live only inside the opaque blob after compaction.
+pub fn is_retained_for_compaction(item: &ConversationItem) -> bool {
+    match item {
+        ConversationItem::User(_) => true,
+        ConversationItem::System(system) => !system.source.lifts_into_instructions(),
+        ConversationItem::Assistant(assistant) => {
+            if assistant
+                .content
+                .as_ref()
+                .starts_with("Message Type: FINAL_ANSWER\n")
+            {
+                return false;
+            }
+            estimate_item_tokens(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS
+        }
+        ConversationItem::ToolResult(_)
+        | ConversationItem::BackendToolCall(_)
+        | ConversationItem::Reasoning(_)
+        | ConversationItem::ResponsesCompactionCheckpoint(_) => false,
+    }
+}
+
+/// Build the retained typed prefix from pre-compaction history: keep
+/// eligible items, then truncate newest-first to
+/// [`RETAINED_MESSAGE_TOKEN_BUDGET`].
+pub fn build_retained_prefix(history: &[ConversationItem]) -> Vec<ConversationItem> {
+    let candidates: Vec<ConversationItem> = history
+        .iter()
+        .filter(|item| is_retained_for_compaction(item))
+        .cloned()
+        .collect();
+    truncate_retained_newest_first(candidates, RETAINED_MESSAGE_TOKEN_BUDGET)
+}
+
+/// Newest-first truncation to a token budget. Returns items in original
+/// chronological order.
+pub fn truncate_retained_newest_first(
+    items: Vec<ConversationItem>,
+    max_tokens: u64,
+) -> Vec<ConversationItem> {
+    let mut remaining = max_tokens;
+    let mut kept_reversed = Vec::with_capacity(items.len());
+    for item in items.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let tokens = estimate_item_tokens(&item).max(1);
+        if tokens > remaining {
+            continue;
+        }
+        remaining = remaining.saturating_sub(tokens);
+        kept_reversed.push(item);
+    }
+    kept_reversed.reverse();
+    kept_reversed
+}
 
 /// Trusted prompt envelope captured at compaction time.
 ///
@@ -61,8 +172,12 @@ pub struct CheckpointIdentity {
     pub cache_route_fingerprint: Option<String>,
 }
 
-/// Local wrapper for the canonical output of `POST /responses/compact`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Local wrapper for a remote-compaction checkpoint.
+///
+/// Replacement history = [`retained_prefix`] + [`compaction_item`] (blob
+/// last). Old unary-compact shapes (`output: [...]`) fail closed on
+/// deserialize (D1 — no compat reader).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerResponsesCheckpoint {
     pub checkpoint_id: String,
@@ -73,16 +188,19 @@ pub struct ServerResponsesCheckpoint {
     pub mode: ResponsesCompactionMode,
     pub branch_id: String,
     pub identity: CheckpointIdentity,
-    /// Opaque provider compact output. Never scanned, never re-ordered,
-    /// never filtered by role.
-    pub output: Vec<serde_json::Value>,
+    /// Retained typed prefix (user/developer/system, budget-truncated).
+    /// Never contains checkpoints or the request-only trigger item.
+    pub retained_prefix: Vec<ConversationItem>,
+    /// Single opaque provider compaction item (`compaction` /
+    /// `compaction_summary` + non-empty `encrypted_content`). Never
+    /// scanned, never re-ordered.
+    pub compaction_item: serde_json::Value,
     /// Portable-history sidecar path (relative to the session directory).
     pub portable_history_path: String,
     pub portable_history_sha256: String,
     pub portable_history_bytes: u64,
     pub checkpoint_token_seed: u64,
     pub token_seed_source: TokenSeedSource,
-    pub server_output_item_count: usize,
     /// Recompact chain link (mirrors identity.prior_checkpoint_id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_checkpoint_id: Option<String>,
@@ -125,12 +243,12 @@ pub fn wrapper_digest_for_branch(
         "mode": checkpoint.mode,
         "branch_id": branch_id,
         "identity": checkpoint.identity,
-        "output": checkpoint.output,
+        "retained_prefix": checkpoint.retained_prefix,
+        "compaction_item": checkpoint.compaction_item,
         "portable_history_path": checkpoint.portable_history_path,
         "portable_history_sha256": checkpoint.portable_history_sha256,
         "checkpoint_token_seed": checkpoint.checkpoint_token_seed,
         "token_seed_source": checkpoint.token_seed_source,
-        "server_output_item_count": checkpoint.server_output_item_count,
         "prior_checkpoint_id": checkpoint.prior_checkpoint_id,
         "memory_revision": checkpoint.memory_revision,
     });

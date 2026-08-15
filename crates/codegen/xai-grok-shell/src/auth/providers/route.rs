@@ -675,6 +675,10 @@ fn provider_headers(
                 "openai-beta".to_owned(),
                 "responses=experimental".to_owned(),
             );
+            // Note: compaction-only headers (x-codex-beta-features,
+            // x-codex-turn-metadata) are NOT on the turn path — see
+            // [`openai_codex_compaction_headers`]. Turns do not send them
+            // today; remote compaction injects them on its SamplingClient.
         }
         ProviderId::GithubCopilot => {
             headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
@@ -703,6 +707,38 @@ fn provider_headers(
         | ProviderId::ZaiCodingCn => {}
     }
     Ok(headers)
+}
+
+/// Headers attached only to OpenAI Codex remote-compaction requests.
+///
+/// Turn requests currently send `chatgpt-account-id` / `originator` /
+/// `openai-beta` (and inherit sticky `session-id` when present) but do **not**
+/// send `x-codex-beta-features` or `x-codex-turn-metadata`. Upstream codex
+/// always includes `remote_compaction_v2` on compaction_trigger requests and
+/// tags the turn metadata as `request_kind: compaction`. Keep these out of
+/// the shared turn header set so ordinary turns stay unchanged; inject them
+/// only when constructing the compact SamplingClient.
+///
+/// Minimal compaction descriptor (matches upstream field names):
+/// `implementation=responses_compaction_v2`, `strategy=memento`.
+pub(crate) fn openai_codex_compaction_headers() -> IndexMap<String, String> {
+    let mut headers = IndexMap::new();
+    headers.insert(
+        "x-codex-beta-features".to_owned(),
+        "remote_compaction_v2".to_owned(),
+    );
+    headers.insert(
+        "x-codex-turn-metadata".to_owned(),
+        serde_json::json!({
+            "request_kind": "compaction",
+            "compaction": {
+                "implementation": "responses_compaction_v2",
+                "strategy": "memento",
+            }
+        })
+        .to_string(),
+    );
+    headers
 }
 
 fn token_principal(provider: ProviderId, token: &str) -> String {
@@ -976,5 +1012,25 @@ mod tests {
         assert_eq!(context.base_url, "https://api.enterprise.example");
         assert_eq!(context.api_backend, ApiBackend::Responses);
         assert!(!format!("{context:?}").contains("oauth-secret"));
+    }
+
+    #[test]
+    fn openai_codex_compaction_headers_include_beta_and_metadata() {
+        let headers = openai_codex_compaction_headers();
+        assert_eq!(
+            headers.get("x-codex-beta-features").map(String::as_str),
+            Some("remote_compaction_v2")
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(headers.get("x-codex-turn-metadata").unwrap()).unwrap();
+        assert_eq!(meta["request_kind"], "compaction");
+        assert_eq!(
+            meta["compaction"]["implementation"],
+            "responses_compaction_v2"
+        );
+        assert_eq!(meta["compaction"]["strategy"], "memento");
+        // Turn headers must stay free of these keys.
+        assert!(!headers.contains_key("chatgpt-account-id"));
+        assert!(!headers.contains_key("openai-beta"));
     }
 }

@@ -170,6 +170,7 @@ use serde::{Deserialize, Serialize};
 use super::responses::portable_history_digest;
 use super::responses_compaction::{
     RESPONSES_COMPACTION_CONTRACT, ServerResponsesCheckpoint, TrustedPromptEnvelope,
+    compaction_trigger_wire_item, is_valid_compaction_item,
 };
 
 /// Separator between base instructions and memory context inside the
@@ -326,7 +327,8 @@ pub struct ValidatedResponsesReplay {
     branch_id: String,
     prior_checkpoint_id: Option<String>,
     contract_version: String,
-    output: Vec<serde_json::Value>,
+    retained_prefix: Vec<ConversationItem>,
+    compaction_item: serde_json::Value,
     typed_tail: Vec<ConversationItem>,
     portable_history: Vec<ConversationItem>,
     memory_revision: Option<u64>,
@@ -384,12 +386,16 @@ impl ValidatedResponsesReplay {
         if material.memory_revision() != checkpoint.memory_revision {
             return Err(ReplayVerificationError::IdentityMismatch("memory_revision"));
         }
-        if checkpoint.output.is_empty() {
-            return Err(ReplayVerificationError::IdentityMismatch("empty_output"));
+        if !is_valid_compaction_item(&checkpoint.compaction_item) {
+            return Err(ReplayVerificationError::IdentityMismatch("compaction_item"));
         }
-        if checkpoint.server_output_item_count != checkpoint.output.len() {
+        if checkpoint
+            .retained_prefix
+            .iter()
+            .any(ConversationItem::is_responses_checkpoint)
+        {
             return Err(ReplayVerificationError::IdentityMismatch(
-                "server_output_item_count",
+                "retained_prefix_checkpoint",
             ));
         }
         if checkpoint.checkpoint_token_seed == 0 {
@@ -422,7 +428,8 @@ impl ValidatedResponsesReplay {
             branch_id: checkpoint.branch_id.clone(),
             prior_checkpoint_id: checkpoint.prior_checkpoint_id.clone(),
             contract_version: material.contract_version().to_string(),
-            output: checkpoint.output.clone(),
+            retained_prefix: checkpoint.retained_prefix.clone(),
+            compaction_item: checkpoint.compaction_item.clone(),
             typed_tail: typed_tail.to_vec(),
             portable_history: portable_history.to_vec(),
             memory_revision: checkpoint.memory_revision,
@@ -447,8 +454,12 @@ impl ValidatedResponsesReplay {
         self.prior_checkpoint_id.as_deref()
     }
 
-    pub fn output(&self) -> &[serde_json::Value] {
-        &self.output
+    pub fn retained_prefix(&self) -> &[ConversationItem] {
+        &self.retained_prefix
+    }
+
+    pub fn compaction_item(&self) -> &serde_json::Value {
+        &self.compaction_item
     }
 
     pub fn typed_tail(&self) -> &[ConversationItem] {
@@ -487,15 +498,19 @@ impl ResolvedResponsesRequest {
     /// `request` supplies the envelope context (model, tools, cache fields,
     /// correlation) with `instructions` pre-composed via
     /// [`compose_instructions`]; the body is
-    /// `opaque output ++ serialized typed tail` with instruction-lifted
-    /// systems removed by source.
+    /// `retained prefix ++ compaction blob ++ serialized typed tail` with
+    /// instruction-lifted systems removed by source.
     pub fn from_validated_replay(
         replay: &ValidatedResponsesReplay,
         request: &ConversationRequest,
     ) -> Result<Self, ResolvedRequestError> {
         let tail = replay_input_tail(replay.typed_tail());
-        let body =
-            FinalResponsesRequest::from_replay_parts(request, replay.output().to_vec(), &tail)?;
+        let body = FinalResponsesRequest::from_retained_parts(
+            request,
+            replay.retained_prefix(),
+            replay.compaction_item().clone(),
+            &tail,
+        )?;
         Ok(Self {
             body,
             model: request.model.clone().unwrap_or_default(),
@@ -508,11 +523,15 @@ impl ResolvedResponsesRequest {
     }
 }
 
-/// Opaque frozen `/responses/compact` request. Obtained only through
+/// Opaque frozen streaming Responses compaction request. Obtained only through
 /// [`ResolvedCompactRequest::try_normal`] (first compact on a
 /// checkpoint-free conversation) or
 /// [`ResolvedCompactRequest::from_validated_recompact`] (continuous compact
 /// on a verified checkpoint).
+///
+/// The frozen body is a full streaming Responses request whose `input` ends
+/// with the bare control item `{"type":"compaction_trigger"}`. The trigger
+/// exists only inside this body — never in history, never persisted.
 #[derive(Debug, Clone)]
 pub struct ResolvedCompactRequest {
     body: serde_json::Value,
@@ -536,82 +555,83 @@ pub enum ResolvedCompactError {
     Build(#[from] ResponsesRequestBuildError),
 }
 
-/// Project a flattened full-request body onto the compact endpoint's field
-/// allowlist, applying the composed-instructions semantics already present
-/// in the body and the compact-only user-context suffix.
-fn compact_body_from_final(
-    final_body: serde_json::Value,
+/// Finalize a full streaming compact body: apply the compact-only user-context
+/// suffix, force stream/store/include/tool_choice, and append the trigger as
+/// the last input element.
+fn streaming_compact_body_from_final(
+    mut final_body: serde_json::Value,
     user_context: Option<&str>,
 ) -> Result<serde_json::Value, ResolvedCompactError> {
-    let model = final_body
+    let object = final_body
+        .as_object_mut()
+        .ok_or(ResolvedCompactError::MissingInput)?;
+    let model = object
         .get("model")
         .and_then(serde_json::Value::as_str)
         .filter(|model| !model.is_empty())
-        .ok_or(ResolvedCompactError::MissingModel)?
-        .to_string();
-    let input = final_body
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .filter(|input| !input.is_empty())
-        .cloned()
-        .ok_or(ResolvedCompactError::MissingInput)?;
-    let string_field = |name: &str| {
-        final_body
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    };
-    let optional_value = |name: &str| {
-        final_body
-            .get(name)
-            .filter(|value| !value.is_null())
-            .filter(|value| !value.as_array().is_some_and(Vec::is_empty))
-            .cloned()
-    };
-    let mut instructions = string_field("instructions");
+        .ok_or(ResolvedCompactError::MissingModel)?;
+    // Touch model so the empty check above is the gate; keep it as-is.
+    let _ = model;
+
     if let Some(context) = user_context.filter(|context| !context.is_empty()) {
-        let value = instructions.get_or_insert_with(String::new);
-        value.push_str(USER_CONTEXT_DELIMITER);
-        value.push_str(context);
+        let instructions = match object
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(existing) if !existing.is_empty() => {
+                format!("{existing}{USER_CONTEXT_DELIMITER}{context}")
+            }
+            _ => format!("{USER_CONTEXT_DELIMITER}{context}"),
+        };
+        object.insert(
+            "instructions".into(),
+            serde_json::Value::String(instructions),
+        );
     }
-    let mut body = serde_json::Map::new();
-    body.insert("model".into(), serde_json::Value::String(model));
-    body.insert("input".into(), serde_json::Value::Array(input));
-    // `parallel_tool_calls` comes from the typed request explicitly —
-    // never an invented default.
-    if let Some(value) = final_body.get("parallel_tool_calls") {
-        body.insert("parallel_tool_calls".into(), value.clone());
+
+    object.insert("stream".into(), serde_json::Value::Bool(true));
+    object.insert("store".into(), serde_json::Value::Bool(false));
+
+    // tool_choice "auto" matches the ordinary streaming turn contract.
+    object.insert(
+        "tool_choice".into(),
+        serde_json::Value::String("auto".into()),
+    );
+
+    let include = object
+        .entry("include".to_owned())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let include_array = include
+        .as_array_mut()
+        .ok_or(ResolvedCompactError::MissingInput)?;
+    let has_encrypted = include_array.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|entry| entry == "reasoning.encrypted_content")
+    });
+    if !has_encrypted {
+        include_array.push(serde_json::Value::String(
+            "reasoning.encrypted_content".into(),
+        ));
     }
-    if let Some(value) = instructions {
-        body.insert("instructions".into(), serde_json::Value::String(value));
+
+    let input = object
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(ResolvedCompactError::MissingInput)?;
+    if input.is_empty() {
+        return Err(ResolvedCompactError::MissingInput);
     }
-    for (name, value) in [
-        ("tools", optional_value("tools")),
-        ("reasoning", optional_value("reasoning")),
-        ("text", optional_value("text")),
-        (
-            "service_tier",
-            string_field("service_tier").map(serde_json::Value::String),
-        ),
-        (
-            "prompt_cache_key",
-            string_field("prompt_cache_key").map(serde_json::Value::String),
-        ),
-        (
-            "prompt_cache_options",
-            optional_value("prompt_cache_options"),
-        ),
-        (
-            "prompt_cache_retention",
-            string_field("prompt_cache_retention").map(serde_json::Value::String),
-        ),
-    ] {
-        if let Some(value) = value {
-            body.insert(name.into(), value);
-        }
-    }
-    Ok(serde_json::Value::Object(body))
+    // Trigger is request-only and must be exactly the last element.
+    input.retain(|item| {
+        item.get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|ty| ty != "compaction_trigger")
+            .unwrap_or(true)
+    });
+    input.push(compaction_trigger_wire_item());
+
+    Ok(final_body)
 }
 
 impl ResolvedCompactRequest {
@@ -623,7 +643,7 @@ impl ResolvedCompactRequest {
         history_revision: Option<u64>,
         request_identity_generation: Option<u64>,
     ) -> Result<Self, ResolvedCompactError> {
-        let body = compact_body_from_final(final_body, user_context)?;
+        let body = streaming_compact_body_from_final(final_body, user_context)?;
         Ok(Self {
             model: request.model.clone().unwrap_or_default(),
             body,
@@ -636,7 +656,8 @@ impl ResolvedCompactRequest {
     }
 
     /// First compact on a checkpoint-free conversation. Rejects every
-    /// checkpoint variant.
+    /// checkpoint variant. Input is the typed history (instruction-lifted
+    /// systems removed by source) with `compaction_trigger` appended last.
     pub fn try_normal(
         request: &ConversationRequest,
         user_context: Option<&str>,
@@ -664,17 +685,21 @@ impl ResolvedCompactRequest {
     }
 
     /// Continuous compact on a verified checkpoint:
-    /// `input = prior opaque output ++ serialized typed tail`, with
-    /// instruction-lifted systems removed by source.
+    /// `input = retained prefix ++ prior blob ++ serialized typed tail ++ trigger`,
+    /// with instruction-lifted systems removed by source.
     pub fn from_validated_recompact(
         replay: &ValidatedResponsesReplay,
         request: &ConversationRequest,
         user_context: Option<&str>,
     ) -> Result<Self, ResolvedCompactError> {
         let tail = replay_input_tail(replay.typed_tail());
-        let final_body =
-            FinalResponsesRequest::from_replay_parts(request, replay.output().to_vec(), &tail)?
-                .into_body();
+        let final_body = FinalResponsesRequest::from_retained_parts(
+            request,
+            replay.retained_prefix(),
+            replay.compaction_item().clone(),
+            &tail,
+        )?
+        .into_body();
         Self::from_final_body(
             final_body,
             request,
@@ -758,16 +783,16 @@ mod tests {
                 prior_checkpoint_id: None,
                 cache_route_fingerprint: None,
             },
-            output: vec![serde_json::json!({
+            retained_prefix: vec![ConversationItem::user("kept")],
+            compaction_item: serde_json::json!({
                 "type": "compaction",
                 "encrypted_content": "opaque"
-            })],
+            }),
             portable_history_path: "compaction_checkpoints/cp.json".into(),
             portable_history_sha256: "digest".into(),
             portable_history_bytes: 1,
             checkpoint_token_seed: 1,
             token_seed_source: TokenSeedSource::UsageOutputTokens,
-            server_output_item_count: 1,
             prior_checkpoint_id: None,
             memory_revision: None,
         });

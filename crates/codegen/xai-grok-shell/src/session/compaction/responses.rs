@@ -263,9 +263,24 @@ impl SessionActor {
             self.models_manager.current_model_id().0.as_ref(),
             &full_config.model,
         );
-        let client =
-            xai_grok_sampler::SamplingClient::new_with_route(full_config.clone(), route_hint)
-                .map_err(|error| self.to_acp_error(error))?;
+        // Codex compaction inherits turn headers via the normal Responses
+        // pipeline, but turns do not yet send the compaction-only beta/
+        // metadata headers. Inject them only for the compact client so
+        // turn requests stay unchanged (sampler strip on turns is
+        // allowlist-based; compact inherits default_headers as-is).
+        let mut compact_config = full_config.clone();
+        if matches!(
+            route_hint,
+            xai_grok_sampler::ProviderRouteHint::Known(
+                xai_grok_sampler::KnownProvider::OpenaiCodex,
+            )
+        ) {
+            for (name, value) in crate::auth::providers::openai_codex_compaction_headers() {
+                compact_config.extra_headers.insert(name, value);
+            }
+        }
+        let client = xai_grok_sampler::SamplingClient::new_with_route(compact_config, route_hint)
+            .map_err(|error| self.to_acp_error(error))?;
         let Some((credential, principal)) = self.compact_credential(&full_config) else {
             return Ok(None);
         };

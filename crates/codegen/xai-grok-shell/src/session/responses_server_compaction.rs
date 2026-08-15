@@ -128,7 +128,9 @@ pub fn prompt_envelope_token_estimate(
     Ok((xai_grok_sampling_types::canonical_json_bytes(&envelope)?.len() as u64).div_ceil(4))
 }
 
-fn canonical_output_token_estimate(output: &[serde_json::Value]) -> Result<u64, serde_json::Error> {
+fn canonical_compaction_item_token_estimate(
+    compaction_item: &serde_json::Value,
+) -> Result<u64, serde_json::Error> {
     fn replace_image_payloads(value: &mut serde_json::Value) -> u64 {
         match value {
             serde_json::Value::Array(values) => values.iter_mut().map(replace_image_payloads).sum(),
@@ -162,13 +164,18 @@ fn canonical_output_token_estimate(output: &[serde_json::Value]) -> Result<u64, 
         }
     }
 
-    let mut value = serde_json::Value::Array(output.to_vec());
+    let mut value = compaction_item.clone();
     let images = replace_image_payloads(&mut value);
     let text_tokens =
         (xai_grok_sampling_types::canonical_json_bytes(&value)?.len() as u64).div_ceil(4);
     Ok(text_tokens.saturating_add(xai_token_estimation::estimate_image_tokens(images)))
 }
 
+/// Derive the checkpoint token seed from a remote-compaction response.
+///
+/// Prefers `usage_output_tokens`; if absent, falls back to a canonical estimate
+/// of the single opaque compaction blob. `usage_total_tokens` is available on
+/// the response for diagnostics but is not a seed source (it includes prompt).
 pub fn server_checkpoint_token_seed(
     response: &ResponsesCompactResponse,
     prompt_envelope_tokens: u64,
@@ -177,7 +184,7 @@ pub fn server_checkpoint_token_seed(
     let (output_tokens, source) = match response.usage_output_tokens.filter(|value| *value > 0) {
         Some(value) => (value, TokenSeedSource::UsageOutputTokens),
         None => (
-            canonical_output_token_estimate(&response.output)?.max(1),
+            canonical_compaction_item_token_estimate(&response.compaction_item)?.max(1),
             TokenSeedSource::EstimatedCanonicalOutput,
         ),
     };
@@ -204,6 +211,12 @@ pub fn current_identity_for_recompact_binding(
 /// Build the one current server-compaction successor:
 /// `[ResponsesCompactionCheckpoint(wrapper)] ++ tail`.
 ///
+/// Replacement history shape (compaction_trigger contract):
+/// retained typed prefix + single opaque compaction blob inside the wrapper;
+/// the live conversation still stores the wrapper at index 0 with the typed
+/// mode/transcript tail after it. Replay expands to
+/// `[retained_prefix…, compaction_item, typed_tail…]`.
+///
 /// The caller supplies the digest of the portable history that will be
 /// embedded in the sidecar. The sidecar constructor independently
 /// recomputes it and fills `portable_history_bytes` before persistence.
@@ -216,7 +229,8 @@ pub fn build_server_successor(
     mode: ResponsesCompactionMode,
     branch_id: &str,
     mut identity: CheckpointIdentity,
-    output: Vec<serde_json::Value>,
+    retained_prefix: Vec<ConversationItem>,
+    compaction_item: serde_json::Value,
     portable_history_path: &str,
     portable_history_sha256: String,
     token_seed: u64,
@@ -226,7 +240,6 @@ pub fn build_server_successor(
     tail: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
     identity.prior_checkpoint_id = prior_checkpoint_id.clone();
-    let server_output_item_count = output.len();
     let wrapper = Box::new(ServerResponsesCheckpoint {
         checkpoint_id: checkpoint_id.to_string(),
         operation_id: operation_id.to_string(),
@@ -236,13 +249,13 @@ pub fn build_server_successor(
         mode,
         branch_id: branch_id.to_string(),
         identity,
-        output,
+        retained_prefix,
+        compaction_item,
         portable_history_path: portable_history_path.to_string(),
         portable_history_sha256,
         portable_history_bytes: 0,
         checkpoint_token_seed: token_seed,
         token_seed_source,
-        server_output_item_count,
         prior_checkpoint_id,
         memory_revision,
     });
@@ -350,8 +363,12 @@ pub fn classify_compact_failure(
         ResponsesCompactFailure::ResponseTooLarge | ResponsesCompactFailure::InvalidResponse => {
             Some(Reason::InvalidResponse)
         }
+        // D6: completed without exactly one compaction item is unsupported
+        // (after sampler retries) and feeds the negative capability cache.
+        ResponsesCompactFailure::CompletedWithoutCompaction => Some(Reason::Unsupported),
         ResponsesCompactFailure::HttpStatus => Some(match status {
-            Some(404 | 405 | 501) => Reason::Unsupported,
+            // D6: 400/404/405/422/501 are endpoint-unsupported.
+            Some(400 | 404 | 405 | 422 | 501) => Reason::Unsupported,
             Some(401) => Reason::Auth,
             Some(408) => Reason::Timeout,
             Some(429) => Reason::RateLimited,
@@ -382,8 +399,12 @@ impl NegativeCapabilityCache {
         }
     }
 
+    /// HTTP statuses that, after retries, mean the endpoint does not support
+    /// the compaction_trigger contract (D6). Prefer
+    /// [`xai_grok_sampler::ResponsesCompactError::is_unsupported_capability`]
+    /// which also covers `CompletedWithoutCompaction`.
     pub fn status_is_unsupported(status: u16) -> bool {
-        matches!(status, 404 | 405 | 501)
+        matches!(status, 400 | 404 | 405 | 422 | 501)
     }
 
     pub fn record_unsupported(&mut self, key: CapabilityKey, now: Duration) {

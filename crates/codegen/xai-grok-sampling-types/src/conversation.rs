@@ -30,9 +30,12 @@ pub use responses::{
     portable_history_digest, response_to_conversation_items,
 };
 pub use responses_compaction::{
-    CheckpointIdentity, RESPONSES_COMPACTION_CONTRACT, ServerResponsesCheckpoint,
-    TrustedPromptEnvelope, base_instructions_sha256, canonical_envelope_fingerprint,
-    wire_prompt_sha256, wrapper_digest_for_branch,
+    CheckpointIdentity, MAX_RETAINED_AGENT_MESSAGE_TOKENS, RESPONSES_COMPACTION_CONTRACT,
+    RETAINED_MESSAGE_TOKEN_BUDGET, ServerResponsesCheckpoint, TrustedPromptEnvelope,
+    base_instructions_sha256, build_retained_prefix, canonical_envelope_fingerprint,
+    compaction_trigger_wire_item, estimate_item_tokens, is_retained_for_compaction,
+    is_valid_compaction_item, truncate_retained_newest_first, wire_prompt_sha256,
+    wrapper_digest_for_branch,
 };
 
 use std::sync::Arc;
@@ -121,9 +124,9 @@ pub enum ConversationItem {
     /// Local-only wrapper for a canonical Responses compaction window.
     ///
     /// This item is never converted through a typed provider item. Replay and
-    /// recompaction flatten its opaque `output` only through validated resolved
-    /// constructors; all other backends reject it via
-    /// [`ConversationRequest::validate_for_backend`].
+    /// recompaction expand its retained prefix + single compaction blob only
+    /// through validated resolved constructors; all other backends reject it
+    /// via [`ConversationRequest::validate_for_backend`].
     ResponsesCompactionCheckpoint(Box<ServerResponsesCheckpoint>),
 }
 
@@ -730,7 +733,7 @@ pub struct ConversationRequest {
 pub enum ConversationValidationError {
     #[error("a responses compaction checkpoint must be the unique item at index 0")]
     InvalidCheckpointLayout,
-    #[error("a responses compaction checkpoint must contain non-empty output")]
+    #[error("a responses compaction checkpoint must contain a valid compaction blob")]
     EmptyCheckpointOutput,
     #[error("responses compaction checkpoints cannot be sent to {0:?}")]
     CheckpointBackendMismatch(crate::ApiBackend),
@@ -757,8 +760,15 @@ impl ConversationRequest {
         if checkpoints.len() != 1 || index != 0 {
             return Err(ConversationValidationError::InvalidCheckpointLayout);
         }
-        if checkpoint.output.is_empty() {
+        if !crate::conversation::is_valid_compaction_item(&checkpoint.compaction_item) {
             return Err(ConversationValidationError::EmptyCheckpointOutput);
+        }
+        if checkpoint
+            .retained_prefix
+            .iter()
+            .any(ConversationItem::is_responses_checkpoint)
+        {
+            return Err(ConversationValidationError::InvalidCheckpointLayout);
         }
         if !matches!(backend, crate::ApiBackend::Responses) {
             return Err(ConversationValidationError::CheckpointBackendMismatch(

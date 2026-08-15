@@ -331,7 +331,12 @@ pub fn read_checkpoint_for_wrapper(
     let rotated = stored.branch_id != wrapper.branch_id;
     let mut rebound = stored.clone();
     rebound.branch_id = wrapper.branch_id.clone();
-    if &rebound != wrapper {
+    // ServerResponsesCheckpoint no longer implements PartialEq (opaque blob).
+    // Compare via wrapper digest (all immutable fields except
+    // portable_history_bytes) plus the byte count itself.
+    if rebound.wrapper_digest() != wrapper.wrapper_digest()
+        || rebound.portable_history_bytes != wrapper.portable_history_bytes
+    {
         let detail = if rotated {
             "rotated branch does not reconcile the wrapper digest"
         } else {
@@ -401,13 +406,17 @@ fn validate_checkpoint(
             "wrapper digest mismatch",
         ));
     }
-    if checkpoint.wrapper.output.is_empty()
-        || checkpoint.wrapper.server_output_item_count != checkpoint.wrapper.output.len()
+    if !xai_grok_sampling_types::is_valid_compaction_item(&checkpoint.wrapper.compaction_item)
+        || checkpoint
+            .wrapper
+            .retained_prefix
+            .iter()
+            .any(ConversationItem::is_responses_checkpoint)
         || checkpoint.wrapper.checkpoint_token_seed == 0
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid checkpoint output or token seed",
+            "invalid checkpoint compaction item, retained prefix, or token seed",
         ));
     }
     if checkpoint.replay_material.branch_id() != checkpoint.wrapper.branch_id {
@@ -1200,9 +1209,7 @@ pub fn publish_staged_compaction_segment_durable(
         &staging.timestamp,
     );
     let markdown = format!("<!-- {RESPONSES_SEGMENT_MARKER_PREFIX}{checkpoint_id} -->\n{rendered}");
-    let segment_path = compaction_dir.join(
-        xai_compaction_transcript::segment_filename(index),
-    );
+    let segment_path = compaction_dir.join(xai_compaction_transcript::segment_filename(index));
     write_bytes_durable(&segment_path, markdown.as_bytes())?;
     ensure_segment_index(
         &compaction_dir,
@@ -1310,12 +1317,8 @@ fn ensure_segment_index(
         ));
     }
     let keywords = xai_compaction_transcript::extract_keywords(summary);
-    let row = xai_compaction_transcript::render_index_row(
-        index,
-        items_len,
-        markdown.len(),
-        &keywords,
-    );
+    let row =
+        xai_compaction_transcript::render_index_row(index, items_len, markdown.len(), &keywords);
     let existing = std::fs::read_to_string(&index_path)?;
     if existing.lines().any(|line| line == row.trim_end()) {
         return Ok(());
@@ -1518,16 +1521,16 @@ mod tests {
             },
             branch_id: "branch-1".into(),
             identity: identity_fixture(prior),
-            output: vec![serde_json::json!({
+            retained_prefix: vec![ConversationItem::user("first")],
+            compaction_item: serde_json::json!({
                 "type": "compaction",
                 "encrypted_content": "opaque"
-            })],
+            }),
             portable_history_path: RELATIVE_PATH.into(),
             portable_history_sha256: digest,
             portable_history_bytes: 128,
             checkpoint_token_seed: 42,
             token_seed_source: TokenSeedSource::UsageOutputTokens,
-            server_output_item_count: 1,
             prior_checkpoint_id: prior.map(str::to_owned),
             memory_revision: Some(3),
         }
@@ -1597,12 +1600,12 @@ mod tests {
         let rotated_marker = marker_for_wrapper(&rotated);
         validate_marker_for_wrapper(&rotated_marker, &sidecar.wrapper).unwrap();
 
-        let mut forged_output = rotated.clone();
-        forged_output.output = vec![serde_json::json!({
+        let mut forged_blob = rotated.clone();
+        forged_blob.compaction_item = serde_json::json!({
             "type": "compaction",
             "encrypted_content": "forged"
-        })];
-        assert!(read_checkpoint_for_wrapper(dir.path(), &forged_output).is_err());
+        });
+        assert!(read_checkpoint_for_wrapper(dir.path(), &forged_blob).is_err());
         let mut forged_seed = rotated.clone();
         forged_seed.checkpoint_token_seed += 1;
         assert!(read_checkpoint_for_wrapper(dir.path(), &forged_seed).is_err());

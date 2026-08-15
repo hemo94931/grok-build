@@ -9,9 +9,33 @@ Everything below was verified against the live endpoint with curl (see `scripts/
 | Logical path | Required path on this backend | Notes |
 |---|---|---|
 | `responses` | `codex/responses` | SSE only: `stream:true` is mandatory (`{"detail":"Stream must be set to true"}`) |
-| `responses/compact` | `codex/responses/compact` | Unprefixed `responses/compact` → **404 with an HTML error page** (not JSON) |
+| `responses/compact` | ~~`codex/responses/compact`~~ | **DEPRECATED upstream** — remote compaction now rides the ordinary `codex/responses` request; see the v2 contract section below |
 
-The `codex/` prefix applies per-endpoint; grok's `endpoint_path` must rewrite both.
+## Remote compaction v2 contract — `compaction_trigger` over `codex/responses`
+
+Derived from upstream codex source (`compact_remote_v2.rs` @ `1bb6384`) and the
+pi-codex-compact plugin; **not yet live-probed by grok** — re-verify with
+`scripts/probe_params.py` before relying on header minimality:
+
+- Compaction = ordinary streaming `POST codex/responses` whose `input` ends with a bare
+  control item `{"type":"compaction_trigger"}` (request-only, never persisted).
+- Request headers: ordinary turn headers plus `x-codex-beta-features: remote_compaction_v2`
+  and `x-codex-turn-metadata: {"request_kind":"compaction","compaction":{"implementation":"responses_compaction_v2","strategy":"memento"}}`
+  (upstream always sends both on compaction requests; whether they are strictly
+  required is a Phase-0 probe item).
+- Response: the compaction blob is expected via `response.output_item.done` frames —
+  per quirk 1 below the terminal `response.completed.response.output` is empty on this
+  backend. Require exactly one distinct `{"type":"compaction"|"compaction_summary", id?,
+  encrypted_content}` item; tolerate other items.
+- Client-side history rebuild: retained prefix = user/developer/system messages
+  (non-final agent messages ≤ 10k tokens), truncated newest-first to a 64k-token
+  budget, then the opaque blob as the last element. Recompact = expand prior
+  checkpoint (incl. old blob) and append the trigger again.
+- grok classification: HTTP 400/404/405/422/501 or a completed stream without exactly
+  one compaction item (after 2 attempts) = endpoint unsupported → negative capability
+  cache 1 h → builtin fallback; transport/timeout/cancel fall back without caching.
+
+Legacy unary contract kept below for reference only.
 
 ## Request parameter contract — `codex/responses`
 
@@ -27,7 +51,7 @@ The `codex/` prefix applies per-endpoint; grok's `endpoint_path` must rewrite bo
 
 **Accepted (HTTP 200)**: `tool_choice`, `parallel_tool_calls`, `prompt_cache_key`, `text`, `include: ["reasoning.encrypted_content"]`, `tools` (function schemas must themselves be valid — `additionalProperties: false` required in `parameters`).
 
-## Request parameter contract — `codex/responses/compact`
+## Request parameter contract — `codex/responses/compact` (LEGACY, deprecated upstream)
 
 Same base, but a *different* rejection set — probe each endpoint separately:
 

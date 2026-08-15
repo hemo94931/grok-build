@@ -41,9 +41,9 @@ pub(crate) use radius::{
 pub(crate) use route::{
     ProviderAuthRemedy, ProviderCredentialMethod, ProviderDescriptor, ProviderLoginOption,
     ProviderLoginTransport, ProviderRequestContext, ProviderSecret, ProviderSecretSource,
-    ProviderWireDialect, namespaced_model_id, parse_namespaced_model_id, provider_auth_remedy,
-    provider_bearer_resolver, provider_descriptor, provider_login_options,
-    resolve_fresh_provider_secret, resolve_provider_secret,
+    ProviderWireDialect, namespaced_model_id, openai_codex_compaction_headers,
+    parse_namespaced_model_id, provider_auth_remedy, provider_bearer_resolver, provider_descriptor,
+    provider_login_options, resolve_fresh_provider_secret, resolve_provider_secret,
 };
 pub(crate) use store::{
     ProviderApiKeyCredential, ProviderCredential, ProviderSlotState, ProviderStore,

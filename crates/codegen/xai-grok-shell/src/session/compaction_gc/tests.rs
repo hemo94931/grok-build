@@ -68,16 +68,16 @@ fn wrapper_fixture(checkpoint_id: &str, prior: Option<&str>) -> ServerResponsesC
         },
         branch_id: "branch-1".into(),
         identity: identity_fixture(prior),
-        output: vec![serde_json::json!({
+        retained_prefix: vec![ConversationItem::user("first")],
+        compaction_item: serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
-        })],
+        }),
         portable_history_path: format!("compaction_checkpoints/{checkpoint_id}.json"),
         portable_history_sha256: digest,
         portable_history_bytes: bytes.len() as u64,
         checkpoint_token_seed: 42,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 1,
         prior_checkpoint_id: prior.map(str::to_owned),
         memory_revision: None,
     }

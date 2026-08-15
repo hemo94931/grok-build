@@ -1456,9 +1456,9 @@ impl SessionActor {
         // the agent policy enabled (`server_compaction` switch), a Responses
         // backend, no continuity migration, and no checkpoint quota pressure.
         // Any Responses base URL qualifies — there is no per-route capability
-        // gate: an endpoint that does not implement `/responses/compact`
-        // fails once, is cached as unsupported (negative capability cache),
-        // and falls back to the builtin compactor.
+        // gate: an endpoint that does not implement the compaction_trigger
+        // contract fails once, is cached as unsupported (negative capability
+        // cache), and falls back to the builtin compactor.
         let server_candidate = matches!(strategy, CompactionStrategy::ServerFirst)
             && self.agent.borrow().compaction_policy().server_compaction
             && actor_snapshot.sampling_config.api_backend == ApiBackend::Responses
@@ -1606,9 +1606,10 @@ impl SessionActor {
                         );
                     }
                     Err(error) => {
-                        if error.status().is_some_and(
-                            crate::session::responses_server_compaction::NegativeCapabilityCache::status_is_unsupported,
-                        ) {
+                        // D6: record only endpoint-unsupported failures
+                        // (HTTP 400/404/405/422/501 and CompletedWithoutCompaction).
+                        // Transport/timeout/cancel fall back without caching.
+                        if error.is_unsupported_capability() {
                             crate::session::responses_server_compaction::process_cache_record_unsupported(
                                 prepared.capability_key.clone(),
                             );
@@ -1651,7 +1652,8 @@ impl SessionActor {
             if let Some(response) = server_response {
                 let server_attempts = response.attempts;
                 let server_response_bytes = response.response_bytes as u64;
-                let server_output_items = response.output.len() as u64;
+                // Exactly one opaque compaction blob under the trigger contract.
+                let server_output_items = 1u64;
                 match crate::session::responses_server_compaction::server_checkpoint_token_seed(
                     &response,
                     prepared.snapshot.semantic_envelope_tokens,
@@ -1683,6 +1685,12 @@ impl SessionActor {
                             .map_err(|error| {
                                 acp::Error::internal_error().data(error.to_string())
                             })?;
+                        // Replacement history = retained typed prefix + single
+                        // opaque blob (mirrors upstream D8 retained-prefix
+                        // semantics). Typed mode/transcript tail follows the
+                        // wrapper in live history.
+                        let retained_prefix =
+                            xai_grok_sampling_types::build_retained_prefix(portable_history);
                         let provisional =
                             crate::session::responses_server_compaction::build_server_successor(
                                 &checkpoint_id,
@@ -1692,7 +1700,8 @@ impl SessionActor {
                                 prepared.snapshot.mode.clone(),
                                 &branch_id,
                                 prepared.snapshot.identity.clone(),
-                                response.output,
+                                retained_prefix,
+                                response.compaction_item,
                                 &relative_path,
                                 portable_digest,
                                 token_seed,

@@ -1,5 +1,12 @@
 # Responses 远程压缩：当前单一实现
 
+> **Superseded**：本文描述的 unary `POST /responses/compact` 实现已被
+> compaction_trigger（responses v2）契约取代，见
+> `docs/plans/responses-compaction-trigger-migration.md` 与
+> `docs/adr/0001-responses-compaction-trigger.md`。本文保留作为迁移前实现的
+> 历史记录；其中提交顺序、prefire/two-pass 关系、持久化与 GC 机器在新实现中
+> 仍然适用（D3 冻结）。
+
 ## 状态
 
 Responses 远程压缩现在只有一套实现，不再包含旧 checkpoint writer、reader、迁移灰度或兼容反序列化路径。

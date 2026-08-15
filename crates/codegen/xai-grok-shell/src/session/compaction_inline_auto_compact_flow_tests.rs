@@ -657,8 +657,7 @@ async fn surface_compact_auth_failure_uses_request_time_provider_source() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
-            let actor =
-                create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
+            let actor = create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
             let provenance = ProviderAuthRequestProvenance {
                 remedy: crate::auth::providers::provider_auth_remedy(
                     crate::auth::ProviderId::Anthropic,
@@ -943,9 +942,8 @@ async fn model_switch_arms_deferred_exact_request_compaction() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let actor = Arc::new(
-                create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
-            );
+            let actor =
+                Arc::new(create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await);
             actor.compaction.previous_model.set(Some(PreviousModelInfo {
                 model_slug: "old-big-model".to_string(),
                 context_window: 400_000,
@@ -977,9 +975,8 @@ async fn clear_auth_suppress_rearms_deferred_model_switch_compaction() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let actor = Arc::new(
-                create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await,
-            );
+            let actor =
+                Arc::new(create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await);
             actor
                 .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
                 .await;

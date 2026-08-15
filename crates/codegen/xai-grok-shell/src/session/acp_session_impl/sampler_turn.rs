@@ -773,12 +773,11 @@ impl SessionActor {
             None
         };
         full_config.supports_backend_search = self.supports_backend_search.get();
-        full_config.extra_response_includes =
-            crate::agent::config::response_include_extensions(
-                full_config.supports_backend_search,
-                &full_config.api_backend,
-                &full_config.base_url,
-            );
+        full_config.extra_response_includes = crate::agent::config::response_include_extensions(
+            full_config.supports_backend_search,
+            &full_config.api_backend,
+            &full_config.base_url,
+        );
         full_config.compactions_remaining = compactions_remaining;
         full_config.compaction_at_tokens = compaction_at_tokens;
         full_config.doom_loop_recovery = self.doom_loop_recovery;

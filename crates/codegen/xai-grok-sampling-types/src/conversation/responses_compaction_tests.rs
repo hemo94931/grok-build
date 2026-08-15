@@ -35,6 +35,13 @@ fn portable_fixture() -> Vec<ConversationItem> {
     ]
 }
 
+fn compaction_blob() -> serde_json::Value {
+    serde_json::json!({
+        "type": "compaction",
+        "encrypted_content": "opaque"
+    })
+}
+
 fn wrapper_fixture(
     portable: &[ConversationItem],
     prior: Option<&str>,
@@ -52,16 +59,13 @@ fn wrapper_fixture(
         },
         branch_id: "branch-1".into(),
         identity: identity_fixture(prior),
-        output: vec![serde_json::json!({
-            "type": "compaction",
-            "encrypted_content": "opaque"
-        })],
+        retained_prefix: vec![ConversationItem::user("first")],
+        compaction_item: compaction_blob(),
         portable_history_path: "compaction_checkpoints/checkpoint-current.json".into(),
         portable_history_sha256: digest,
         portable_history_bytes: 128,
         checkpoint_token_seed: 42,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 1,
         prior_checkpoint_id: prior.map(str::to_owned),
         memory_revision: Some(3),
     }
@@ -98,11 +102,29 @@ fn checkpoint_uses_the_single_unversioned_contract() {
     let wrapper = wrapper_fixture(&portable_fixture(), None);
     let mut value = serde_json::to_value(&wrapper).unwrap();
     assert!(value.get("schema_version").is_none());
+    assert!(value.get("output").is_none());
+    assert!(value.get("server_output_item_count").is_none());
+    assert!(value.get("retained_prefix").is_some());
+    assert!(value.get("compaction_item").is_some());
 
     value
         .as_object_mut()
         .unwrap()
         .insert("schema_version".into(), serde_json::json!(2));
+    assert!(serde_json::from_value::<ServerResponsesCheckpoint>(value).is_err());
+}
+
+#[test]
+fn old_output_shape_fails_closed() {
+    let mut value = serde_json::to_value(wrapper_fixture(&portable_fixture(), None)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("retained_prefix");
+    object.remove("compaction_item");
+    object.insert(
+        "output".into(),
+        serde_json::json!([{"type": "compaction", "encrypted_content": "opaque"}]),
+    );
+    object.insert("server_output_item_count".into(), serde_json::json!(1));
     assert!(serde_json::from_value::<ServerResponsesCheckpoint>(value).is_err());
 }
 
@@ -143,7 +165,14 @@ fn verify_accepts_and_freezes_replay() {
     assert_eq!(replay.history_revision(), 7);
     assert_eq!(replay.request_identity_generation(), 2);
     assert_eq!(replay.memory_revision(), Some(3));
-    assert_eq!(replay.output().len(), 1);
+    assert_eq!(replay.retained_prefix().len(), 1);
+    assert_eq!(
+        replay
+            .compaction_item()
+            .get("encrypted_content")
+            .and_then(|v| v.as_str()),
+        Some("opaque")
+    );
     assert_eq!(replay.typed_tail().len(), 2);
 }
 
@@ -177,24 +206,24 @@ fn verify_rejects_tampered_wrapper() {
 
     let mut forged_operation = wrapper.clone();
     forged_operation.operation_id = "operation-forged".into();
-    let mut forged_output = wrapper.clone();
-    forged_output.output = vec![serde_json::json!({
+    let mut forged_blob = wrapper.clone();
+    forged_blob.compaction_item = serde_json::json!({
         "type": "compaction",
         "encrypted_content": "attacker-controlled"
-    })];
+    });
     let mut forged_seed = wrapper.clone();
     forged_seed.checkpoint_token_seed += 1;
     let mut forged_source = wrapper.clone();
     forged_source.token_seed_source = TokenSeedSource::EstimatedCanonicalOutput;
-    let mut forged_count = wrapper.clone();
-    forged_count.server_output_item_count += 1;
+    let mut forged_prefix = wrapper.clone();
+    forged_prefix.retained_prefix = vec![ConversationItem::user("forged")];
 
     for forged in [
         forged_operation,
-        forged_output,
+        forged_blob,
         forged_seed,
         forged_source,
-        forged_count,
+        forged_prefix,
     ] {
         assert!(matches!(
             ValidatedResponsesReplay::verify(
@@ -301,7 +330,7 @@ fn compose_instructions_lifts_only_marked_sources() {
 }
 
 #[test]
-fn replay_request_body_is_output_prefix_plus_tail() {
+fn replay_request_body_is_retained_prefix_plus_blob_plus_tail() {
     let replay = verify_ok();
     let request = ConversationRequest {
         items: std::iter::once(ConversationItem::ResponsesCompactionCheckpoint(Box::new(
@@ -320,11 +349,16 @@ fn replay_request_body_is_output_prefix_plus_tail() {
         .get("input")
         .and_then(|value| value.as_array())
         .unwrap();
+    // retained user + compaction blob + two tail items
+    assert!(input.len() >= 3);
     assert_eq!(
-        input[0].get("type").and_then(|value| value.as_str()),
-        Some("compaction")
+        input
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("compaction"))
+            .and_then(|item| item.get("encrypted_content"))
+            .and_then(|v| v.as_str()),
+        Some("opaque")
     );
-    assert_eq!(input.len(), 3);
     let binding = resolved.checkpoint_binding().unwrap();
     assert_eq!(binding.checkpoint_id, "checkpoint-current");
     assert_eq!(binding.contract_version, RESPONSES_COMPACTION_CONTRACT);
@@ -342,6 +376,7 @@ fn compact_try_normal_rejects_checkpoint_and_lifts_instructions() {
         items: items.clone(),
         model: Some("grok-test".into()),
         instructions: compose_instructions(&items),
+        parallel_tool_calls: Some(true),
         ..Default::default()
     };
     let resolved = ResolvedCompactRequest::try_normal(&request, Some("focus on rust")).unwrap();
@@ -353,12 +388,30 @@ fn compact_try_normal_rejects_checkpoint_and_lifts_instructions() {
     assert!(instructions.starts_with("base\n\nmemory"));
     assert!(instructions.contains(USER_CONTEXT_DELIMITER));
     assert!(instructions.ends_with("focus on rust"));
+    let input = body
+        .get("input")
+        .and_then(|value| value.as_array())
+        .unwrap();
+    // user + trigger
+    assert_eq!(input.len(), 2);
     assert_eq!(
-        body.get("input")
-            .and_then(|value| value.as_array())
-            .unwrap()
-            .len(),
-        1
+        input
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("compaction_trigger")
+    );
+    assert_eq!(body.get("stream").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(body.get("store").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        body.get("tool_choice").and_then(|v| v.as_str()),
+        Some("auto")
+    );
+    let include = body.get("include").and_then(|v| v.as_array()).unwrap();
+    assert!(
+        include
+            .iter()
+            .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
     );
     assert!(resolved.checkpoint_binding().is_none());
 
@@ -377,7 +430,7 @@ fn compact_try_normal_rejects_checkpoint_and_lifts_instructions() {
 }
 
 #[test]
-fn recompact_uses_prior_output_prefix() {
+fn recompact_uses_retained_prefix_blob_and_trigger() {
     let replay = verify_ok();
     let request = ConversationRequest {
         items: std::iter::once(ConversationItem::ResponsesCompactionCheckpoint(Box::new(
@@ -388,6 +441,7 @@ fn recompact_uses_prior_output_prefix() {
         model: Some("grok-test".into()),
         instructions: Some("base".into()),
         prompt_cache_key: Some("grok:stable-main-session-key".into()),
+        parallel_tool_calls: Some(true),
         ..Default::default()
     };
     let resolved =
@@ -398,10 +452,17 @@ fn recompact_uses_prior_output_prefix() {
         .and_then(|value| value.as_array())
         .unwrap();
     assert_eq!(
-        input[0].get("type").and_then(|value| value.as_str()),
-        Some("compaction")
+        input
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("compaction_trigger")
     );
-    assert_eq!(input.len(), 3);
+    assert!(
+        input
+            .iter()
+            .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("compaction"))
+    );
     assert_eq!(
         resolved
             .body()
@@ -414,6 +475,10 @@ fn recompact_uses_prior_output_prefix() {
         "checkpoint-current"
     );
     assert_eq!(resolved.request_identity_generation(), Some(2));
+    assert_eq!(
+        resolved.body().get("stream").and_then(|v| v.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]
@@ -538,7 +603,7 @@ fn backend_validation_requires_one_leading_current_checkpoint() {
     ));
 
     let mut empty = wrapper;
-    empty.output.clear();
+    empty.compaction_item = serde_json::json!({"type": "compaction", "encrypted_content": ""});
     let empty = ConversationRequest {
         items: vec![ConversationItem::ResponsesCompactionCheckpoint(Box::new(
             empty,
@@ -549,4 +614,75 @@ fn backend_validation_requires_one_leading_current_checkpoint() {
         empty.validate_for_backend(&crate::ApiBackend::Responses),
         Err(ConversationValidationError::EmptyCheckpointOutput)
     ));
+}
+
+#[test]
+fn retained_prefix_keeps_user_system_and_budget_truncates_newest_first() {
+    let history = vec![
+        ConversationItem::base_instructions("lifted base"),
+        ConversationItem::user("oldest"),
+        ConversationItem::assistant("agent short"),
+        ConversationItem::tool_result("c1", "tool out"),
+        ConversationItem::user("middle"),
+        ConversationItem::user("newest"),
+    ];
+    let retained = build_retained_prefix(&history);
+    assert!(
+        retained
+            .iter()
+            .all(|item| !matches!(item, ConversationItem::ToolResult(_)))
+    );
+    assert!(
+        retained
+            .iter()
+            .all(|item| !matches!(item, ConversationItem::System(_)))
+    );
+    // lifted base instructions must not appear
+    assert!(
+        !retained
+            .iter()
+            .any(|item| item.text_content() == "lifted base")
+    );
+
+    // Tiny budget keeps only the newest eligible item(s).
+    let truncated = truncate_retained_newest_first(
+        vec![
+            ConversationItem::user("aaaa"), // 1 token
+            ConversationItem::user("bbbb"), // 1 token
+            ConversationItem::user("cccc"), // 1 token
+        ],
+        2,
+    );
+    assert_eq!(truncated.len(), 2);
+    assert_eq!(truncated[0].text_content(), "bbbb");
+    assert_eq!(truncated[1].text_content(), "cccc");
+}
+
+#[test]
+fn retained_prefix_drops_oversized_non_final_agent_messages() {
+    let huge = "x".repeat((MAX_RETAINED_AGENT_MESSAGE_TOKENS as usize + 1) * 4);
+    let history = vec![
+        ConversationItem::user("keep"),
+        ConversationItem::assistant(huge),
+        ConversationItem::assistant("Message Type: FINAL_ANSWER\nbody"),
+    ];
+    let retained = build_retained_prefix(&history);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].text_content(), "keep");
+}
+
+#[test]
+fn compaction_trigger_wire_item_is_bare_type_object() {
+    let trigger = compaction_trigger_wire_item();
+    assert_eq!(trigger, serde_json::json!({ "type": "compaction_trigger" }));
+    assert!(is_valid_compaction_item(&compaction_blob()));
+    assert!(is_valid_compaction_item(&serde_json::json!({
+        "type": "compaction_summary",
+        "encrypted_content": "x"
+    })));
+    assert!(!is_valid_compaction_item(&serde_json::json!({
+        "type": "compaction",
+        "encrypted_content": ""
+    })));
+    assert!(!is_valid_compaction_item(&compaction_trigger_wire_item()));
 }

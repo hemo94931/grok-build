@@ -414,16 +414,16 @@ mod install_system_prompt_tests {
                     prior_checkpoint_id: None,
                     cache_route_fingerprint: None,
                 },
-                output: vec![serde_json::json!({
+                retained_prefix: vec![ConversationItem::user("kept")],
+                compaction_item: serde_json::json!({
                     "type": "compaction",
                     "encrypted_content": "opaque"
-                })],
+                }),
                 portable_history_path: "compaction_checkpoints/checkpoint.json".into(),
                 portable_history_sha256: "digest".into(),
                 portable_history_bytes: 1,
                 checkpoint_token_seed: 1,
                 token_seed_source: TokenSeedSource::UsageOutputTokens,
-                server_output_item_count: 1,
                 prior_checkpoint_id: None,
                 memory_revision: None,
             },

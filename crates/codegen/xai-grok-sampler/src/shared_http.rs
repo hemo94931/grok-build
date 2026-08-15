@@ -18,8 +18,6 @@ use std::time::Duration;
 
 static SHARED_H2: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
-static SHARED_COMPACT_H2: OnceLock<reqwest::Client> = OnceLock::new();
-static SHARED_COMPACT_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Kill switch: `GROK_SAMPLER_SHARED_CLIENT=0` (or `false`, any case)
 /// restores the old behavior of building a fresh `reqwest::Client` per
@@ -69,22 +67,6 @@ pub(crate) fn client_http1() -> Result<reqwest::Client, reqwest::Error> {
     shared(&SHARED_HTTP1, build_http_client_http1, sharing_disabled())
 }
 
-pub(crate) fn compact_client() -> Result<reqwest::Client, reqwest::Error> {
-    shared(
-        &SHARED_COMPACT_H2,
-        build_compact_http_client,
-        sharing_disabled(),
-    )
-}
-
-pub(crate) fn compact_client_http1() -> Result<reqwest::Client, reqwest::Error> {
-    shared(
-        &SHARED_COMPACT_HTTP1,
-        build_compact_http_client_http1,
-        sharing_disabled(),
-    )
-}
-
 fn build_http_client_with_timeout(
     connect_timeout: Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
@@ -121,12 +103,6 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     build_http_client_with_timeout(Duration::from_secs(connect_timeout_secs))
 }
 
-fn build_compact_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    build_http_client_with_timeout(
-        crate::client::responses_compact::RESPONSES_COMPACT_CONNECT_TIMEOUT,
-    )
-}
-
 fn build_http1_client_with_timeout(
     connect_timeout: Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
@@ -149,12 +125,6 @@ fn build_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
     build_http1_client_with_timeout(Duration::from_secs(connect_timeout_secs))
-}
-
-fn build_compact_http_client_http1() -> Result<reqwest::Client, reqwest::Error> {
-    build_http1_client_with_timeout(
-        crate::client::responses_compact::RESPONSES_COMPACT_CONNECT_TIMEOUT,
-    )
 }
 
 #[cfg(test)]

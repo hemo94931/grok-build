@@ -19,7 +19,11 @@ fn envelope() -> TrustedPromptEnvelope {
     }
 }
 
-fn checkpoint(portable_history: &[ConversationItem], output: Vec<Value>) -> ConversationItem {
+fn checkpoint(
+    portable_history: &[ConversationItem],
+    retained_prefix: Vec<ConversationItem>,
+    compaction_item: Value,
+) -> ConversationItem {
     ConversationItem::ResponsesCompactionCheckpoint(Box::new(ServerResponsesCheckpoint {
         checkpoint_id: "checkpoint-1".into(),
         operation_id: "operation-1".into(),
@@ -43,32 +47,32 @@ fn checkpoint(portable_history: &[ConversationItem], output: Vec<Value>) -> Conv
             prior_checkpoint_id: None,
             cache_route_fingerprint: None,
         },
-        output,
+        retained_prefix,
+        compaction_item,
         portable_history_path: "compaction_checkpoints/checkpoint-1.json".into(),
         portable_history_sha256: portable_history_digest(portable_history).unwrap(),
         portable_history_bytes: 123,
         checkpoint_token_seed: 42,
         token_seed_source: TokenSeedSource::UsageOutputTokens,
-        server_output_item_count: 1,
         prior_checkpoint_id: None,
         memory_revision: None,
     }))
 }
 
 #[test]
-fn validated_replay_preserves_raw_output_prefix() {
+fn validated_replay_preserves_retained_prefix_and_blob() {
     let portable_history = vec![
         ConversationItem::base_instructions("base"),
         ConversationItem::user("compacted user"),
     ];
-    let raw_reasoning = json!({
-        "type": "reasoning",
-        "id": "raw-r1",
-        "content": [{"text": "canonical-prefix"}],
+    let retained = vec![ConversationItem::user("compacted user")];
+    let blob = json!({
+        "type": "compaction",
+        "encrypted_content": "opaque-blob",
         "provider_extension": {"keep": [3, 2, 1]}
     });
-    let checkpoint = checkpoint(&portable_history, vec![raw_reasoning.clone()]);
-    let wrapper = checkpoint.as_responses_checkpoint().unwrap();
+    let checkpoint_item = checkpoint(&portable_history, retained, blob.clone());
+    let wrapper = checkpoint_item.as_responses_checkpoint().unwrap();
     let material =
         CheckpointReplayMaterial::try_new(wrapper, envelope(), &portable_history).unwrap();
     let typed_tail = vec![ConversationItem::Reasoning(rs::ReasoningItem {
@@ -93,7 +97,7 @@ fn validated_replay_preserves_raw_output_prefix() {
     let request = ConversationRequest {
         model: Some("grok-test".into()),
         instructions: compose_instructions(&portable_history),
-        items: std::iter::once(checkpoint).chain(typed_tail).collect(),
+        items: std::iter::once(checkpoint_item).chain(typed_tail).collect(),
         ..Default::default()
     };
 
@@ -104,9 +108,17 @@ fn validated_replay_preserves_raw_output_prefix() {
         .get("input")
         .and_then(Value::as_array)
         .unwrap();
-    assert_eq!(input[0], raw_reasoning);
-    assert_eq!(input[1]["id"], "tail-r1");
-    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    // retained user + blob + reasoning tail
+    assert!(
+        input.iter().any(
+            |item| item.get("encrypted_content").and_then(|v| v.as_str()) == Some("opaque-blob")
+        )
+    );
+    assert!(
+        input
+            .iter()
+            .any(|item| item.get("id").and_then(|v| v.as_str()) == Some("tail-r1"))
+    );
 }
 
 #[test]
@@ -114,10 +126,11 @@ fn wrapper_layout_and_non_responses_backends_fail_closed() {
     let portable = vec![ConversationItem::user("old")];
     let wrapper = checkpoint(
         &portable,
-        vec![json!({
+        vec![ConversationItem::user("old")],
+        json!({
             "type": "compaction",
             "encrypted_content": "opaque"
-        })],
+        }),
     );
     let request = ConversationRequest {
         items: vec![ConversationItem::user("before"), wrapper.clone()],

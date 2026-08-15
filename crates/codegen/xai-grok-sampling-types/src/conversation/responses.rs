@@ -314,11 +314,10 @@ impl FinalResponsesRequest {
         Ok(Self { body })
     }
 
-    /// Replay/recompact body from explicit parts: `output prefix ++
-    /// serialized typed items`. `typed_items` must already be checkpoint-free
-    /// and have instruction-lifted systems removed; `request` supplies the
-    /// envelope context (model, tools, cache fields, pre-composed
-    /// instructions).
+    /// Replay/recompact body from an opaque wire prefix plus serialized typed
+    /// items. `typed_items` must already be checkpoint-free and have
+    /// instruction-lifted systems removed; `request` supplies the envelope
+    /// context (model, tools, cache fields, pre-composed instructions).
     ///
     /// `pub(crate)`: only validated constructors in
     /// [`crate::conversation::resolved`] may call this.
@@ -340,6 +339,42 @@ impl FinalResponsesRequest {
             input.append(tail);
             this.body["input"] = serde_json::Value::Array(input);
         }
+        Ok(this)
+    }
+
+    /// Replay body: `serialized retained prefix ++ compaction blob ++
+    /// serialized typed tail`.
+    ///
+    /// `pub(crate)`: only validated constructors in
+    /// [`crate::conversation::resolved`] may call this.
+    pub(crate) fn from_retained_parts(
+        request: &ConversationRequest,
+        retained_prefix: &[ConversationItem],
+        compaction_item: serde_json::Value,
+        typed_tail: &[ConversationItem],
+    ) -> Result<Self, ResponsesRequestBuildError> {
+        let mut prefix_request = request.clone();
+        prefix_request.items = retained_prefix.to_vec();
+        let prefix_body = Self::from_typed_items(&prefix_request)?;
+        let mut prefix_input = prefix_body
+            .body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        prefix_input.push(compaction_item);
+
+        let mut tail_request = request.clone();
+        tail_request.items = typed_tail.to_vec();
+        let mut this = Self::from_typed_items(&tail_request)?;
+        let tail = this
+            .body
+            .get_mut("input")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or(ResponsesRequestBuildError::MissingInput)?;
+        let mut input = prefix_input;
+        input.append(tail);
+        this.body["input"] = serde_json::Value::Array(input);
         Ok(this)
     }
 }
