@@ -60,6 +60,40 @@ pub async fn connect_and_auth<C>(
 where
     C: acp::Client + 'static,
 {
+    let (client_conn, init) = connect_noauth(client, client_type).await;
+
+    // API-key auth so sessions resolve the mock's `test-model`.
+    let method = init
+        .auth_methods
+        .iter()
+        .find(|m| &*m.id().0 == "xai.api_key")
+        .expect("xai.api_key auth method not advertised");
+    tokio::time::timeout(
+        RPC_TIMEOUT,
+        client_conn.authenticate(
+            acp::AuthenticateRequest::new(method.id().clone())
+                .meta(json!({ "headless": true }).as_object().cloned()),
+        ),
+    )
+    .await
+    .expect("authenticate timed out")
+    .expect("authenticate failed");
+
+    (client_conn, init)
+}
+
+/// [`connect_and_auth`] without the ACP `authenticate` call. For live-backend
+/// tests whose provider models resolve via the provider credential store —
+/// the xai.api_key flow would persist `$XAI_API_KEY` into the real
+/// `~/.grok/auth.json`, which must not happen with a dummy gate key.
+#[allow(dead_code)]
+pub async fn connect_noauth<C>(
+    client: C,
+    client_type: &str,
+) -> (acp::ClientSideConnection, acp::InitializeResponse)
+where
+    C: acp::Client + 'static,
+{
     let agent_config = AgentConfig::default();
     let auth_manager = Arc::new(agent_config.create_auth_manager());
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -115,23 +149,6 @@ where
     .await
     .expect("initialize timed out")
     .expect("initialize failed");
-
-    // API-key auth so sessions resolve the mock's `test-model`.
-    let method = init
-        .auth_methods
-        .iter()
-        .find(|m| &*m.id().0 == "xai.api_key")
-        .expect("xai.api_key auth method not advertised");
-    tokio::time::timeout(
-        RPC_TIMEOUT,
-        client_conn.authenticate(
-            acp::AuthenticateRequest::new(method.id().clone())
-                .meta(json!({ "headless": true }).as_object().cloned()),
-        ),
-    )
-    .await
-    .expect("authenticate timed out")
-    .expect("authenticate failed");
 
     (client_conn, init)
 }

@@ -7,8 +7,17 @@
   `response.output_item.done` 流式帧收集（真实后端 terminal 帧 output 为空，
   见 codex-backend-quirks quirk 1）、compact 请求头部恢复 turn 管线 allowlist
   并补 codex 路由集成测试。
-- Phase 0（live probe）与 Phase 6（文档收尾）待办：probe 需真实 ChatGPT
-  OAuth 凭证，验证点见下文「待 live probe 锁定项」。
+- Phase 0（live probe）**已完成**（2026-08-14，生产 ChatGPT 路由实测）：
+  trigger 契约、replay、recompact 形状全部 HTTP 200 通过；`x-codex-beta-features`/
+  `x-codex-turn-metadata`/`openai-beta` 三个头均验证**非必需**（保留发送以对齐上游）；
+  blob 经 `output_item.done` 到达、terminal 帧 output 为空已实测确认；`usage`
+  字段齐全。详见 codex-backend-quirks.md v2 节。
+- Phase 6（文档收尾）：quirks/旧计划已更新；grok 端到端 e2e **已通过**
+  （`tests/responses_compaction_live_e2e.rs`，`GROK_LIVE_CODEX_E2E=1` 门控）：
+  真实后端完成 seed → `/compact` → checkpoint 落盘（`kind: responses_server`，
+  retained 前缀 + 真实 `cmp_…` blob）→ 后续 turn replay 被接受。e2e 发现并修复了
+  一个 mock 期不可见的缺陷：retained 前缀必须丢弃携带 tool call 的 assistant 项
+  （其 function_call_output 随 ToolResult 不保留，否则 replay 400），已带回归测试。
 
 ## 背景
 
@@ -40,7 +49,7 @@ Bedrock 保留（`RemoteCompactionSupport::V1`），OpenAI 与 Azure-Responses �
 | D5 | transport 形态 | **统一进普通 Responses 流式路径**：普通请求构造 + `input` 末尾追加 trigger + 「恰好一个 compaction item」收集模式；专用 `compact_http` client 退役 |
 | D6 | negative cache 分类 | 400/404/405/501/422 记入；「completed 但无恰好一个 compaction item」在重试预算耗尽后记入；流错误/超时/取消不记 |
 | D7 | 契约标识 | `responses-compact-grok` 不变 |
-| D8 | 保留前缀语义 | 镜像上游：user/developer/system（非 final agent 消息 ≤10k token），newest-first 截断至 64k token，compaction item 收尾 |
+| D8 | 保留前缀语义 | 镜像上游：user/developer/system（非 final 且不携带 tool call 的 agent 消息 ≤10k token），newest-first 截断至 64k token，compaction item 收尾 |
 
 ## 目标 wire 契约
 
@@ -76,7 +85,8 @@ SSE 流，要求：
 
 - **替换历史** = 保留前缀（retained prefix）+ 不透明压缩项收尾：
   - 保留前缀 = 压缩前 history 中的 user/developer/system 消息（非 final 的 agent
-    消息须 ≤10k token），**newest-first** 截断至 **64k token** 预算（镜像上游
+    消息须 ≤10k token 且**不携带 tool call** —— tool call 载体的
+    function_call_output 随 ToolResult 不保留，replay 会 400，live 实测），**newest-first** 截断至 **64k token** 预算（镜像上游
     `RETAINED_MESSAGE_TOKEN_BUDGET`，与服务端默认一致）；
   - 不透明压缩项（opaque compaction item）作为最后一个元素；reasoning/assistant/tool
     项不保留在 typed 段，只存在于服务端加密的 blob 内。
@@ -97,17 +107,20 @@ compaction 请求继承 turn 请求管线（D5），因此自动获得：`author
 "implementation":"responses_compaction_v2","strategy":"memento"}}`。
 HTTP 上**不再**设 `OpenAI-Beta: responses=experimental`。
 
-### 待 live probe 锁定项
+### 待 live probe 锁定项（已于 Phase 0 实测解决，结论见 quirks v2 节）
 
 按 provider-backend-debug 流程（`.agents/skills/provider-backend-debug/scripts/probe_params.py`
 + 反向代理抓包）对真实 ChatGPT 路由验证，结果回写
 `.agents/skills/provider-backend-debug/references/codex-backend-quirks.md`：
 
-1. `x-codex-beta-features: remote_compaction_v2` 是否为后端接受 trigger 的**必需**头；
-2. `x-codex-turn-metadata` 的 `request_kind:"compaction"` 是否必需或仅为遥测；
+1. `x-codex-beta-features: remote_compaction_v2` 是否为后端接受 trigger 的**必需**头 → **非必需**（已实测）；
+2. `x-codex-turn-metadata` 的 `request_kind:"compaction"` 是否必需或仅为遥测 → **非必需**（已实测），保留发送以对齐上游遥测；
 3. 不支持 trigger 的通用 Responses 端点的实际错误码（400 vs 422 vs completed-无-item），
-   校准 D6 分类器；
-4. `encrypted_content` 实际上限与 `usage` 字段位置。
+   校准 D6 分类器 → codex 官方路由已实测支持；通用第三方端点按现有 turn 契约表
+   （400/422 schema 拒绝）+ completed-无-item 覆盖，逐个端点无法穷举，运行时由
+   negative cache 探测兜底；
+4. `encrypted_content` 实际上限与 `usage` 字段位置 → blob 实测 1.7–2.5 KB（远低于 10 MiB
+   上限），`usage.output_tokens/total_tokens` 在 `response.completed` 中（已实测）。
 
 ## 变更映射
 

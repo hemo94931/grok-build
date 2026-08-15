@@ -13,27 +13,41 @@ Everything below was verified against the live endpoint with curl (see `scripts/
 
 ## Remote compaction v2 contract — `compaction_trigger` over `codex/responses`
 
-Derived from upstream codex source (`compact_remote_v2.rs` @ `1bb6384`) and the
-pi-codex-compact plugin; **not yet live-probed by grok** — re-verify with
-`scripts/probe_params.py` before relying on header minimality:
+**Live-verified 2026-08-14** against the production ChatGPT backend (probe scripts:
+trigger baseline + header variants + replay/recompact shapes):
 
 - Compaction = ordinary streaming `POST codex/responses` whose `input` ends with a bare
   control item `{"type":"compaction_trigger"}` (request-only, never persisted).
-- Request headers: ordinary turn headers plus `x-codex-beta-features: remote_compaction_v2`
-  and `x-codex-turn-metadata: {"request_kind":"compaction","compaction":{"implementation":"responses_compaction_v2","strategy":"memento"}}`
-  (upstream always sends both on compaction requests; whether they are strictly
-  required is a Phase-0 probe item).
-- Response: the compaction blob is expected via `response.output_item.done` frames —
-  per quirk 1 below the terminal `response.completed.response.output` is empty on this
-  backend. Require exactly one distinct `{"type":"compaction"|"compaction_summary", id?,
-  encrypted_content}` item; tolerate other items.
+- Verified response: `response.created` → `response.in_progress` →
+  `response.output_item.added` → `response.output_item.done` carrying exactly one
+  `{"type":"compaction", id:"cmp_…", encrypted_content}` item (probe blobs 1.7–2.5 KB),
+  then `response.completed` with **`output: []` (empty, per quirk 1)** and full `usage`
+  (`output_tokens`/`total_tokens` present — did-not-shrink inputs available).
+- **Header necessity — all verified NOT required**: the trigger alone drives compaction.
+  Probed and still HTTP 200 with a valid blob when dropping, independently and combined:
+  `x-codex-beta-features: remote_compaction_v2`, `x-codex-turn-metadata`,
+  `openai-beta: responses=experimental`. grok keeps sending the first two on compaction
+  requests for upstream parity / future enforcement (upstream always advertises them).
+- **Replay shape verified**: `[retained user msg…, compaction blob, new user msg]` →
+  HTTP 200, follow-up answer correctly used the pre-compaction context.
+- **Recompact shape verified**: `[retained…, old blob, new turns…, compaction_trigger]` →
+  HTTP 200 with a fresh compaction item (chain semantics work).
 - Client-side history rebuild: retained prefix = user/developer/system messages
   (non-final agent messages ≤ 10k tokens), truncated newest-first to a 64k-token
-  budget, then the opaque blob as the last element. Recompact = expand prior
-  checkpoint (incl. old blob) and append the trigger again.
+  budget, then the opaque blob as the last element.
 - grok classification: HTTP 400/404/405/422/501 or a completed stream without exactly
   one compaction item (after 2 attempts) = endpoint unsupported → negative capability
   cache 1 h → builtin fallback; transport/timeout/cancel fall back without caching.
+- **Replay integrity — live-verified failure mode**: a replayed `input` containing a
+  `function_call` without its matching `function_call_output` is rejected with 400
+  `No tool output found for function call call_…`. Since ToolResult items are never
+  retained in the prefix (they live inside the blob), grok's retained-prefix filter
+  drops assistant items that carry tool calls entirely — upstream retains *messages*
+  only, so this matches reference behavior.
+- grok live e2e (`tests/responses_compaction_live_e2e.rs`, gated on
+  `GROK_LIVE_CODEX_E2E=1`): seed turn → `/compact` → on-disk sidecar asserted
+  (`kind: responses_server`, wrapper = retained prefix + blob, real `cmp_…` id) →
+  follow-up turn over the replayed checkpoint accepted.
 
 Legacy unary contract kept below for reference only.
 

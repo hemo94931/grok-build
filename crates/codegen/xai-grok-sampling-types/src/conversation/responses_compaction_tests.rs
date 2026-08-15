@@ -671,6 +671,33 @@ fn retained_prefix_drops_oversized_non_final_agent_messages() {
     assert_eq!(retained[0].text_content(), "keep");
 }
 
+/// Live-verified regression: an assistant item carrying tool calls serializes
+/// as `function_call` wire items whose `function_call_output` lives in a
+/// ToolResult item that is never retained. Retaining the call would 400 the
+/// replay: "No tool output found for function call call_…".
+#[test]
+fn retained_prefix_drops_assistant_tool_call_carriers() {
+    let mut with_call = ConversationItem::assistant("calling a tool");
+    let ConversationItem::Assistant(assistant) = &mut with_call else {
+        unreachable!()
+    };
+    assistant.tool_calls.push(crate::ToolCall {
+        id: "call_1".into(),
+        name: "read".into(),
+        arguments: "{}".into(),
+    });
+    let history = vec![
+        ConversationItem::user("keep"),
+        with_call,
+        ConversationItem::tool_result("call_1", "tool out"),
+        ConversationItem::assistant("plain text reply"),
+    ];
+    let retained = build_retained_prefix(&history);
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].text_content(), "keep");
+    assert_eq!(retained[1].text_content(), "plain text reply");
+}
+
 #[test]
 fn compaction_trigger_wire_item_is_bare_type_object() {
     let trigger = compaction_trigger_wire_item();

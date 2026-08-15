@@ -73,6 +73,15 @@ pub fn is_retained_for_compaction(item: &ConversationItem) -> bool {
         ConversationItem::User(_) => true,
         ConversationItem::System(system) => !system.source.lifts_into_instructions(),
         ConversationItem::Assistant(assistant) => {
+            // Assistant items carrying tool calls serialize as `function_call`
+            // wire items; their matching `function_call_output` lives in a
+            // ToolResult item which is never retained — retaining the call
+            // would 400 the replay ("No tool output found for function call",
+            // live-verified). Tool-call carriers survive only inside the
+            // opaque blob, mirroring upstream which retains *messages* only.
+            if !assistant.tool_calls.is_empty() {
+                return false;
+            }
             if assistant
                 .content
                 .as_ref()
